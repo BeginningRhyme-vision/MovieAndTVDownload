@@ -1,0 +1,230 @@
+import random
+import traceback
+import uuid
+import requests
+import re
+import json
+import time
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+    "Referer": "https://vidup.to/",
+    "X-Requested-With": "XMLHttpRequest"
+}
+
+API = "https://enc-dec.app/api"
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # 秒
+
+
+def build_proxy():
+    """每次生成随机 session，确保 IP 不同。地区 JP，生命周期 120 分钟。"""
+    session_id = uuid.uuid4().hex[:12]
+    # proxy_url = f"http://client-UATTTTTTT_area-JP_session-{session_id}_life-120:Qwe7412369@proxy.iproyal.net:9000"
+    # proxy_url = f"http://client-UATTTTTTT_area-SG_session-{session_id}_life-120:Qwe7412369@proxy.iproyal.net:9000"
+    # return {"http": proxy_url, "https": proxy_url}
+    port = random.randint(9000, 9050)
+    return {
+        "http": f"http://daran:TYQSUK9-3VKDM4M-MH365O9-HPDIYIG-O9YHYN9-FXCSKNO-QMS83CJ@unmetered.residential.proxyrack.net:{port}",
+        "https": f"http://daran:TYQSUK9-3VKDM4M-MH365O9-HPDIYIG-O9YHYN9-FXCSKNO-QMS83CJ@unmetered.residential.proxyrack.net:{port}",
+    }
+
+
+# ---------- 辅助函数 ----------
+def validate(data, path):
+    if data.get("status") != 200:
+        error_msg = data.get("error", "unknown")
+        raise Exception(f"API Error at {path}: status={data.get('status')}, error={error_msg}")
+    return data["result"]
+
+
+def process_tmdb_id(tmdb_id):
+    """处理单个 TMDB ID，内部自动重试，返回 (成功标志, 结果字典或None)"""
+    last_exception = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            # 使用本地代理（可根据需要替换为轮换代理）
+            proxy = build_proxy()
+            # 1. 获取页面，提取加密文本
+            base_url = f"https://vidup.to/movie/{tmdb_id}/"
+            resp = requests.get(base_url, timeout=30, headers=HEADERS, proxies=proxy)
+            resp.raise_for_status()
+            html = resp.text
+
+            match_1 = re.search(r'\\"en\\":\\"(.*?)\\"', html)
+            match = re.search(r'\\"token\\":\\"(.*?)\\"', html)
+            if match_1:
+                text = match_1.group(1)
+            else:
+                if match:
+                    text = match.group(1)
+                else:
+                    print(f'Failed to extract encrypted text from page for: {tmdb_id}')
+                    return None, None
+
+            # 2. 调用 enc-vidup 获取 parts
+            enc_vidup = f"{API}/enc-vidup?text={text}"
+            resp = requests.get(enc_vidup, timeout=30, headers=HEADERS, proxies=proxy)
+            resp.raise_for_status()
+            data = resp.json()
+            parts = validate(data, enc_vidup)
+            servers = parts['servers']
+            stream = parts['stream']
+            token = parts['token']
+
+            headers_with_token = HEADERS.copy()
+            headers_with_token["X-CSRF-Token"] = token
+
+            # 3. 获取加密的服务器列表
+            resp = requests.post(servers, headers=headers_with_token, timeout=30, proxies=proxy)
+            servers_encrypted = resp.text
+
+            # 4. 解密服务器列表
+            dec_vidup = f"{API}/dec-vidup"
+            resp = requests.post(dec_vidup, json={"text": servers_encrypted}, timeout=30, proxies=proxy)
+            resp.raise_for_status()
+            data = resp.json()
+            servers_decrypted = validate(data, dec_vidup)
+
+            if not servers_decrypted:
+                raise Exception("No servers found")
+
+            # ========== 关键改动：遍历所有服务器，逐个尝试 ==========
+            last_server_error = None
+            for server in servers_decrypted:
+                try:
+                    data_val = server['data']
+                    # 5. 获取加密的流数据
+                    stream_url = f"{stream}/{data_val}"
+                    resp = requests.post(stream_url, headers=headers_with_token, timeout=30, proxies=proxy)
+                    resp.raise_for_status()
+                    stream_encrypted = resp.text
+
+                    # 6. 解密流数据
+                    resp = requests.post(dec_vidup, json={"text": stream_encrypted}, timeout=30, proxies=proxy)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    stream_decrypted = validate(data, dec_vidup)
+
+                    result = {
+                        "url": stream_decrypted.get("url"),
+                        "tmdbId": stream_decrypted.get("tmdbId"),
+                        "title": stream_decrypted.get("title")
+                    }
+                    if result["url"] and result["tmdbId"]:
+                        # 成功获取数据，返回结果
+                        return True, result
+                    else:
+                        # 数据不完整，视为失败，继续尝试下一个服务器
+                        last_server_error = "Missing url or tmdbId in decrypted data"
+                        continue
+                except Exception as e:
+                    last_server_error = e
+                    server_name = server.get('name', 'unknown')
+                    print(f"  Server '{server_name}' failed: {e}")
+                    continue
+
+            # 所有服务器都尝试失败
+            raise Exception(f"All servers failed for {tmdb_id}. Last error: {last_server_error}")
+
+        except Exception as e:
+            last_exception = e
+            print(f"  [Attempt {attempt}/{MAX_RETRIES}] Error for {tmdb_id}: {e}")
+            if attempt < MAX_RETRIES:
+                print(f"  Retrying in {RETRY_DELAY} seconds...")
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"  All {MAX_RETRIES} attempts failed for ID {tmdb_id}")
+
+    return False, None
+
+
+def load_processed_ids(results_file, fail_file):
+    processed = set()
+    if results_file.exists():
+        with open(results_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        obj = json.loads(line)
+                        tid = obj.get('tmdbId')
+                        if tid is not None:
+                            processed.add(str(tid))
+                    except:
+                        pass
+    if fail_file.exists():
+        with open(fail_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                tid = line.strip()
+                if tid:
+                    processed.add(tid)
+    return processed
+
+
+def main():
+    ids_file = Path("ids.txt")
+    results_file = Path("results.jsonl")
+    fail_file = Path("fail.txt")
+
+    if not ids_file.exists():
+        print("ids.txt not found!")
+        return
+
+    with open(ids_file, 'r', encoding='utf-8') as f:
+        ids = [line.strip() for line in f if line.strip()]
+
+    processed = load_processed_ids(results_file, fail_file)
+    to_process = [tid for tid in ids if tid not in processed]
+    print(f"Total IDs: {len(ids)}, Already processed: {len(processed)}, To process: {len(to_process)}")
+
+    if not to_process:
+        print("All IDs processed.")
+        return
+
+    # 多线程配置
+    MAX_WORKERS = 20  # 并发线程数，可调整
+    lock = threading.Lock()  # 文件写入锁
+    success_count = 0
+    fail_count = 0
+
+    def process_one(tid):
+        """线程执行的包装函数，负责调用处理并写入结果"""
+        success, result = process_tmdb_id(tid)
+        with lock:
+            if success and result:
+                with open(results_file, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(result, ensure_ascii=False) + '\n')
+                print(f"✅ SUCCESS: {result.get('title')} ({result.get('tmdbId')})")
+                return True
+            else:
+                with open(fail_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{tid}\n")
+                print(f"❌ FAILED: {tid}")
+                return False
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_one, tid): tid for tid in to_process}
+        for future in as_completed(futures):
+            tid = futures[future]
+            try:
+                ok = future.result()
+                if ok:
+                    success_count += 1
+                else:
+                    fail_count += 1
+            except Exception as e:
+                print(f"⚠️  Unexpected exception for {tid}: {e}")
+                with lock:
+                    with open(fail_file, 'a', encoding='utf-8') as f:
+                        f.write(f"{tid}\n")
+                fail_count += 1
+
+    print(f"\nDone. Success: {success_count}, Failed: {fail_count}")
+
+
+if __name__ == "__main__":
+    main()
