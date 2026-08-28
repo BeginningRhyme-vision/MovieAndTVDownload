@@ -1,6 +1,5 @@
 import random
 import traceback
-import uuid
 import requests
 import re
 import json
@@ -15,22 +14,30 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest"
 }
 
+# 抓取 vidup.to 页面时不能带 X-Requested-With，否则会被 Cloudflare 拦成 403
+PAGE_HEADERS = {k: v for k, v in HEADERS.items() if k != "X-Requested-With"}
+
 API = "https://enc-dec.app/api"
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # 秒
 
 
+# 代理开关：设为 True 时启用下方代理，False 则直连
+# 注意：vidup.to 有 Cloudflare 机房 IP 拦截，直连会返回 403，必须走住宅代理
+USE_PROXY = True
+PROXY_HOST = "unmetered.residential.proxyrack.net"
+PROXY_USER = "daran"
+PROXY_PASS = "TYQSUK9-3VKDM4M-MH365O9-HPDIYIG-O9YHYN9-FXCSKNO-QMS83CJ"
+PROXY_PORT_RANGE = (9000, 9050)  # 每次随机取一个端口，换一个出口 IP
+
+
 def build_proxy():
-    """每次生成随机 session，确保 IP 不同。地区 JP，生命周期 120 分钟。"""
-    session_id = uuid.uuid4().hex[:12]
-    # proxy_url = f"http://client-UATTTTTTT_area-JP_session-{session_id}_life-120:Qwe7412369@proxy.iproyal.net:9000"
-    # proxy_url = f"http://client-UATTTTTTT_area-SG_session-{session_id}_life-120:Qwe7412369@proxy.iproyal.net:9000"
-    # return {"http": proxy_url, "https": proxy_url}
-    port = random.randint(9000, 9050)
-    return {
-        "http": f"http://daran:TYQSUK9-3VKDM4M-MH365O9-HPDIYIG-O9YHYN9-FXCSKNO-QMS83CJ@unmetered.residential.proxyrack.net:{port}",
-        "https": f"http://daran:TYQSUK9-3VKDM4M-MH365O9-HPDIYIG-O9YHYN9-FXCSKNO-QMS83CJ@unmetered.residential.proxyrack.net:{port}",
-    }
+    """返回 requests 用的 proxies；未启用代理时返回 None 表示直连。"""
+    if not USE_PROXY:
+        return None
+    port = random.randint(*PROXY_PORT_RANGE)
+    proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{port}"
+    return {"http": proxy_url, "https": proxy_url}
 
 
 # ---------- 辅助函数 ----------
@@ -50,7 +57,7 @@ def process_tmdb_id(tmdb_id):
             proxy = build_proxy()
             # 1. 获取页面，提取加密文本
             base_url = f"https://vidup.to/movie/{tmdb_id}/"
-            resp = requests.get(base_url, timeout=30, headers=HEADERS, proxies=proxy)
+            resp = requests.get(base_url, timeout=30, headers=PAGE_HEADERS, proxies=proxy)
             resp.raise_for_status()
             html = resp.text
 

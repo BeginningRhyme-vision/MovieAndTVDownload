@@ -9,7 +9,12 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from urllib.parse import urljoin
 
 import requests
@@ -20,21 +25,21 @@ from urllib3.util.retry import Retry
 
 
 # ---------- 配置 ----------
-INPUT_JSONL = "only_one.jsonl"
+INPUT_JSONL = "results.jsonl"
 SUCCESS_LOG = "success.jsonl"
 FAILED_LOG = "failed.jsonl"
-BASE_DIR = "/mnt/datasets/pt-movies/movies_02/new_movie"
+BASE_DIR = "/mnt/MovieAndTVDownload/downloads"
 FOLDER_PREFIX = "movie_"
 MAX_VIDEOS_PER_FOLDER = 1000
-START_FOLDER_INDEX = 2
+START_FOLDER_INDEX = 1
 
 # 下载线程池固定保持的影片下载数。
-MAX_WORKERS = 30
+MAX_WORKERS = 32
 # 独立的 FFmpeg 转封装/移动线程数，不占用上面的下载槽位。
 CONVERT_WORKERS = 4
 # 单部影片同时下载的分片数。
-SEGMENT_CONCURRENCY = 16
-TEMP_DIR = "../temp"
+SEGMENT_CONCURRENCY = 64
+TEMP_DIR = "/mnt/MovieAndTVDownload/temp"
 SAMPLE_COUNT = 30
 SEG_RETRY_MAX = 20
 SEG_RETRY_DELAY = 1
@@ -65,6 +70,19 @@ class UnsupportedPlaylistError(RuntimeError):
     """播放列表使用了当前手工分片下载器不支持的 HLS 功能。"""
 
 
+# 并发开大后用于观察是否被源站风控：统计 403/429/503 的出现次数。
+block_status_lock = threading.Lock()
+block_status_counter = {}
+
+
+def record_block_status(status):
+    with block_status_lock:
+        block_status_counter[status] = block_status_counter.get(status, 0) + 1
+        count = block_status_counter[status]
+    if count in (1, 10, 50) or count % 200 == 0:
+        print(f"  [风控监控] HTTP {status} 累计出现 {count} 次")
+
+
 # ---------- HTTP ----------
 def get_session():
     """每个线程复用自己的 requests.Session。"""
@@ -81,8 +99,8 @@ def get_session():
             raise_on_status=False,
         )
         adapter = HTTPAdapter(
-            pool_connections=10,
-            pool_maxsize=20,
+            pool_connections=SEGMENT_CONCURRENCY,
+            pool_maxsize=SEGMENT_CONCURRENCY * 2,
             max_retries=retry,
             pool_block=True,
         )
@@ -120,6 +138,9 @@ def request_with_retry(
                 return response.content
         except (requests.RequestException, ConnectionError, TimeoutError) as exc:
             last_error = exc
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in (403, 429, 503):
+                record_block_status(status)
             if attempt == retries - 1:
                 break
             time.sleep(backoff * (2**attempt))
@@ -272,7 +293,7 @@ def move_to_target_folder(temp_mp4, tmdb_id):
 
 # ---------- M3U8 解析 ----------
 def parse_master_playlist(master_url):
-    """返回 [(resolution, media_playlist_url), ...]。"""
+    """返回 [(resolution, media_playlist_url, declared_bandwidth_kbps), ...]。"""
     text = request_with_retry("GET", master_url, as_text=True)
     lines = [line.strip() for line in text.splitlines()]
     variants = []
@@ -286,23 +307,41 @@ def parse_master_playlist(master_url):
         )
         resolution = resolution_match.group(1) if resolution_match else "unknown"
 
+        # BANDWIDTH 是 master 里声明的码率（bps），用于同分辨率下的初步排序，
+        # 可以少下载几个采样片段。缺失时记为 0，后续仍以实测采样为准。
+        bandwidth_match = re.search(
+            r"(?:^|,)BANDWIDTH=(\d+)(?:,|$)", line, re.IGNORECASE
+        )
+        bandwidth_kbps = (
+            int(bandwidth_match.group(1)) / 1000 if bandwidth_match else 0.0
+        )
+
         # URI 通常在下一行；跳过中间可能存在的空行或标签行。
         for following in lines[index + 1 :]:
             if not following or following.startswith("#"):
                 continue
-            variants.append((resolution, urljoin(master_url, following)))
+            variants.append(
+                (resolution, urljoin(master_url, following), bandwidth_kbps)
+            )
             break
 
     if not variants and any(line.startswith("#EXTINF:") for line in lines):
-        variants.append(("unknown", master_url))
+        variants.append(("unknown", master_url, 0.0))
 
     return variants
 
 
 def parse_media_playlist(playlist_url):
-    """解析普通 MPEG-TS 媒体播放列表，返回分片 URL 和时长。"""
+    """
+    解析媒体播放列表，返回 (分片 URL 列表, 时长列表, init 段 URL)。
+
+    同时支持 MPEG-TS 和 fMP4：fMP4 会带 #EXT-X-MAP 声明一个 init 段，
+    该段必须写在所有媒体分片之前，否则产出的文件无法解码。TS 没有
+    init 段，返回 None。
+    """
     text = request_with_retry("GET", playlist_url, as_text=True)
     lines = [line.strip() for line in text.splitlines()]
+    init_url = None
 
     for line in lines:
         upper = line.upper()
@@ -315,9 +354,15 @@ def parse_media_playlist(playlist_url):
                 "播放列表使用 #EXT-X-BYTERANGE，不能按普通独立分片拼接"
             )
         if upper.startswith("#EXT-X-MAP"):
-            raise UnsupportedPlaylistError(
-                "播放列表使用 #EXT-X-MAP（通常是 fMP4），不能按 MPEG-TS 拼接"
-            )
+            # 形如：#EXT-X-MAP:URI="init.mp4"
+            if "BYTERANGE" in upper:
+                raise UnsupportedPlaylistError(
+                    "#EXT-X-MAP 带 BYTERANGE，不能按独立分片拼接"
+                )
+            uri_match = re.search(r'URI="([^"]+)"', line, re.IGNORECASE)
+            if not uri_match:
+                raise UnsupportedPlaylistError("#EXT-X-MAP 缺少 URI 属性")
+            init_url = urljoin(playlist_url, uri_match.group(1))
 
     segment_urls = []
     durations = []
@@ -340,17 +385,67 @@ def parse_media_playlist(playlist_url):
     if not segment_urls:
         raise RuntimeError("媒体播放列表中没有找到任何 EXTINF 分片")
 
-    return segment_urls, durations
+    return segment_urls, durations, init_url
 
 
-def is_1080p(resolution):
+def parse_resolution(resolution):
+    """把 "1920x1080" 解析为 (width, height)；无法解析时返回 None。"""
     if not resolution or resolution == "unknown":
-        return True
+        return None
     try:
         width, height = resolution.lower().split("x", 1)
-        return int(width) >= 1920 and int(height) >= 1080
+        return int(width), int(height)
     except (TypeError, ValueError):
-        return False
+        return None
+
+
+def probe_resolution(sample_path):
+    """用 ffprobe 读取采样文件的真实分辨率，失败返回 None。"""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        sample_path,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    return parse_resolution(result.stdout.strip())
+
+
+def resolution_tier(size):
+    """
+    按高度归类画质档位，数值越大画质越高。
+
+    用高度而不是宽度判断，因为宽银幕片源（如 3600x2160、2972x2160）宽度
+    差异很大，但高度能稳定反映实际清晰度档位。
+    """
+    if not size:
+        return -1
+
+    height = size[1]
+    if height >= 2160:
+        return 3
+    if height >= 1440:
+        return 2
+    if height >= 1080:
+        return 1
+    return 0
 
 
 # ---------- 分片下载 ----------
@@ -397,15 +492,22 @@ def download_segments(
     start_idx=0,
     end_idx=None,
     concurrency=SEGMENT_CONCURRENCY,
+    init_url=None,
 ):
     """
     并发下载、按索引顺序写入分片。
 
-    关键修复：输出文件在整个下载过程中只打开一次，不能每批用 wb 重开；
+    使用滑动窗口：始终保持 concurrency 个分片在途，任一分片完成就立刻补进
+    下一个，避免"整批等最慢分片"的木桶效应。写盘仍严格按索引顺序进行。
+
+    关键点：输出文件在整个下载过程中只打开一次，不能每批用 wb 重开；
     否则前面已经写入的批次会被清空。
 
     单个分片耗尽重试次数后会记录并跳过，不中止整部影片。返回值为：
     (成功写入的字节数, 失败分片索引列表)。
+
+    init_url 用于 fMP4：该 init 段必须写在文件最前面，只在新建文件
+    （start_idx == 0）时写入一次。
     """
     if end_idx is None:
         end_idx = len(segment_urls)
@@ -421,46 +523,78 @@ def download_segments(
 
     # 只打开一次：这是修复 PPS/SPS 丢失问题的核心。
     with open(output_path, mode) as output_file:
-        for batch_start in range(0, len(indices), concurrency):
-            batch_indices = indices[batch_start : batch_start + concurrency]
-            results = {}
-            failures = {}
+        # fMP4 的 init 段携带 moov（编解码参数），必须位于所有媒体分片之前。
+        if init_url and mode == "wb":
+            init_data = download_single_segment(
+                init_url, -1, SEG_RETRY_MAX, SEG_RETRY_DELAY
+            )
+            output_file.write(init_data)
+            total_bytes += len(init_data)
 
-            with ThreadPoolExecutor(
-                max_workers=min(concurrency, len(batch_indices))
-            ) as executor:
-                future_to_index = {
-                    executor.submit(
-                        download_single_segment,
-                        segment_urls[index],
-                        index,
-                        SEG_RETRY_MAX,
-                        SEG_RETRY_DELAY,
-                    ): index
-                    for index in batch_indices
-                }
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            next_submit = 0
+            write_cursor = 0
+            done_buffer = {}
+            future_to_index = {}
+            # 已下完但因前面分片未到、还不能落盘的分片会暂存在内存里。
+            # 限制暂存量，避免某个慢分片导致缓冲无限膨胀吃光内存。
+            max_buffered = concurrency * 2
 
-                for future in as_completed(future_to_index):
-                    index = future_to_index[future]
-                    try:
-                        results[index] = future.result()
-                    except Exception as exc:
-                        failures[index] = str(exc)
-
-            if failures:
-                batch_failed_indices = sorted(failures)
-                failed_indices.extend(batch_failed_indices)
-                print(
-                    f"    警告: {len(batch_failed_indices)} 个分片耗尽重试次数，"
-                    f"将跳过并继续；索引: {batch_failed_indices}"
+            def submit_next():
+                nonlocal next_submit
+                if next_submit >= len(indices):
+                    return
+                index = indices[next_submit]
+                future = executor.submit(
+                    download_single_segment,
+                    segment_urls[index],
+                    index,
+                    SEG_RETRY_MAX,
+                    SEG_RETRY_DELAY,
                 )
+                future_to_index[future] = index
+                next_submit += 1
 
-            for index in batch_indices:
-                if index in failures:
-                    continue
-                data = results[index]
-                output_file.write(data)
-                total_bytes += len(data)
+            def refill():
+                # 缓冲过大时暂缓投递新分片，等落盘追上来再继续。
+                while (
+                    len(future_to_index) < concurrency
+                    and next_submit < len(indices)
+                    and (len(done_buffer) < max_buffered or not future_to_index)
+                ):
+                    submit_next()
+
+            refill()
+
+            while future_to_index:
+                done, _ = wait(
+                    future_to_index.keys(), return_when=FIRST_COMPLETED
+                )
+                for future in done:
+                    index = future_to_index.pop(future)
+                    try:
+                        done_buffer[index] = future.result()
+                    except Exception as exc:
+                        done_buffer[index] = None
+                        failed_indices.append(index)
+                        print(
+                            f"    警告: 分片 {index + 1} 耗尽重试次数，"
+                            f"将跳过并继续；{exc}"
+                        )
+
+                # 按索引顺序把已就绪的分片落盘，保证输出严格有序。
+                while write_cursor < len(indices):
+                    index = indices[write_cursor]
+                    if index not in done_buffer:
+                        break
+                    data = done_buffer.pop(index)
+                    if data is not None:
+                        output_file.write(data)
+                        total_bytes += len(data)
+                    write_cursor += 1
+
+                # 落盘后再补满窗口，保持 concurrency 个分片始终在途。
+                refill()
 
     return total_bytes, sorted(failed_indices)
 
@@ -543,20 +677,37 @@ def process_one_entry(entry, processed_ids):
         if not variants:
             raise RuntimeError("没有找到媒体播放列表或清晰度变体")
 
-        candidates = [item for item in variants if is_1080p(item[0])]
+        # 分辨率优先：先按档位从高到低排，档位相同时优先试 BANDWIDTH 高的。
+        # 分辨率未知的流排在最后，等采样后用 ffprobe 探测真实分辨率。
+        annotated = [
+            (resolution, playlist_url, bandwidth, parse_resolution(resolution))
+            for resolution, playlist_url, bandwidth in variants
+        ]
+        # 已声明分辨率且低于 1080p 的流直接排除，不必浪费采样流量。
+        candidates = [
+            item
+            for item in annotated
+            if item[3] is None or resolution_tier(item[3]) >= 1
+        ]
         if not candidates:
             raise RuntimeError("没有找到 1080p 或更高分辨率的流")
 
+        candidates.sort(
+            key=lambda item: (resolution_tier(item[3]), item[2]), reverse=True
+        )
+
+        best_tier = -1
         best_bitrate = 0.0
         best_resolution = None
         best_segment_urls = None
         best_durations = None
+        best_init_url = None
         best_sample_bytes = 0
         best_sample_count = 0
         best_sample_path = None
         best_sample_failed_indices = []
 
-        for resolution, playlist_url in candidates:
+        for resolution, playlist_url, _declared_bandwidth, size in candidates:
             print(f"  检测流 {resolution}: {playlist_url}")
             sample_path = os.path.join(
                 TEMP_DIR,
@@ -567,7 +718,9 @@ def process_one_entry(entry, processed_ids):
             remove_file(sample_path)
 
             try:
-                segment_urls, durations = parse_media_playlist(playlist_url)
+                segment_urls, durations, init_url = parse_media_playlist(
+                    playlist_url
+                )
                 sample_count = min(SAMPLE_COUNT, len(segment_urls))
                 sample_bytes, sample_failed_indices = download_segments(
                     segment_urls,
@@ -575,6 +728,7 @@ def process_one_entry(entry, processed_ids):
                     start_idx=0,
                     end_idx=sample_count,
                     concurrency=min(4, SEGMENT_CONCURRENCY),
+                    init_url=init_url,
                 )
                 sample_failed_set = set(sample_failed_indices)
                 sample_duration = sum(
@@ -585,16 +739,45 @@ def process_one_entry(entry, processed_ids):
                 if sample_duration <= 0 or sample_bytes <= 0:
                     raise RuntimeError("采样数据或采样时长为 0")
 
-                bitrate = sample_bytes * 8 / sample_duration / 1000
-                print(f"  流 {resolution} 采样码率: {bitrate:.0f} kbps")
+                # master 没声明 RESOLUTION 时，用采样文件探测真实分辨率。
+                actual_size = size
+                actual_resolution = resolution
+                if actual_size is None:
+                    actual_size = probe_resolution(sample_path)
+                    if actual_size is None:
+                        raise RuntimeError("无法探测该流的分辨率")
+                    actual_resolution = f"{actual_size[0]}x{actual_size[1]}"
+                    print(f"  流 {resolution} 实测分辨率: {actual_resolution}")
 
-                if bitrate > best_bitrate:
+                tier = resolution_tier(actual_size)
+                if tier < 1:
+                    raise RuntimeError(
+                        f"分辨率 {actual_resolution} 低于 1080p，跳过"
+                    )
+
+                bitrate = sample_bytes * 8 / sample_duration / 1000
+                print(f"  流 {actual_resolution} 采样码率: {bitrate:.0f} kbps")
+
+                # 恰好 1080p 档要求码率达标；更高分辨率不再设码率门槛。
+                if tier == 1 and bitrate <= MIN_BITRATE_KBPS:
+                    raise RuntimeError(
+                        f"1080p 流码率 {bitrate:.0f} kbps "
+                        f"未达到 {MIN_BITRATE_KBPS} kbps"
+                    )
+
+                # 分辨率优先，同档位下再比码率。
+                better = tier > best_tier or (
+                    tier == best_tier and bitrate > best_bitrate
+                )
+                if better:
                     if best_sample_path and best_sample_path != sample_path:
                         remove_file(best_sample_path)
+                    best_tier = tier
                     best_bitrate = bitrate
-                    best_resolution = resolution
+                    best_resolution = actual_resolution
                     best_segment_urls = segment_urls
                     best_durations = durations
+                    best_init_url = init_url
                     best_sample_bytes = sample_bytes
                     best_sample_count = sample_count
                     best_sample_path = sample_path
@@ -605,10 +788,10 @@ def process_one_entry(entry, processed_ids):
                 remove_file(sample_path)
                 print(f"  处理流 {resolution} 失败: {exc}")
 
-        if not best_sample_path or best_bitrate <= MIN_BITRATE_KBPS:
+        if not best_sample_path:
             raise RuntimeError(
-                f"所有 1080p 流采样码率均 <= {MIN_BITRATE_KBPS} kbps；"
-                f"最高为 {best_bitrate:.0f} kbps"
+                "没有可用的流：候选流全部低于 1080p、采样失败，"
+                f"或 1080p 流码率未达到 {MIN_BITRATE_KBPS} kbps"
             )
 
         print(
@@ -634,6 +817,7 @@ def process_one_entry(entry, processed_ids):
                 start_idx=best_sample_count,
                 end_idx=None,
                 concurrency=SEGMENT_CONCURRENCY,
+                init_url=best_init_url,
             )
 
         failed_segment_indices = sorted(
