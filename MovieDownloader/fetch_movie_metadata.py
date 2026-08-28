@@ -27,7 +27,7 @@ OUTPUT = Path("movies.jsonl")
 PROGRESS = Path("progress.txt")
 LOG_PATH = Path("fetch.log")
 
-KEEP_TYPES = {"movie", "tvMovie"}
+KEEP_TYPES = {"movie"}
 MAX_WORKERS = 8
 SLEEP = 0.25
 
