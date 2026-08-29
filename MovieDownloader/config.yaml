@@ -53,9 +53,17 @@ tmdb_ids_to_links:
   output: "results.jsonl"
   # 解析失败的 tmdb_id 记录
   fail_file: "fail.txt"
+  # 解密服务 API 根地址（负责 enc-vidup / dec-vidup 加解密）
+  api: "https://enc-dec.app/api"
+  # 并发线程数：同时解析多少个 tmdb_id。配合住宅代理分散 IP，20 较稳
+  max_workers: 20
   # 单个 id 的最大重试次数与每次重试间隔（秒）
   max_retries: 3
   retry_delay: 2
+  # 单个 HTTP 请求超时（秒）。启用 Session 连接复用后握手更快，
+  # 20 秒足够正常响应；调小可让卡死的请求更早放弃、减少线程空耗，
+  # 但过小会误杀较慢的正常响应，建议 15~30 之间按代理实测调整
+  timeout: 20
   # 代理配置：vidup.to 有 Cloudflare 机房 IP 拦截，直连会 403，需走住宅代理
   proxy:
     # true=启用下方代理，false=直连
