@@ -14,22 +14,42 @@ import sqlite3
 import threading
 import pandas as pd
 import tmdbsimple as tmdb
+import yaml
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ========== 配置 ==========
-TMDB_API_KEY = "83ee7d0b61b4623ae794e741a5883d34"
+# ========== 配置（从 config.yaml 的 fetch_movie_metadata 段读取）==========
+CONFIG_PATH = Path(__file__).with_name("config.yaml")
+
+
+def load_config() -> dict:
+    """读取项目统一配置文件中本脚本对应的段落。"""
+    if not CONFIG_PATH.exists():
+        raise SystemExit(f"找不到配置文件: {CONFIG_PATH}")
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        full = yaml.safe_load(f) or {}
+    cfg = full.get("fetch_movie_metadata")
+    if not isinstance(cfg, dict):
+        raise SystemExit("config.yaml 缺少 fetch_movie_metadata 配置段")
+    return cfg
+
+
+_CFG = load_config()
+
+TMDB_API_KEY = _CFG.get("tmdb_api_key") or ""
+if not TMDB_API_KEY:
+    raise SystemExit("请在 config.yaml 的 fetch_movie_metadata.tmdb_api_key 填写 TMDB API Key")
 tmdb.API_KEY = TMDB_API_KEY
 
-DATA_DIR = Path("imdb_data")
+DATA_DIR = Path(_CFG.get("data_dir", "imdb_data"))
 INDEX_DB = DATA_DIR / "index.db"  # 辅助索引库（akas/principals/names）
-OUTPUT = Path("movies.jsonl")
-PROGRESS = Path("progress.txt")
-LOG_PATH = Path("fetch.log")
+OUTPUT = Path(_CFG.get("output", "movies.jsonl"))
+PROGRESS = Path(_CFG.get("progress", "progress.txt"))
+LOG_PATH = Path(_CFG.get("log_path", "fetch.log"))
 
-KEEP_TYPES = {"movie"}
-MAX_WORKERS = 8
-SLEEP = 0.25
+KEEP_TYPES = set(_CFG.get("keep_types", ["movie"]))
+MAX_WORKERS = int(_CFG.get("max_workers", 8))
+SLEEP = float(_CFG.get("sleep", 0.25))
 
 BASE_URL = "https://datasets.imdbws.com/"
 DATASETS = {
@@ -229,9 +249,11 @@ def query_principals(imdb_id: str, names_dict: dict) -> list:
     return result
 
 
-def query_name(nconst: str) -> str:
-    r = get_conn().execute("SELECT primaryName FROM names WHERE nconst=?", (nconst,)).fetchone()
-    return r[0] if r else nconst
+def query_name(nconst: str, names_dict: dict) -> str:
+    # 统一从内存字典取名，与 cast_crew(query_principals) 共用同一数据来源，
+    # 避免同一份 names 表既走内存又走 SQLite 造成的重复存储与潜在不一致。
+    # 保留原语义：查不到时回退为 nconst 本身。
+    return names_dict.get(nconst, nconst)
 
 
 # ========== 加载小文件（全量，内存够用）==========
@@ -244,8 +266,16 @@ def load_basics() -> pd.DataFrame:
     df["runtimeMinutes"] = pd.to_numeric(df["runtimeMinutes"], errors="coerce")
     df["isAdult"] = df["isAdult"].map({"0": False, "1": True, 0: False, 1: True})
     df["genres"] = df["genres"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
+    df = df.set_index("tconst")
+    # tconst 理论上唯一，但对索引去重可防御脏数据：
+    # 若存在重复 tconst，basics.loc[imdb_id] 会返回多行 DataFrame 而非单行 Series，
+    # 导致后续 row.get(...) 取值异常。保留首次出现的记录。
+    dup = df.index.duplicated(keep="first")
+    if dup.any():
+        log.warning(f"basics: 发现 {int(dup.sum()):,} 个重复 tconst，已保留首次出现的记录")
+        df = df[~dup]
     log.info(f"basics: {len(df):,} 条")
-    return df.set_index("tconst")
+    return df
 
 
 def load_ratings() -> pd.DataFrame:
@@ -303,8 +333,8 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
     rat = ratings.loc[imdb_id] if imdb_id in ratings.index else None
     cr = crew.loc[imdb_id] if imdb_id in crew.index else None
 
-    directors = [query_name(n) for n in (cr["directors"] if cr is not None else [])]
-    writers = [query_name(n) for n in (cr["writers"] if cr is not None else [])]
+    directors = [query_name(n, names_dict) for n in (cr["directors"] if cr is not None else [])]
+    writers = [query_name(n, names_dict) for n in (cr["writers"] if cr is not None else [])]
 
     record = {
         "imdb_id": imdb_id,
@@ -361,8 +391,10 @@ def main():
             result = process(imdb_id, basics, ratings, crew, names_dict)
             return "ok" if result else "skip"
         except Exception as e:
-            log.error(f"{imdb_id} 异常: {e}")
-            mark_done(imdb_id)
+            # 注意：这里不能 mark_done。异常代表本条“未成功处理”，
+            # 若标记为已完成，重跑时会跳过它，造成静默丢数据。
+            # 不标记则下次运行会自动重试该 imdb_id。
+            log.error(f"{imdb_id} 异常（将于下次运行重试）: {e}")
             return "error"
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:

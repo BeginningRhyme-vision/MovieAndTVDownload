@@ -1,0 +1,118 @@
+# ============================================================================
+# MovieDownloader 项目统一配置文件
+# ----------------------------------------------------------------------------
+# 【设计约定】
+#   - 本文件按“代码文件”分段：每个顶层键对应一个 .py 脚本，段名与脚本文件名
+#     （去掉 .py）一致。
+#   - 每个脚本运行时只读取自己对应的那一段，互不干扰。
+#   - 想改某个脚本的参数，只需改它所属段落，无需改动任何代码。
+#
+# 【接入进度】
+#   - fetch_movie_metadata：已接入（脚本会读取本段）。
+#   - 其余段落为“预留配置”，对应脚本尚未接入，等后续逐个改造时再启用。
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# fetch_movie_metadata.py —— 抓取 IMDB 全量电影元数据并转换 TMDB ID
+# ----------------------------------------------------------------------------
+fetch_movie_metadata:
+  # TMDB API Key：在 https://www.themoviedb.org 申请。必填，留空会直接报错退出
+  tmdb_api_key: "83ee7d0b61b4623ae794e741a5883d34"
+
+  # 只保留哪些 IMDB 条目类型（title.basics 的 titleType 列）。
+  # 常见值：movie / tvSeries / short / tvMovie ...；这里默认只要电影
+  keep_types:
+    - movie
+
+  # 调用 TMDB API 的并发线程数。太高容易触发 429 限速，建议 4~8
+  max_workers: 8
+
+  # 每次调用 TMDB API 后的固定间隔（秒），用于降低触发限速的概率
+  sleep: 0.25
+
+  # ---- 以下为文件路径，一般无需修改 ----
+  # IMDB 数据集与 SQLite 索引库所在目录
+  data_dir: "imdb_data"
+  # 最终输出的电影元数据文件（下游 filter_to_ids.py 的输入）
+  output: "movies.jsonl"
+  # 断点续跑的进度记录文件（记录已处理的 imdb_id）
+  progress: "progress.txt"
+  # 运行日志文件
+  log_path: "fetch.log"
+
+
+# ----------------------------------------------------------------------------
+# tmdb_ids_to_links.py —— 由 tmdb_id 解析出可播放的 m3u8 地址
+# 【预留】对应脚本尚未接入本配置，后续改造时启用
+# ----------------------------------------------------------------------------
+tmdb_ids_to_links:
+  # 输入：待解析的 tmdb_id 列表（filter_to_ids.py 的产物）
+  input: "ids.txt"
+  # 输出：解析成功的结果（含 m3u8 地址）
+  output: "results.jsonl"
+  # 解析失败的 tmdb_id 记录
+  fail_file: "fail.txt"
+  # 单个 id 的最大重试次数与每次重试间隔（秒）
+  max_retries: 3
+  retry_delay: 2
+  # 代理配置：vidup.to 有 Cloudflare 机房 IP 拦截，直连会 403，需走住宅代理
+  proxy:
+    # true=启用下方代理，false=直连
+    enabled: true
+    host: "unmetered.residential.proxyrack.net"
+    user: "daran"
+    password: "TYQSUK9-3VKDM4M-MH365O9-HPDIYIG-O9YHYN9-FXCSKNO-QMS83CJ"
+    # 端口范围 [起, 止]，每次请求随机取一个端口以更换出口 IP
+    port_range: [9000, 9050]
+
+
+# ----------------------------------------------------------------------------
+# download_movies.py —— 下载 m3u8 并转封装为 mp4
+# 【预留】对应脚本尚未接入本配置，后续改造时启用
+# ----------------------------------------------------------------------------
+download_movies:
+  # 输入与日志
+  input: "results.jsonl"
+  success_log: "success.jsonl"
+  failed_log: "failed.jsonl"
+  # 视频落盘根目录与分文件夹规则
+  base_dir: "/mnt/MovieAndTVDownload/downloads"
+  temp_dir: "/mnt/MovieAndTVDownload/temp"
+  folder_prefix: "movie_"
+  max_videos_per_folder: 1000
+  start_folder_index: 1
+  # 并发控制
+  max_workers: 32          # 同时下载的影片数
+  convert_workers: 4       # 独立的 FFmpeg 转封装线程数
+  segment_concurrency: 64  # 单部影片同时下载的分片数
+  # 画质探测与分片重试
+  sample_count: 30
+  seg_retry_max: 20
+  seg_retry_delay: 1
+  # 选 1080p 时要求的最低码率（kbps），过滤伪高清
+  min_bitrate_kbps: 1850
+
+
+# ----------------------------------------------------------------------------
+# fetch_subtitles.py —— 按 tmdb_id 抓取外挂字幕
+# 【预留】对应脚本尚未接入本配置，后续改造时启用
+# ----------------------------------------------------------------------------
+fetch_subtitles:
+  # SubDL API Key：在 https://subdl.com/panel/api 免费申请。必填
+  subdl_api_key: ""
+  # 输入：download_movies.py 的成功日志
+  success_log: "success.jsonl"
+  # 字幕输出根目录
+  subtitle_dir: "/mnt/MovieAndTVDownload/subtitles"
+  # 已处理状态记录（断点续跑）
+  state_log: "subtitles.jsonl"
+  # 要抓取的语言：SubDL 语言代码 -> 输出文件后缀
+  languages:
+    EN: en
+    ZH: zh
+  # 并发与重试
+  max_workers: 4
+  request_timeout: 30
+  retry_max: 3
+  retry_delay: 3
