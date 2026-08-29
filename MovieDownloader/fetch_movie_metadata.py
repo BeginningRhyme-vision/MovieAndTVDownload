@@ -51,6 +51,14 @@ KEEP_TYPES = set(_CFG.get("keep_types", ["movie"]))
 MAX_WORKERS = int(_CFG.get("max_workers", 8))
 SLEEP = float(_CFG.get("sleep", 0.25))
 
+# 复用同一个 requests.Session：并发访问 TMDB 时共享 TCP 连接池，
+# 避免每次请求重复 DNS 解析 / TLS 握手，降低连接开销与偶发的连接重置。
+_SESSION = requests.Session()
+_SESSION.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS * 2,
+))
+tmdb.REQUESTS_SESSION = _SESSION
+
 BASE_URL = "https://datasets.imdbws.com/"
 DATASETS = {
     "basics": "title.basics.tsv.gz",
