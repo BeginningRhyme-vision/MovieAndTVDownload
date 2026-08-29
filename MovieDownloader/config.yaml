@@ -25,11 +25,12 @@ fetch_movie_metadata:
   keep_types:
     - movie
 
-  # 调用 TMDB API 的并发线程数。太高容易触发 429 限速，建议 4~8
-  max_workers: 8
+  # 调用 TMDB API 的并发线程数。TMDB 软上限约 50 req/s，配合 sleep 控制整体 QPS
+  max_workers: 16
 
   # 每次调用 TMDB API 后的固定间隔（秒），用于降低触发限速的概率
-  sleep: 0.25
+  # 16 并发 + 0.2s 约对应 50 QPS（贴近上限）；若日志频繁出现 429 可调大到 0.28
+  sleep: 0.2
 
   # ---- 以下为文件路径，一般无需修改 ----
   # IMDB 数据集与 SQLite 索引库所在目录

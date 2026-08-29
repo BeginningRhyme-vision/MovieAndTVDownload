@@ -131,81 +131,90 @@ def build_index():
     conn = sqlite3.connect(INDEX_DB)
     cur = conn.cursor()
 
-    # 检查是否已经建好
-    tables = {r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    def _index_ready(table: str) -> bool:
+        # 仅当"表存在且至少有一行数据"才算建好，避免上次插入途中崩溃留下的半成品空表被误判为完成
+        row = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not row:
+            return False
+        return cur.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+
+    def build_table(name, create_sql, index_sql, insert_sql, dataset_key,
+                    row_to_tuple, reader_kwargs=None):
+        # 全有或全无：清掉可能的半成品表 -> 建表建索引 -> 批量插入 -> 提交；
+        # 中途任何异常（含 KeyboardInterrupt/SystemExit）回滚并删表，保证不留半成品
+        if _index_ready(name):
+            log.info(f"索引已存在跳过: {name}")
+            return
+        cur.execute(f"DROP TABLE IF EXISTS {name}")
+        conn.commit()
+        log.info(f"建索引: {name} ...")
+        try:
+            cur.execute(create_sql)
+            if index_sql:
+                cur.execute(index_sql)
+            path = ensure_dataset(dataset_key)
+            with open(path, encoding="utf-8", errors="replace") as f:
+                reader = csv.DictReader(f, delimiter="\t", **(reader_kwargs or {}))
+                batch = []
+                for row in reader:
+                    rec = row_to_tuple(row)
+                    if rec is None:
+                        continue
+                    batch.append(rec)
+                    if len(batch) >= 50000:
+                        cur.executemany(insert_sql, batch)
+                        batch = []
+                if batch:
+                    cur.executemany(insert_sql, batch)
+            conn.commit()
+            log.info(f"建索引: {name} 完成")
+        except BaseException:
+            conn.rollback()
+            cur.execute(f"DROP TABLE IF EXISTS {name}")
+            conn.commit()
+            log.error(f"建索引: {name} 失败，已回滚并清除半成品表")
+            raise
 
     # --- names ---
-    if "names" not in tables:
-        log.info("建索引: names ...")
-        cur.execute("CREATE TABLE names (nconst TEXT PRIMARY KEY, primaryName TEXT)")
-        path = ensure_dataset("names")
-        with open(path, encoding="utf-8", errors="replace") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            batch = []
-            for row in reader:
-                batch.append((row["nconst"], row.get("primaryName", "")))
-                if len(batch) >= 50000:
-                    cur.executemany("INSERT OR IGNORE INTO names VALUES (?,?)", batch)
-                    batch = []
-            if batch:
-                cur.executemany("INSERT OR IGNORE INTO names VALUES (?,?)", batch)
-        conn.commit()
-        log.info("建索引: names 完成")
-    else:
-        log.info("索引已存在跳过: names")
+    build_table(
+        "names",
+        "CREATE TABLE names (nconst TEXT PRIMARY KEY, primaryName TEXT)",
+        None,
+        "INSERT OR IGNORE INTO names VALUES (?,?)",
+        "names",
+        lambda row: (row["nconst"], row.get("primaryName", "")),
+    )
 
     # --- akas ---
-    if "akas" not in tables:
-        log.info("建索引: akas ...")
-        cur.execute("""CREATE TABLE akas (
+    _akas_cols = ["titleId", "ordering", "title", "region", "language", "types", "attributes", "isOriginalTitle"]
+    build_table(
+        "akas",
+        """CREATE TABLE akas (
             titleId TEXT, ordering TEXT, title TEXT, region TEXT,
             language TEXT, types TEXT, attributes TEXT, isOriginalTitle TEXT
-        )""")
-        cur.execute("CREATE INDEX idx_akas_titleId ON akas(titleId)")
-        path = ensure_dataset("akas")
-        with open(path, encoding="utf-8", errors="replace") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            batch = []
-            cols = ["titleId", "ordering", "title", "region", "language", "types", "attributes", "isOriginalTitle"]
-            for row in reader:
-                batch.append(tuple(row.get(c, "") for c in cols))
-                if len(batch) >= 50000:
-                    cur.executemany("INSERT INTO akas VALUES (?,?,?,?,?,?,?,?)", batch)
-                    batch = []
-            if batch:
-                cur.executemany("INSERT INTO akas VALUES (?,?,?,?,?,?,?,?)", batch)
-        conn.commit()
-        log.info("建索引: akas 完成")
-    else:
-        log.info("索引已存在跳过: akas")
+        )""",
+        "CREATE INDEX idx_akas_titleId ON akas(titleId)",
+        "INSERT INTO akas VALUES (?,?,?,?,?,?,?,?)",
+        "akas",
+        lambda row: tuple(row.get(c, "") for c in _akas_cols),
+    )
 
     # --- principals ---
-    if "principals" not in tables:
-        log.info("建索引: principals ...")
-        cur.execute("""CREATE TABLE principals (
+    _principals_cols = ["tconst", "ordering", "nconst", "category", "job", "characters"]
+    build_table(
+        "principals",
+        """CREATE TABLE principals (
             tconst TEXT, ordering TEXT, nconst TEXT,
             category TEXT, job TEXT, characters TEXT
-        )""")
-        cur.execute("CREATE INDEX idx_principals_tconst ON principals(tconst)")
-        path = ensure_dataset("principals")
-        with open(path, encoding="utf-8", errors="replace") as f:
-            reader = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
-            batch = []
-            cols = ["tconst", "ordering", "nconst", "category", "job", "characters"]
-            for row in reader:
-                try:
-                    batch.append(tuple(row.get(c, "") for c in cols))
-                except Exception:
-                    continue
-                if len(batch) >= 50000:
-                    cur.executemany("INSERT INTO principals VALUES (?,?,?,?,?,?)", batch)
-                    batch = []
-            if batch:
-                cur.executemany("INSERT INTO principals VALUES (?,?,?,?,?,?)", batch)
-        conn.commit()
-        log.info("建索引: principals 完成")
-    else:
-        log.info("索引已存在跳过: principals")
+        )""",
+        "CREATE INDEX idx_principals_tconst ON principals(tconst)",
+        "INSERT INTO principals VALUES (?,?,?,?,?,?)",
+        "principals",
+        lambda row: tuple(row.get(c, "") for c in _principals_cols),
+        reader_kwargs={"quoting": csv.QUOTE_NONE},
+    )
 
     conn.close()
     log.info("SQLite 索引全部就绪")
@@ -283,8 +292,13 @@ def load_ratings() -> pd.DataFrame:
     df = pd.read_csv(path, sep="\t", na_values="\\N")
     df["averageRating"] = pd.to_numeric(df["averageRating"], errors="coerce")
     df["numVotes"] = pd.to_numeric(df["numVotes"], errors="coerce")
+    df = df.set_index("tconst")
+    dup = df.index.duplicated(keep="first")
+    if dup.any():
+        log.warning(f"ratings: 发现 {int(dup.sum()):,} 个重复 tconst，已保留首次出现的记录")
+        df = df[~dup]
     log.info(f"ratings: {len(df):,} 条")
-    return df.set_index("tconst")
+    return df
 
 
 def load_crew() -> pd.DataFrame:
@@ -292,8 +306,13 @@ def load_crew() -> pd.DataFrame:
     df = pd.read_csv(path, sep="\t", na_values="\\N")
     df["directors"] = df["directors"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df["writers"] = df["writers"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
+    df = df.set_index("tconst")
+    dup = df.index.duplicated(keep="first")
+    if dup.any():
+        log.warning(f"crew: 发现 {int(dup.sum()):,} 个重复 tconst，已保留首次出现的记录")
+        df = df[~dup]
     log.info(f"crew: {len(df):,} 条")
-    return df.set_index("tconst")
+    return df
 
 
 def load_names_dict() -> dict:
