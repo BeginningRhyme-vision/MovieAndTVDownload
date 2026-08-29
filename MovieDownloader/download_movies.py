@@ -15,35 +15,65 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
+from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
 import urllib3
+import yaml
 from requests.adapters import HTTPAdapter
 from urllib3.exceptions import InsecureRequestWarning
 from urllib3.util.retry import Retry
 
 
 # ---------- 配置 ----------
-INPUT_JSONL = "results.jsonl"
-SUCCESS_LOG = "success.jsonl"
-FAILED_LOG = "failed.jsonl"
-BASE_DIR = "/mnt/MovieAndTVDownload/downloads"
-FOLDER_PREFIX = "movie_"
-MAX_VIDEOS_PER_FOLDER = 1000
-START_FOLDER_INDEX = 1
+def load_config():
+    """读取与本脚本同目录的 config.yaml 中 download_movies 段。"""
+    config_path = Path(__file__).with_name("config.yaml")
+    if not config_path.exists():
+        return {}
+    with open(config_path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data.get("download_movies", {}) or {}
+
+
+_CFG = load_config()
+
+# 脚本所在目录（MovieDownloader/），作为相对路径与默认目录的根。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def resolve_dir(value, default_name):
+    """解析下载/临时目录配置：
+    - 为空 -> 脚本目录下的 default_name 子目录（随项目位置自动跟随）；
+    - 相对路径 -> 以脚本目录为根拼接；
+    - 绝对路径 -> 直接使用。
+    """
+    raw = value.strip() if isinstance(value, str) else value
+    if not raw:
+        raw = default_name
+    return str((_SCRIPT_DIR / raw).resolve())
+
+
+INPUT_JSONL = _CFG.get("input", "results.jsonl")
+SUCCESS_LOG = _CFG.get("success_log", "success.jsonl")
+FAILED_LOG = _CFG.get("failed_log", "failed.jsonl")
+BASE_DIR = resolve_dir(_CFG.get("base_dir"), "downloads")
+FOLDER_PREFIX = _CFG.get("folder_prefix", "movie_")
+MAX_VIDEOS_PER_FOLDER = _CFG.get("max_videos_per_folder", 1000)
+START_FOLDER_INDEX = _CFG.get("start_folder_index", 1)
 
 # 下载线程池固定保持的影片下载数。
-MAX_WORKERS = 32
+MAX_WORKERS = _CFG.get("max_workers", 32)
 # 独立的 FFmpeg 转封装/移动线程数，不占用上面的下载槽位。
-CONVERT_WORKERS = 4
+CONVERT_WORKERS = _CFG.get("convert_workers", 4)
 # 单部影片同时下载的分片数。
-SEGMENT_CONCURRENCY = 64
-TEMP_DIR = "/mnt/MovieAndTVDownload/temp"
-SAMPLE_COUNT = 30
-SEG_RETRY_MAX = 20
-SEG_RETRY_DELAY = 1
-MIN_BITRATE_KBPS = 1850
+SEGMENT_CONCURRENCY = _CFG.get("segment_concurrency", 64)
+TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
+SAMPLE_COUNT = _CFG.get("sample_count", 30)
+SEG_RETRY_MAX = _CFG.get("seg_retry_max", 20)
+SEG_RETRY_DELAY = _CFG.get("seg_retry_delay", 1)
+MIN_BITRATE_KBPS = _CFG.get("min_bitrate_kbps", 1850)
 
 HEADERS = {
     "User-Agent": (
@@ -479,7 +509,7 @@ def download_single_segment(url, index, retry_max, delay):
                 f"    分片 {index + 1} 下载失败 "
                 f"({attempt}/{retry_max}): {exc}; {wait:.1f}s 后重试"
             )
-            time.sleep(random.uniform(3, 5))
+            time.sleep(wait)
 
     raise RuntimeError(
         f"分片 {index + 1} 重试 {retry_max} 次后仍失败: {last_error}"

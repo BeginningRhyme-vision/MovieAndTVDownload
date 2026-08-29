@@ -84,9 +84,15 @@ download_movies:
   input: "results.jsonl"
   success_log: "success.jsonl"
   failed_log: "failed.jsonl"
-  # 视频落盘根目录与分文件夹规则
-  base_dir: "/mnt/MovieAndTVDownload/downloads"
-  temp_dir: "/mnt/MovieAndTVDownload/temp"
+  # 视频落盘根目录与临时工作目录。
+  # 支持三种写法：
+  #   1) 相对路径（如 downloads）—— 以脚本所在目录 MovieDownloader/ 为根，
+  #      故默认值即项目下的 MovieDownloader/downloads 与 MovieDownloader/temp，
+  #      随项目 clone 位置自动跟随；
+  #   2) 绝对路径（如 /mnt/data/downloads）—— 直接使用该路径；
+  #   3) 两者建议放在同一磁盘，成品从 temp_dir 移到 base_dir 才是瞬时操作。
+  base_dir: "downloads"
+  temp_dir: "temp"
   folder_prefix: "movie_"
   max_videos_per_folder: 1000
   start_folder_index: 1
