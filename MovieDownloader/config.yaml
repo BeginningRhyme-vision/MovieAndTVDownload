@@ -102,7 +102,7 @@ download_movies:
   start_folder_index: 1
   # 并发控制
   max_workers: 32          # 同时下载的影片数
-  convert_workers: 4       # 独立的 FFmpeg 转封装线程数
+  convert_workers: 16      # 独立的 FFmpeg 转封装线程数（与 upload_workers 对齐）
   segment_concurrency: 64  # 单部影片同时下载的分片数
   # 画质探测与分片重试
   sample_count: 30

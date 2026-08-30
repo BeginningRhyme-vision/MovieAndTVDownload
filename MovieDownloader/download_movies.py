@@ -68,7 +68,7 @@ START_FOLDER_INDEX = _CFG.get("start_folder_index", 1)
 # 下载线程池固定保持的影片下载数。
 MAX_WORKERS = _CFG.get("max_workers", 32)
 # 独立的 FFmpeg 转封装/移动线程数，不占用上面的下载槽位。
-CONVERT_WORKERS = _CFG.get("convert_workers", 4)
+CONVERT_WORKERS = _CFG.get("convert_workers", 16)
 # 单部影片同时下载的分片数。
 SEGMENT_CONCURRENCY = _CFG.get("segment_concurrency", 64)
 TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
@@ -353,6 +353,61 @@ def write_pending(record):
     with pending_lock:
         with open(UPLOAD_PENDING_LOG, "a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# 主流程运行标记文件：用于让手动 reupload 检测主流程是否在跑，
+# 避免二者并发操作 pending 文件导致记录被覆盖丢失。
+MAIN_LOCK_FILE = str((_SCRIPT_DIR / "download_movies.main.lock").resolve())
+
+
+def _pid_alive(pid):
+    """判断给定 PID 的进程是否存活（不发送真正的信号）。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 进程存在但无权限——仍视为存活。
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def acquire_main_lock():
+    """主流程启动时写入 PID 锁文件。"""
+    with open(MAIN_LOCK_FILE, "w", encoding="utf-8") as file:
+        file.write(str(os.getpid()))
+
+
+def release_main_lock():
+    """主流程退出时清理锁文件（仅当锁属于本进程时才删）。"""
+    try:
+        with open(MAIN_LOCK_FILE, "r", encoding="utf-8") as file:
+            pid = int((file.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        pid = 0
+    if pid == os.getpid():
+        remove_file(MAIN_LOCK_FILE)
+
+
+def is_main_running():
+    """检测主流程是否正在运行：锁文件存在且其中 PID 仍存活。
+
+    若锁文件存在但 PID 已死（上次异常退出留下的陈旧锁），清理后返回 False。
+    """
+    if not os.path.exists(MAIN_LOCK_FILE):
+        return False
+    try:
+        with open(MAIN_LOCK_FILE, "r", encoding="utf-8") as file:
+            pid = int((file.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return False
+    if pid > 0 and _pid_alive(pid):
+        return True
+    # 陈旧锁：进程已不在，清理掉。
+    remove_file(MAIN_LOCK_FILE)
+    return False
 
 
 def safe_file_token(value):
@@ -1065,45 +1120,42 @@ def upload_one_entry(success_info):
 
     S3_ENABLED=False 时走老逻辑：不传不删，成品留本地，仅写 SUCCESS_LOG。
     无论上传成败都会写 SUCCESS_LOG（标记 uploaded 字段），避免下次重新下载。
-    反压信号量在提交上传时已 acquire，本函数结束时 release。
+    反压信号量由提交方在 future 完成回调中释放，本函数不负责 release。
     """
     tmdb_id = success_info["tmdbId"]
     local_path = success_info["final_path"]
-    try:
-        if not S3_ENABLED:
-            success_info["uploaded"] = False
-            write_log(SUCCESS_LOG, success_info)
-            print(f"  [{tmdb_id}] 成功（未上传，本地保留）: {local_path}",
-                  flush=True)
-            return tmdb_id, True, success_info
-
-        s3_key = build_s3_key(local_path)
-        ok, reason = upload_to_r2(local_path, s3_key)
-        if ok:
-            success_info["uploaded"] = True
-            success_info["s3_key"] = s3_key
-            if DELETE_LOCAL_AFTER_UPLOAD:
-                remove_file(local_path)
-            write_log(SUCCESS_LOG, success_info)
-            print(f"  [{tmdb_id}] 上传成功: {s3_key}", flush=True)
-            return tmdb_id, True, success_info
-
-        # 上传失败：保留本地文件，写 SUCCESS_LOG(uploaded=false) 防重下 + 写 pending。
+    if not S3_ENABLED:
         success_info["uploaded"] = False
-        success_info["s3_key"] = s3_key
         write_log(SUCCESS_LOG, success_info)
-        write_pending({
-            "tmdbId": tmdb_id,
-            "title": success_info.get("title", ""),
-            "local_path": local_path,
-            "s3_key": s3_key,
-            "fail_reason": reason,
-            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-        })
-        print(f"  [{tmdb_id}] 上传失败，已留本地待补传: {reason}", flush=True)
-        return tmdb_id, False, {"error": f"上传失败: {reason}"}
-    finally:
-        upload_semaphore.release()
+        print(f"  [{tmdb_id}] 成功（未上传，本地保留）: {local_path}",
+              flush=True)
+        return tmdb_id, True, success_info
+
+    s3_key = build_s3_key(local_path)
+    ok, reason = upload_to_r2(local_path, s3_key)
+    if ok:
+        success_info["uploaded"] = True
+        success_info["s3_key"] = s3_key
+        if DELETE_LOCAL_AFTER_UPLOAD:
+            remove_file(local_path)
+        write_log(SUCCESS_LOG, success_info)
+        print(f"  [{tmdb_id}] 上传成功: {s3_key}", flush=True)
+        return tmdb_id, True, success_info
+
+    # 上传失败：保留本地文件，写 SUCCESS_LOG(uploaded=false) 防重下 + 写 pending。
+    success_info["uploaded"] = False
+    success_info["s3_key"] = s3_key
+    write_log(SUCCESS_LOG, success_info)
+    write_pending({
+        "tmdbId": tmdb_id,
+        "title": success_info.get("title", ""),
+        "local_path": local_path,
+        "s3_key": s3_key,
+        "fail_reason": reason,
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    print(f"  [{tmdb_id}] 上传失败，已留本地待补传: {reason}", flush=True)
+    return tmdb_id, False, {"error": f"上传失败: {reason}"}
 
 
 
@@ -1111,6 +1163,14 @@ def upload_one_entry(success_info):
 
 # ---------- 主函数 ----------
 def main():
+    acquire_main_lock()
+    try:
+        _run_pipeline()
+    finally:
+        release_main_lock()
+
+
+def _run_pipeline():
     clean_temp_directory()
     print("已清理 temp 目录中的旧临时文件")
 
@@ -1248,9 +1308,13 @@ def main():
 
             # 转封装成功 -> 提交上传。反压：先 acquire 信号量（限制在途+排队
             # 的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载会在此阻塞，
-            # 从而钳制本地磁盘占用上限。信号量在 upload_one_entry 结束时 release。
+            # 从而钳制本地磁盘占用上限。release 由 future 完成回调对称释放，
+            # 保证无论上传成功/异常/取消都不会泄漏信号量（避免耗尽后死锁）。
             upload_semaphore.acquire()
             upload_future = upload_executor.submit(upload_one_entry, info)
+            upload_future.add_done_callback(
+                lambda _f: upload_semaphore.release()
+            )
             upload_future_to_entry[upload_future] = entry
 
         # 退出前必须 wait 所有上传池任务跑完——这是数据完整性的硬保证，
@@ -1294,6 +1358,13 @@ def reupload_pending():
     """
     if not S3_ENABLED:
         print("s3.enabled=false，未开启远端上传，无需补传。")
+        return
+    if is_main_running():
+        print(
+            "检测到主流程（download_movies.py）正在运行，"
+            "此时手动补传会与主流程并发操作 pending 文件、可能导致记录丢失。"
+            "请在主流程结束后再执行 reupload。本次补传已忽略。"
+        )
         return
     if not os.path.exists(UPLOAD_PENDING_LOG):
         print(f"未找到 pending 日志 {UPLOAD_PENDING_LOG}，无待补传文件。")
