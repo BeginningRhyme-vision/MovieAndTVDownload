@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import (
@@ -80,6 +81,22 @@ MAX_MISSING_RATIO = _CFG.get("max_missing_ratio", 0.02)
 # 小样本豁免：允许至少丢这么多片而不触发阈值（与比例阈值取较大者）。
 MIN_MISSING_ALLOWANCE = _CFG.get("min_missing_allowance", 1)
 
+# ---- R2 上传配置 ----
+UPLOAD_PENDING_LOG = _CFG.get("upload_pending_log", "upload_pending.jsonl")
+_S3_CFG = _CFG.get("s3", {}) or {}
+S3_ENABLED = bool(_S3_CFG.get("enabled", False))
+S3_ENDPOINT_URL = _S3_CFG.get("endpoint_url", "") or ""
+S3_REGION = _S3_CFG.get("region", "auto") or "auto"
+S3_BUCKET = _S3_CFG.get("bucket", "") or ""
+S3_PREFIX = (_S3_CFG.get("prefix", "movies") or "").strip("/")
+S3_ACCESS_KEY = _S3_CFG.get("access_key", "") or ""
+S3_SECRET_KEY = _S3_CFG.get("secret_key", "") or ""
+UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
+MAX_PENDING_UPLOADS = _S3_CFG.get("max_pending_uploads", 64)
+UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
+UPLOAD_RETRY_DELAY = _S3_CFG.get("upload_retry_delay", 3)
+DELETE_LOCAL_AFTER_UPLOAD = bool(_S3_CFG.get("delete_local_after_upload", True))
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -96,6 +113,38 @@ folder_lock = threading.Lock()
 processing_lock = threading.Lock()
 processing_ids = set()
 _thread_local = threading.local()
+
+# 上传相关：pending 日志写入锁 + 反压信号量 + boto3 客户端单例（线程安全懒加载）。
+pending_lock = threading.Lock()
+# 反压：限制"在途+排队"的上传总量，达到上限时提交上传的线程阻塞，
+# 阻塞回传到转封装、再回传到下载，从而钳制本地磁盘占用上限。
+upload_semaphore = threading.BoundedSemaphore(MAX_PENDING_UPLOADS)
+_s3_client_lock = threading.Lock()
+_s3_client = None
+
+
+def get_s3_client():
+    """懒加载并复用 boto3 S3 客户端（R2 兼容）。多线程共享同一 client 是安全的。"""
+    global _s3_client
+    if _s3_client is not None:
+        return _s3_client
+    with _s3_client_lock:
+        if _s3_client is None:
+            import boto3
+            from botocore.config import Config as BotoConfig
+
+            _s3_client = boto3.client(
+                "s3",
+                endpoint_url=S3_ENDPOINT_URL,
+                region_name=S3_REGION,
+                aws_access_key_id=S3_ACCESS_KEY,
+                aws_secret_access_key=S3_SECRET_KEY,
+                config=BotoConfig(
+                    signature_version="s3v4",
+                    retries={"max_attempts": 1, "mode": "standard"},
+                ),
+            )
+    return _s3_client
 
 # 因为本脚本明确关闭了 TLS 证书校验，所以关闭对应警告。
 urllib3.disable_warnings(InsecureRequestWarning)
@@ -273,6 +322,37 @@ def write_log(log_file, data):
     with log_lock:
         with open(log_file, "a", encoding="utf-8") as file:
             file.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def build_s3_key(local_path):
+    """把本地成品路径映射为 R2 对象键，保留 movie_00001/xxx.mp4 目录结构。
+
+    如 BASE_DIR/movie_000001/12345.mp4 -> {S3_PREFIX}/movie_000001/12345.mp4
+    """
+    rel = os.path.relpath(local_path, BASE_DIR).replace(os.sep, "/")
+    return f"{S3_PREFIX}/{rel}" if S3_PREFIX else rel
+
+
+def upload_to_r2(local_path, s3_key):
+    """带指数退避重试地上传单个文件到 R2。成功返回 True，耗尽重试返回 (False, 原因)。"""
+    client = get_s3_client()
+    last_exc = None
+    for attempt in range(1, UPLOAD_RETRY_MAX + 1):
+        try:
+            client.upload_file(local_path, S3_BUCKET, s3_key)
+            return True, None
+        except Exception as exc:  # noqa: BLE001 - 网络/凭证/服务端多种异常统一重试
+            last_exc = exc
+            if attempt < UPLOAD_RETRY_MAX:
+                time.sleep(UPLOAD_RETRY_DELAY * attempt)
+    return False, str(last_exc)
+
+
+def write_pending(record):
+    """线程安全地向 upload_pending_log 追加一条待补传记录。"""
+    with pending_lock:
+        with open(UPLOAD_PENDING_LOG, "a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def safe_file_token(value):
@@ -931,7 +1011,11 @@ def process_one_entry(entry, processed_ids):
 
 
 def finalize_one_entry(conversion_job, processed_ids):
-    """独立执行 FFmpeg 转封装和文件移动，不占用下载线程。"""
+    """转封装 + 移动到目标目录。成功后登记去重，把成品交给上传阶段。
+
+    注意：SUCCESS_LOG 的写入推迟到上传阶段统一处理（以便标记 uploaded 字段），
+    但 processed_ids 在此登记——成品已落地，无论后续上传成败都不应再重新下载。
+    """
     tmdb_id = conversion_job["tmdbId"]
     normalized_id = conversion_job["normalized_id"]
     final_ts = conversion_job["final_ts"]
@@ -959,20 +1043,70 @@ def finalize_one_entry(conversion_job, processed_ids):
                 "missing_segment_indices"
             ],
         }
-        write_log(SUCCESS_LOG, success_info)
         completed = True
-        print(f"  [{tmdb_id}] 成功: {final_path}", flush=True)
+        print(f"  [{tmdb_id}] 转封装完成: {final_path}", flush=True)
         return tmdb_id, True, success_info
 
     except Exception as exc:
         return tmdb_id, False, {"error": str(exc)}
     finally:
+        # 只清理中间产物（TS/采样），成品 mp4 交给上传阶段处理，不在此删。
         for path in cleanup_paths:
             remove_file(path)
+        # 成品已落地即登记去重（成败上传都不再重下）；失败则释放 ID 锁允许重试。
         with processing_lock:
             processing_ids.discard(normalized_id)
             if completed:
                 processed_ids.add(normalized_id)
+
+
+def upload_one_entry(success_info):
+    """上传阶段：把成品 mp4 传到 R2，成功删本地；失败留本地并写 pending。
+
+    S3_ENABLED=False 时走老逻辑：不传不删，成品留本地，仅写 SUCCESS_LOG。
+    无论上传成败都会写 SUCCESS_LOG（标记 uploaded 字段），避免下次重新下载。
+    反压信号量在提交上传时已 acquire，本函数结束时 release。
+    """
+    tmdb_id = success_info["tmdbId"]
+    local_path = success_info["final_path"]
+    try:
+        if not S3_ENABLED:
+            success_info["uploaded"] = False
+            write_log(SUCCESS_LOG, success_info)
+            print(f"  [{tmdb_id}] 成功（未上传，本地保留）: {local_path}",
+                  flush=True)
+            return tmdb_id, True, success_info
+
+        s3_key = build_s3_key(local_path)
+        ok, reason = upload_to_r2(local_path, s3_key)
+        if ok:
+            success_info["uploaded"] = True
+            success_info["s3_key"] = s3_key
+            if DELETE_LOCAL_AFTER_UPLOAD:
+                remove_file(local_path)
+            write_log(SUCCESS_LOG, success_info)
+            print(f"  [{tmdb_id}] 上传成功: {s3_key}", flush=True)
+            return tmdb_id, True, success_info
+
+        # 上传失败：保留本地文件，写 SUCCESS_LOG(uploaded=false) 防重下 + 写 pending。
+        success_info["uploaded"] = False
+        success_info["s3_key"] = s3_key
+        write_log(SUCCESS_LOG, success_info)
+        write_pending({
+            "tmdbId": tmdb_id,
+            "title": success_info.get("title", ""),
+            "local_path": local_path,
+            "s3_key": s3_key,
+            "fail_reason": reason,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        print(f"  [{tmdb_id}] 上传失败，已留本地待补传: {reason}", flush=True)
+        return tmdb_id, False, {"error": f"上传失败: {reason}"}
+    finally:
+        upload_semaphore.release()
+
+
+
 
 
 # ---------- 主函数 ----------
@@ -1033,14 +1167,19 @@ def main():
         "duplicate entry currently processing",
     }
     conversion_future_to_entry = {}
+    upload_future_to_entry = {}
 
     print(
-        f"启动两级流水线: {MAX_WORKERS} 个下载槽位，"
-        f"{CONVERT_WORKERS} 个独立转封装槽位"
+        f"启动三级流水线: {MAX_WORKERS} 个下载槽位，"
+        f"{CONVERT_WORKERS} 个独立转封装槽位，"
+        f"{UPLOAD_WORKERS} 个上传槽位"
+        f"（反压上限 {MAX_PENDING_UPLOADS} 在途上传，S3 上传="
+        f"{'开启' if S3_ENABLED else '关闭'}）"
     )
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as download_executor, \
-            ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as conversion_executor:
+            ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as conversion_executor, \
+            ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as upload_executor:
         download_future_to_entry = {
             download_executor.submit(
                 process_one_entry, entry, processed_ids
@@ -1105,7 +1244,142 @@ def main():
                 }
                 write_log(FAILED_LOG, failed_info)
                 print(f"转封装失败: {tmdb_id}: {failed_info['error']}")
+                continue
+
+            # 转封装成功 -> 提交上传。反压：先 acquire 信号量（限制在途+排队
+            # 的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载会在此阻塞，
+            # 从而钳制本地磁盘占用上限。信号量在 upload_one_entry 结束时 release。
+            upload_semaphore.acquire()
+            upload_future = upload_executor.submit(upload_one_entry, info)
+            upload_future_to_entry[upload_future] = entry
+
+        # 退出前必须 wait 所有上传池任务跑完——这是数据完整性的硬保证，
+        # 否则 with 块退出会等线程池但成品可能尚未落到远端。
+        print(
+            f"所有转封装任务已结束，共进入上传队列 "
+            f"{len(upload_future_to_entry)} 部；等待全部上传完成..."
+        )
+        for future in as_completed(upload_future_to_entry):
+            entry = upload_future_to_entry[future]
+            try:
+                tmdb_id, upload_success, info = future.result()
+            except Exception as exc:
+                tmdb_id = entry.get("tmdbId")
+                upload_success = False
+                info = {"error": str(exc)}
+
+            if not upload_success:
+                # upload_one_entry 内部已写 pending 与 SUCCESS_LOG(uploaded=false)，
+                # 这里再落一条 FAILED_LOG 便于统计上传阶段失败。
+                failed_info = {
+                    "tmdbId": tmdb_id,
+                    "title": entry.get("title", ""),
+                    "url": entry.get("url", ""),
+                    "error": info.get("error", "未知错误"),
+                    "stage": "upload",
+                }
+                write_log(FAILED_LOG, failed_info)
+                print(f"上传失败: {tmdb_id}: {failed_info['error']}")
+
+
+def reupload_pending():
+    """手动补传：读 upload_pending.jsonl，逐条重传上传失败留在本地的成品。
+
+    一致性铁律：
+      1. 补传前检查 os.path.exists(local_path)，文件不在（已被补传/手动清理）则
+         直接从 pending 移除，视为已消解，不再重复上传。
+      2. 同一 tmdbId 只保留最新一条 pending 记录（去孤儿/去重复）。
+      3. 补传成功 -> 删本地 + 从 pending 移除（重写整个文件）+ 更新 SUCCESS_LOG
+         标 uploaded:true；仍失败则保留该条 pending。
+    """
+    if not S3_ENABLED:
+        print("s3.enabled=false，未开启远端上传，无需补传。")
+        return
+    if not os.path.exists(UPLOAD_PENDING_LOG):
+        print(f"未找到 pending 日志 {UPLOAD_PENDING_LOG}，无待补传文件。")
+        return
+
+    # 读入全部记录，同 tmdbId 只保留最新一条。
+    latest_by_id = {}
+    order = []
+    with open(UPLOAD_PENDING_LOG, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tmdb_id = record.get("tmdbId")
+            if tmdb_id is None:
+                continue
+            if tmdb_id not in latest_by_id:
+                order.append(tmdb_id)
+            latest_by_id[tmdb_id] = record
+
+    if not latest_by_id:
+        print(f"{UPLOAD_PENDING_LOG} 中无有效待补传记录。")
+        return
+
+    print(f"共 {len(latest_by_id)} 个待补传文件，开始逐条补传...")
+
+    remaining = {}  # tmdbId -> record，仍失败保留
+    success_count = 0
+    orphan_count = 0
+    fail_count = 0
+
+    for tmdb_id in order:
+        record = latest_by_id[tmdb_id]
+        local_path = record.get("local_path", "")
+        s3_key = record.get("s3_key") or build_s3_key(local_path)
+
+        if not local_path or not os.path.exists(local_path):
+            # 文件已不在本地：视为已消解（可能此前已成功补传），从 pending 移除。
+            orphan_count += 1
+            print(f"  [{tmdb_id}] 本地文件不存在，跳过并移除 pending: {local_path}")
+            continue
+
+        print(f"  [{tmdb_id}] 补传中 -> {s3_key}")
+        ok, reason = upload_to_r2(local_path, s3_key)
+        if ok:
+            if DELETE_LOCAL_AFTER_UPLOAD:
+                remove_file(local_path)
+            write_log(SUCCESS_LOG, {
+                "tmdbId": tmdb_id,
+                "title": record.get("title", ""),
+                "final_path": local_path,
+                "s3_key": s3_key,
+                "uploaded": True,
+                "reupload": True,
+            })
+            success_count += 1
+            print(f"  [{tmdb_id}] 补传成功: {s3_key}")
+        else:
+            record["s3_key"] = s3_key
+            record["fail_reason"] = reason
+            record["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            remaining[tmdb_id] = record
+            fail_count += 1
+            print(f"  [{tmdb_id}] 补传仍失败，保留 pending: {reason}")
+
+    # 重写整个 pending 文件：仅保留仍失败的记录。用锁保证与在跑主流程互斥。
+    with pending_lock:
+        with open(UPLOAD_PENDING_LOG, "w", encoding="utf-8") as file:
+            for tmdb_id in order:
+                if tmdb_id in remaining:
+                    file.write(
+                        json.dumps(remaining[tmdb_id], ensure_ascii=False) + "\n"
+                    )
+
+    print(
+        f"补传完成：成功 {success_count}，仍失败 {fail_count}，"
+        f"孤儿(本地已无)清理 {orphan_count}；pending 剩余 {len(remaining)} 条。"
+    )
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "reupload":
+        reupload_pending()
+    else:
+        main()

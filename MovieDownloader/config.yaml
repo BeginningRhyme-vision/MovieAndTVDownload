@@ -117,6 +117,25 @@ download_movies:
   # 小样本豁免：总片数很少时 2% 可能连 1 片都不到，会被苛刻卡死。
   # 允许至少丢这么多片而不触发阈值判定（取比例值与本值中较大者）。
   min_missing_allowance: 1
+  # 上传失败待补传清单：记录"已下载但上传 R2 失败、仍留在本地"的文件，
+  # 供 `python download_movies.py reupload` 手动补传时精确定位。
+  upload_pending_log: "upload_pending.jsonl"
+  # ---- S3 兼容对象存储（Cloudflare R2）上传配置 ----
+  # 每部影片转封装成功后并发上传到 R2，上传成功即删除本地文件；
+  # 上传失败则保留本地文件并写入 upload_pending_log 等待手动补传。
+  s3:
+    enabled: false           # 默认关闭：走老逻辑（不传不删，成品留本地）
+    endpoint_url: ""         # R2 端点，如 https://<account_id>.r2.cloudflarestorage.com
+    region: "auto"           # R2 固定用 auto
+    bucket: ""               # 目标存储桶名
+    prefix: "movies"         # 桶内根目录前缀，本地 movie_00001/ 会映射到 prefix/movie_00001/
+    access_key: ""           # R2 Access Key ID
+    secret_key: ""           # R2 Secret Access Key
+    upload_workers: 16       # 上传并发数
+    max_pending_uploads: 64  # 反压阈值：在途+排队上传数达到此值就阻塞下载，防磁盘撑爆
+    upload_retry_max: 5      # 单文件上传最大重试次数
+    upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避）
+    delete_local_after_upload: true  # 上传成功后删除本地 mp4
 
 
 # ----------------------------------------------------------------------------
