@@ -7,3 +7,6 @@
 # 放行子目录后，重新忽略 Python 缓存
 MovieDownloader/__pycache__/
 **/__pycache__/
+
+# 私有记忆文件，仅供本地使用，不纳入 git 跟踪
+MovieDownloader/AGENTS.md

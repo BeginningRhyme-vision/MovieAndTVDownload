@@ -1,5 +1,5 @@
 import random
-import requests
+from curl_cffi import requests
 import re
 import json
 import time
@@ -64,18 +64,40 @@ def validate(data, path):
     return data["result"]
 
 
+def _is_retriable(exc):
+    """判断异常是否值得重试：只对瞬时错误（网络/SSL/超时/连接中断/5xx/403）重试。
+    真无源的干净 404（All servers failed / stream 取流 404）不重试——重试也还是 404，纯浪费。
+    """
+    msg = str(exc)
+    # 取流阶段所有 server 都失败：只有当 Last error 是干净 404（=vidup 真无源）才不重试；
+    # 若是瞬时错误（SSL/超时等）导致的 All servers failed，仍需重试，避免误丢可成功的片。
+    if "All servers failed" in msg:
+        return "404" not in msg
+    # 明确的瞬时错误特征：连接中断、SSL、超时、代理错误、连接被拒
+    retriable_markers = (
+        "curl: (35)", "SSL", "timed out", "Timeout", "timeout",
+        "Connection", "connection", "Failed to perform", "Proxy",
+        "Could not resolve", "Recv failure", "Send failure",
+        "403",  # 偶发 Cloudflare 限流，换 IP 重试可能过
+        "500", "502", "503", "504",
+        "API Error",  # enc/dec 服务瞬时非200，换次重试可能过
+        "No servers found",  # 偶发 server 列表空，重试可能拿到
+    )
+    return any(m in msg for m in retriable_markers)
+
+
 def process_tmdb_id(tmdb_id):
-    """处理单个 TMDB ID，内部自动重试，返回 (成功标志, 结果字典或None)"""
+    """处理单个 TMDB ID，仅对瞬时错误重试，返回 (成功标志, 结果字典或None)"""
     last_exception = None
     for attempt in range(1, MAX_RETRIES + 1):
         # 每个 id、每次重试用一个独立 Session：
         # - session 内部复用 TCP/TLS 连接，减少同一 id 内多次请求的握手开销；
         # - session 绑定本次 build_proxy() 的随机出口 IP，作用域仅限本次尝试，
         #   结束即关闭，因此“同一 id 同 IP、不同 id 换 IP”的轮换粒度保持不变。
-        with requests.Session() as session:
+        with requests.Session(impersonate="chrome") as session:
             proxy = build_proxy()
             if proxy:
-                session.proxies.update(proxy)
+                session.proxies = proxy
             try:
                 # 1. 获取页面，提取加密文本
                 base_url = f"https://vidup.to/movie/{tmdb_id}/"
@@ -161,9 +183,12 @@ def process_tmdb_id(tmdb_id):
 
             except Exception as e:
                 last_exception = e
-                print(f"  [Attempt {attempt}/{MAX_RETRIES}] Error for {tmdb_id}: {e}")
+                # 真无源的干净 404 不重试，直接失败退出，省掉 2/3 的无用请求与 sleep
+                if not _is_retriable(e):
+                    print(f"  [无源 404] {tmdb_id}: {e}")
+                    return False, None
+                print(f"  [Attempt {attempt}/{MAX_RETRIES}] 瞬时错误 for {tmdb_id}: {e}")
                 if attempt < MAX_RETRIES:
-                    print(f"  Retrying in {RETRY_DELAY} seconds...")
                     time.sleep(RETRY_DELAY)
                 else:
                     print(f"  All {MAX_RETRIES} attempts failed for ID {tmdb_id}")
