@@ -394,6 +394,49 @@ def write_log(log_file, data):
             file.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
+def update_success_log(tmdb_id, new_record):
+    """按 tmdbId 去重地写 SUCCESS_LOG：同一 ID 覆盖旧记录，否则追加。
+
+    用于 reupload 补传成功后，避免同一影片在 SUCCESS_LOG 中残留
+    uploaded:false / uploaded:true 两条记录。理想状态：每个下载成功的
+    影片只有一条记录（不管上传成功与否）。
+    全程 log_lock 保护，读全量 -> 覆盖/追加 -> 写临时文件 -> os.replace 原子替换。
+    """
+    tmdb_id = str(tmdb_id)
+    with log_lock:
+        records = []
+        replaced = False
+        if os.path.exists(SUCCESS_LOG):
+            with open(SUCCESS_LOG, "r", encoding="utf-8") as file:
+                for line in file:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        records.append(line)  # 无法解析的行原样保留，避免丢数据
+                        continue
+                    if str(record.get("tmdbId")) == tmdb_id:
+                        if not replaced:
+                            records.append(new_record)
+                            replaced = True
+                        # 后续同 ID 记录直接丢弃（去重）
+                        continue
+                    records.append(record)
+        if not replaced:
+            records.append(new_record)
+
+        tmp_path = SUCCESS_LOG + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            for record in records:
+                if isinstance(record, str):
+                    file.write(record + "\n")
+                else:
+                    file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, SUCCESS_LOG)
+
+
 def build_s3_key(local_path):
     """把本地成品路径映射为 R2 对象键，保留 movie_00001/xxx.mp4 目录结构。
 
@@ -1236,8 +1279,57 @@ def upload_one_entry(success_info):
 
 
 # ---------- 主函数 ----------
+def preflight_check_s3():
+    """开启 s3 上传时的启动前预检：任一不过则写日志并退出，避免每部片静默失败进 pending。
+
+    检查顺序：
+      1. import boto3/botocore（未安装 -> 报错退出，提示装依赖）
+      2. 必填配置字段（endpoint_url/bucket/access_key/secret_key）非空
+      3. head_bucket 真连一次：凭证错(403)/桶不存在(404) 当场暴露
+    """
+    def _fail(reason):
+        print(f"[S3 预检失败] {reason}", flush=True)
+        write_log(FAILED_LOG, {
+            "stage": "preflight",
+            "error": reason,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        release_main_lock()
+        sys.exit(1)
+
+    try:
+        import boto3  # noqa: F401
+        from botocore.exceptions import ClientError, BotoCoreError  # noqa: F401
+    except ImportError as exc:
+        _fail(f"未安装 boto3/botocore，无法上传 R2：{exc}。请先在虚拟环境中安装依赖。")
+
+    missing = [
+        name for name, value in (
+            ("endpoint_url", S3_ENDPOINT_URL),
+            ("bucket", S3_BUCKET),
+            ("access_key", S3_ACCESS_KEY),
+            ("secret_key", S3_SECRET_KEY),
+        ) if not value
+    ]
+    if missing:
+        _fail(f"config.yaml 的 s3 段缺少必填字段：{', '.join(missing)}")
+
+    try:
+        client = get_s3_client()
+        client.head_bucket(Bucket=S3_BUCKET)
+    except Exception as exc:  # noqa: BLE001 - 凭证/网络/桶不存在等统一拦截
+        _fail(f"连接 R2 存储桶 '{S3_BUCKET}' 失败（凭证错误或桶不存在）：{exc}")
+
+    print(
+        f"[S3 预检通过] 已连通存储桶 '{S3_BUCKET}'，endpoint={S3_ENDPOINT_URL}",
+        flush=True,
+    )
+
+
 def main():
     acquire_main_lock()
+    if S3_ENABLED:
+        preflight_check_s3()
     monitor_thread = None
     if DISK_GUARD_ENABLED:
         monitor_thread = threading.Thread(
@@ -1506,7 +1598,7 @@ def reupload_pending():
         if ok:
             if DELETE_LOCAL_AFTER_UPLOAD:
                 remove_file(local_path)
-            write_log(SUCCESS_LOG, {
+            update_success_log(tmdb_id, {
                 "tmdbId": tmdb_id,
                 "title": record.get("title", ""),
                 "final_path": local_path,
