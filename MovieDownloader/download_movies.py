@@ -57,9 +57,22 @@ def resolve_dir(value, default_name):
     return str((_SCRIPT_DIR / raw).resolve())
 
 
-INPUT_JSONL = _CFG.get("input", "results.jsonl")
-SUCCESS_LOG = _CFG.get("success_log", "success.jsonl")
-FAILED_LOG = _CFG.get("failed_log", "failed.jsonl")
+def resolve_file(value, default_name):
+    """解析输入/日志/pending 等文件路径，统一锚定到脚本目录：
+    - 为空 -> 脚本目录下的 default_name；
+    - 相对路径 -> 以脚本目录为根拼接（不随进程当前工作目录漂移）；
+    - 绝对路径 -> 直接使用。
+    这样无论从哪个工作目录启动脚本，去重记录/pending 都指向同一份文件。
+    """
+    raw = value.strip() if isinstance(value, str) else value
+    if not raw:
+        raw = default_name
+    return str((_SCRIPT_DIR / raw).resolve())
+
+
+INPUT_JSONL = resolve_file(_CFG.get("input"), "results.jsonl")
+SUCCESS_LOG = resolve_file(_CFG.get("success_log"), "success.jsonl")
+FAILED_LOG = resolve_file(_CFG.get("failed_log"), "failed.jsonl")
 BASE_DIR = resolve_dir(_CFG.get("base_dir"), "downloads")
 FOLDER_PREFIX = _CFG.get("folder_prefix", "movie_")
 MAX_VIDEOS_PER_FOLDER = _CFG.get("max_videos_per_folder", 1000)
@@ -82,7 +95,7 @@ MAX_MISSING_RATIO = _CFG.get("max_missing_ratio", 0.02)
 MIN_MISSING_ALLOWANCE = _CFG.get("min_missing_allowance", 1)
 
 # ---- R2 上传配置 ----
-UPLOAD_PENDING_LOG = _CFG.get("upload_pending_log", "upload_pending.jsonl")
+UPLOAD_PENDING_LOG = resolve_file(_CFG.get("upload_pending_log"), "upload_pending.jsonl")
 _S3_CFG = _CFG.get("s3", {}) or {}
 S3_ENABLED = bool(_S3_CFG.get("enabled", False))
 S3_ENDPOINT_URL = _S3_CFG.get("endpoint_url", "") or ""
@@ -435,6 +448,48 @@ def update_success_log(tmdb_id, new_record):
                 else:
                     file.write(json.dumps(record, ensure_ascii=False) + "\n")
         os.replace(tmp_path, SUCCESS_LOG)
+
+
+def remove_upload_failure_from_log(tmdb_id):
+    """从 FAILED_LOG 中删除指定 tmdbId 的「上传阶段」失败记录（stage=="upload"）。
+
+    用于 reupload 补传成功后清算：这样 FAILED_LOG 里若不再有 upload 阶段的行，
+    即可判定所有下载成功的影片都已上传成功。
+    只删 stage=="upload" 的行，保留 download/conversion/preflight 等其它阶段
+    的失败记录（那些不是上传问题，不应被补传成功抹掉）。
+    全程 log_lock 保护，读全量 -> 过滤 -> 写临时文件 -> os.replace 原子替换。
+    """
+    tmdb_id = str(tmdb_id)
+    with log_lock:
+        if not os.path.exists(FAILED_LOG):
+            return
+        kept = []
+        changed = False
+        with open(FAILED_LOG, "r", encoding="utf-8") as file:
+            for line in file:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError:
+                    kept.append(stripped)  # 无法解析的行原样保留
+                    continue
+                if (str(record.get("tmdbId")) == tmdb_id
+                        and record.get("stage") == "upload"):
+                    changed = True
+                    continue  # 丢弃这条上传失败记录
+                kept.append(record)
+        if not changed:
+            return
+        tmp_path = FAILED_LOG + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            for record in kept:
+                if isinstance(record, str):
+                    file.write(record + "\n")
+                else:
+                    file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(tmp_path, FAILED_LOG)
 
 
 def build_s3_key(local_path):
@@ -1317,8 +1372,19 @@ def preflight_check_s3():
     try:
         client = get_s3_client()
         client.head_bucket(Bucket=S3_BUCKET)
-    except Exception as exc:  # noqa: BLE001 - 凭证/网络/桶不存在等统一拦截
-        _fail(f"连接 R2 存储桶 '{S3_BUCKET}' 失败（凭证错误或桶不存在）：{exc}")
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        if code in ("403", "401") or status in (401, 403):
+            _fail(f"连接 R2 存储桶 '{S3_BUCKET}' 被拒绝（凭证错误或无访问权限，HTTP {status}）：{exc}")
+        elif code == "404" or status == 404:
+            _fail(f"R2 存储桶 '{S3_BUCKET}' 不存在（HTTP 404）：{exc}")
+        else:
+            _fail(f"连接 R2 存储桶 '{S3_BUCKET}' 失败（HTTP {status}, Code={code}）：{exc}")
+    except BotoCoreError as exc:
+        _fail(f"连接 R2 失败（网络/endpoint 配置错误）：{exc}")
+    except Exception as exc:  # noqa: BLE001 - 兜底拦截其余未知异常
+        _fail(f"连接 R2 存储桶 '{S3_BUCKET}' 失败：{exc}")
 
     print(
         f"[S3 预检通过] 已连通存储桶 '{S3_BUCKET}'，endpoint={S3_ENDPOINT_URL}",
@@ -1606,6 +1672,7 @@ def reupload_pending():
                 "uploaded": True,
                 "reupload": True,
             })
+            remove_upload_failure_from_log(tmdb_id)
             success_count += 1
             print(f"  [{tmdb_id}] 补传成功: {s3_key}")
         else:
