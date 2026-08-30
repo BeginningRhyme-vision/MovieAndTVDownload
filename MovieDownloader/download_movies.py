@@ -97,6 +97,16 @@ UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
 UPLOAD_RETRY_DELAY = _S3_CFG.get("upload_retry_delay", 3)
 DELETE_LOCAL_AFTER_UPLOAD = bool(_S3_CFG.get("delete_local_after_upload", True))
 
+# ---- 磁盘水位监控（兜底）配置 ----
+_DISK_CFG = _CFG.get("disk_guard", {}) or {}
+DISK_GUARD_ENABLED = bool(_DISK_CFG.get("enabled", True))
+DISK_HIGH_WATERMARK = float(_DISK_CFG.get("high_watermark", 0.85))
+DISK_LOW_WATERMARK = float(_DISK_CFG.get("low_watermark", 0.80))
+DISK_CHECK_INTERVAL = float(_DISK_CFG.get("check_interval", 5))
+# 防误配：低水位必须严格小于高水位，否则清闸后永远无法恢复放行（下载卡死）。
+if DISK_LOW_WATERMARK >= DISK_HIGH_WATERMARK:
+    DISK_LOW_WATERMARK = max(0.0, DISK_HIGH_WATERMARK - 0.05)
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -148,6 +158,66 @@ def get_s3_client():
 
 # 因为本脚本明确关闭了 TLS 证书校验，所以关闭对应警告。
 urllib3.disable_warnings(InsecureRequestWarning)
+
+
+# ---- 磁盘水位监控（兜底）----
+# disk_gate 为“放行”闸门：置位=允许开新片下载；清位=磁盘吃紧，阻塞开新片。
+# 初始置位（放行）。只闸“未开始的新片下载”，绝不打断已在跑的下载/转封装/上传。
+disk_gate = threading.Event()
+disk_gate.set()
+# 监控线程停止信号：主流程退出时置位，让线程尽快收尾。
+disk_monitor_stop = threading.Event()
+
+
+def _disk_used_ratio(path):
+    """返回 path 所在磁盘的占用比例（0~1）。取不到时返回 0（视为不吃紧）。"""
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        return 0.0
+    if usage.total <= 0:
+        return 0.0
+    return usage.used / usage.total
+
+
+def disk_monitor_loop():
+    """后台监控线程：按占用百分比做熔断。
+    占用 >= high_watermark 清闸（阻塞新下载）；回落到 <= low_watermark 恢复放行。
+    采用高/低双水位滞回，避免在阈值附近反复抖动。
+    """
+    os.makedirs(BASE_DIR, exist_ok=True)
+    while not disk_monitor_stop.is_set():
+        ratio = _disk_used_ratio(BASE_DIR)
+        if disk_gate.is_set():
+            if ratio >= DISK_HIGH_WATERMARK:
+                disk_gate.clear()
+                print(
+                    f"[磁盘水位] 占用 {ratio:.1%} 达到高水位 "
+                    f"{DISK_HIGH_WATERMARK:.0%}，暂停开启新片下载，"
+                    f"等待上传腾出空间...",
+                    flush=True,
+                )
+        else:
+            if ratio <= DISK_LOW_WATERMARK:
+                disk_gate.set()
+                print(
+                    f"[磁盘水位] 占用回落到 {ratio:.1%}（<= 低水位 "
+                    f"{DISK_LOW_WATERMARK:.0%}），恢复新片下载。",
+                    flush=True,
+                )
+        disk_monitor_stop.wait(DISK_CHECK_INTERVAL)
+
+
+def wait_for_disk_gate():
+    """开新片前调用：磁盘吃紧时在此阻塞，直到放行或监控线程停止。
+    只阻塞尚未开始的下载，不影响已在跑的任务。未开启兜底时立即返回。
+    """
+    if not DISK_GUARD_ENABLED:
+        return
+    while not disk_gate.wait(timeout=DISK_CHECK_INTERVAL):
+        # 若监控线程已停止（主流程退出中），不再苦等，放行让任务自然收尾。
+        if disk_monitor_stop.is_set():
+            return
 
 
 class UnsupportedPlaylistError(RuntimeError):
@@ -833,6 +903,10 @@ def process_one_entry(entry, processed_ids):
             return tmdb_id, False, {"error": "duplicate entry currently processing"}
         processing_ids.add(normalized_id)
 
+    # 磁盘水位兜底：仅在此处（尚未开始任何下载动作前）阻塞。磁盘吃紧时新片
+    # 在闸门前等待，不会占用 temp/带宽；已在跑的下载不受影响。
+    wait_for_disk_gate()
+
     print(f"\n开始处理: {tmdb_id} - {title}")
     os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -1164,9 +1238,25 @@ def upload_one_entry(success_info):
 # ---------- 主函数 ----------
 def main():
     acquire_main_lock()
+    monitor_thread = None
+    if DISK_GUARD_ENABLED:
+        monitor_thread = threading.Thread(
+            target=disk_monitor_loop, name="disk-monitor", daemon=True
+        )
+        monitor_thread.start()
+        print(
+            f"[磁盘水位] 兜底监控已启动：高水位 {DISK_HIGH_WATERMARK:.0%} 闸下载，"
+            f"低水位 {DISK_LOW_WATERMARK:.0%} 恢复，每 {DISK_CHECK_INTERVAL:g}s 检查一次",
+            flush=True,
+        )
     try:
         _run_pipeline()
     finally:
+        # 先停监控线程并放行闸门，避免仍有线程卡在 wait_for_disk_gate 上。
+        disk_monitor_stop.set()
+        disk_gate.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=DISK_CHECK_INTERVAL + 1)
         release_main_lock()
 
 

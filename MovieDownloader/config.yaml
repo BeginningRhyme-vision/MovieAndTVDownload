@@ -136,6 +136,16 @@ download_movies:
     upload_retry_max: 5      # 单文件上传最大重试次数
     upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避）
     delete_local_after_upload: true  # 上传成功后删除本地 mp4
+  # ---- 磁盘水位监控（兜底）----
+  # 反压按"上传数量"封顶，兜不住大文件/上传持续失败堆积/enabled=false 等场景。
+  # 水位监控按 base_dir 所在磁盘的实际占用百分比做终极熔断：
+  #   占用超过 high_watermark 就闸住"未开始的新片下载"（不打断在跑的下载/转封装/上传），
+  #   等上传腾出空间、占用回落到 low_watermark 以下再放开。
+  disk_guard:
+    enabled: true            # 默认开启兜底
+    high_watermark: 0.85     # 磁盘占用达到 85% 闸住新下载
+    low_watermark: 0.75      # 回落到 75% 以下恢复新下载
+    check_interval: 5        # 监控线程检查间隔（秒）
 
 
 # ----------------------------------------------------------------------------
