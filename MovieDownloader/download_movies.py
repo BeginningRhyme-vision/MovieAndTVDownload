@@ -3,6 +3,7 @@
 
 import json
 import os
+import math
 import random
 import re
 import shutil
@@ -74,6 +75,10 @@ SAMPLE_COUNT = _CFG.get("sample_count", 30)
 SEG_RETRY_MAX = _CFG.get("seg_retry_max", 20)
 SEG_RETRY_DELAY = _CFG.get("seg_retry_delay", 1)
 MIN_BITRATE_KBPS = _CFG.get("min_bitrate_kbps", 1850)
+# 缺片保护阈值：缺片率超过 MAX_MISSING_RATIO 且缺片数超过豁免量，判失败可重下。
+MAX_MISSING_RATIO = _CFG.get("max_missing_ratio", 0.02)
+# 小样本豁免：允许至少丢这么多片而不触发阈值（与比例阈值取较大者）。
+MIN_MISSING_ALLOWANCE = _CFG.get("min_missing_allowance", 1)
 
 HEADERS = {
     "User-Agent": (
@@ -870,6 +875,28 @@ def process_one_entry(entry, processed_ids):
             print(
                 f"  警告: 本片共跳过 {len(failed_segment_indices)} 个失败分片；"
                 f"索引: {failed_segment_indices}"
+            )
+
+        # 缺片保护：缺太多会明显影响观看，判失败写 failed 以便二次重下，
+        # 避免"残片也判成功后被去重逻辑永久跳过"。
+        # 触发条件：缺片数同时超过比例阈值和小样本豁免量。
+        total_segment_count = len(best_segment_urls)
+        missing_count = len(failed_segment_indices)
+        # 比例阈值向上取整（从宽）：如 625 片 ×2%=12.5 允许丢 13 片而非 12；
+        # 再与小样本豁免量取较大者，保证片数很少时也允许丢 MIN_MISSING_ALLOWANCE 片。
+        allowed_missing = max(
+            MIN_MISSING_ALLOWANCE,
+            math.ceil(total_segment_count * MAX_MISSING_RATIO),
+        )
+        if missing_count > allowed_missing:
+            missing_ratio = (
+                missing_count / total_segment_count if total_segment_count else 0
+            )
+            raise RuntimeError(
+                f"缺片率过高：缺 {missing_count}/{total_segment_count} 片 "
+                f"({missing_ratio:.1%})，超过阈值 "
+                f"{MAX_MISSING_RATIO:.1%}（豁免 {MIN_MISSING_ALLOWANCE} 片），"
+                f"判失败以便二次重下"
             )
 
         conversion_job = {
