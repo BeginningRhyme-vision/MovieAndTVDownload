@@ -1383,6 +1383,7 @@ def upload_one_entry(success_info):
     write_pending({
         "tmdbId": tmdb_id,
         "title": success_info.get("title", ""),
+        "year": success_info.get("year"),
         "local_path": local_path,
         "s3_key": s3_key,
         "fail_reason": reason,
@@ -1734,7 +1735,7 @@ def reupload_pending():
     for tmdb_id in order:
         record = latest_by_id[tmdb_id]
         local_path = record.get("local_path", "")
-        s3_key = record.get("s3_key") or build_s3_key(local_path)
+        s3_key = record.get("s3_key") or build_s3_key(local_path, record.get("year"))
 
         if not local_path or not os.path.exists(local_path):
             # 文件已不在本地：视为已消解（可能此前已成功补传），从 pending 移除。
