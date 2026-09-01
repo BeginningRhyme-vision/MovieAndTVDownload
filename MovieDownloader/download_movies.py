@@ -103,6 +103,9 @@ SEG_RETRY_DELAY = _CFG.get("seg_retry_delay", 1)
 PLAYLIST_RETRY_MAX = _CFG.get("playlist_retry_max", 10)
 PLAYLIST_RETRY_BACKOFF = _CFG.get("playlist_retry_backoff", 1.0)
 PLAYLIST_RETRY_BACKOFF_MAX = _CFG.get("playlist_retry_backoff_max", 60.0)
+# 方案C 分阶重试：多节点 fallback 时，非末节点用更小的 playlist 重试次数，
+# 坏节点快速判定并换下一个备用节点；末节点/单节点仍用 PLAYLIST_RETRY_MAX 死磕。
+PLAYLIST_RETRY_FALLBACK = _CFG.get("playlist_retry_fallback", 3)
 MIN_BITRATE_KBPS = _CFG.get("min_bitrate_kbps", 1850)
 # 缺片保护阈值：缺片率超过 MAX_MISSING_RATIO 且缺片数超过豁免量，判失败可重下。
 MAX_MISSING_RATIO = _CFG.get("max_missing_ratio", 0.02)
@@ -473,7 +476,7 @@ def truncate_log(log_file):
 # 确定性失败关键字：命中即判为“重试也没用”，绝不进入下一轮下载。
 # 这些错误来自 process_one_entry 抛出的 RuntimeError 文案或早返回 error。
 _PERMANENT_FAILURE_MARKERS = (
-    "缺少 tmdbId 或 url",
+    "缺少 tmdbId 或 urls",
     "没有找到媒体播放列表",       # master 解析出来是空
     "没有找到 1080p",             # 声明分辨率全部不达标
     "低于 1080p",                 # 实测分辨率不达标
@@ -728,11 +731,15 @@ def move_to_target_folder(temp_mp4, tmdb_id):
 
 
 # ---------- M3U8 解析 ----------
-def parse_master_playlist(master_url):
-    """返回 [(resolution, media_playlist_url, declared_bandwidth_kbps), ...]。"""
+def parse_master_playlist(master_url, retries=None):
+    """返回 [(resolution, media_playlist_url, declared_bandwidth_kbps), ...]。
+
+    retries 为 None 时用默认强度 PLAYLIST_RETRY_MAX；方案C fallback 里对
+    非末节点传更小的值，以便坏节点快速判定并换下一个备用节点。
+    """
     text = request_with_retry(
         "GET", master_url, as_text=True,
-        retries=PLAYLIST_RETRY_MAX,
+        retries=PLAYLIST_RETRY_MAX if retries is None else retries,
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
     )
@@ -1094,11 +1101,11 @@ def process_one_entry(entry, processed_ids):
     tmdb_id = entry.get("tmdbId")
     normalized_id = normalize_tmdb_id(tmdb_id)
     title = entry.get("title", "")
-    url = entry.get("url", "")
+    urls = entry.get("urls", [])
     year = entry.get("year")
 
-    if not normalized_id or not url:
-        return tmdb_id, False, {"error": "缺少 tmdbId 或 url", "retriable": False}
+    if not normalized_id or not urls:
+        return tmdb_id, False, {"error": "缺少 tmdbId 或 urls", "retriable": False}
 
     # 原子地检查“历史已完成”和“当前正在处理”，防止并发重复下载。
     with processing_lock:
@@ -1123,8 +1130,16 @@ def process_one_entry(entry, processed_ids):
     temp_mp4 = os.path.join(TEMP_DIR, f"temp_{safe_file_token(tmdb_id)}.mp4")
     cleanup_paths.update((final_ts, temp_mp4))
 
-    try:
-        variants = parse_master_playlist(url)
+    def _attempt_download(url, is_last_node):
+        """对单个取流节点(url)尝试完整下载，成功返回 conversion_job，失败抛异常。
+
+        is_last_node=False（还有备用节点）时，master playlist 解析用短重试
+        PLAYLIST_RETRY_FALLBACK，坏节点快速判定即换下一个；末节点/单节点用
+        默认 PLAYLIST_RETRY_MAX 死磕，不放过最后的机会。
+        """
+        variants = parse_master_playlist(
+            url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK
+        )
         if not variants:
             raise RuntimeError("没有找到媒体播放列表或清晰度变体")
 
@@ -1329,16 +1344,46 @@ def process_one_entry(entry, processed_ids):
             "missing_segment_count": len(failed_segment_indices),
             "missing_segment_indices": failed_segment_indices,
         }
-        handed_off_to_conversion = True
         print(
             f"  [{tmdb_id}] 分片下载完成，已释放下载槽位并进入转封装队列",
             flush=True,
         )
+        return conversion_job
+
+    try:
+        # 方案C：依次尝试各取流节点，任一节点下完即成功；全部失败才判失败。
+        conversion_job = None
+        last_exc = None
+        any_retriable = False  # 只要有任一节点是“可重试失败”，整片就值得下一轮重试
+        for idx, url in enumerate(urls, start=1):
+            is_last_node = idx == len(urls)
+            try:
+                if idx > 1:
+                    print(f"  [{tmdb_id}] 切换备用节点 {idx}/{len(urls)}", flush=True)
+                conversion_job = _attempt_download(url, is_last_node)
+                break
+            except Exception as exc:
+                last_exc = exc
+                # 记录本节点失败是否可重试：任一可重试即让整片进入外层多轮，
+                # 避免末节点恰为确定性失败时“连坐”误伤前面本可恢复的瞬时节点。
+                if _classify_failure(str(exc)):
+                    any_retriable = True
+                # 本节点失败：清掉本轮残留的 ts，避免污染下一个节点。
+                remove_file(final_ts)
+                if idx < len(urls):
+                    print(f"  [{tmdb_id}] 节点 {idx} 失败，尝试下一个: {exc}")
+        if conversion_job is None:
+            raise last_exc if last_exc else RuntimeError("所有取流节点均失败")
+
+        handed_off_to_conversion = True
         return tmdb_id, True, conversion_job
 
     except Exception as exc:
         msg = str(exc)
-        return tmdb_id, False, {"error": msg, "retriable": _classify_failure(msg)}
+        # 整片可否重试：全节点失败时以“任一节点可重试”为准（乐观，首要目标是下全）；
+        # 其它异常路径（单次抛出）回退到按该异常本身分类。
+        retriable = any_retriable or _classify_failure(msg)
+        return tmdb_id, False, {"error": msg, "retriable": retriable}
     finally:
         # 下载成功后临时文件和 ID 锁交给转封装阶段管理。
         if not handed_off_to_conversion:
@@ -1661,7 +1706,7 @@ def _run_pipeline():
             write_log(FAILED_LOG, {
                 "tmdbId": tmdb_id,
                 "title": entry.get("title", ""),
-                "url": entry.get("url", ""),
+                "urls": entry.get("urls", []),
                 "error": error_msg,
                 "stage": "download",
             })
@@ -1693,7 +1738,7 @@ def _run_pipeline():
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
                     "title": entry.get("title", ""),
-                    "url": entry.get("url", ""),
+                    "urls": entry.get("urls", []),
                     "error": info.get("error", "未知错误"),
                     "stage": "conversion",
                 })
@@ -1730,7 +1775,7 @@ def _run_pipeline():
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
                     "title": entry.get("title", ""),
-                    "url": entry.get("url", ""),
+                    "urls": entry.get("urls", []),
                     "error": info.get("error", "未知错误"),
                     "stage": "upload",
                 })
