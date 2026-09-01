@@ -14,3 +14,6 @@ MovieDownloader/AGENTS.md
 # 运行期产物，不纳入 git 跟踪
 MovieDownloader/download_movies.main.lock
 MovieDownloader/upload_pending.jsonl
+
+# 敏感凭据，仅本地使用，切勿提交（.env.example 作为模板可提交）
+MovieDownloader/.env

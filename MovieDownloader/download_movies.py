@@ -88,6 +88,11 @@ TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
 SAMPLE_COUNT = _CFG.get("sample_count", 30)
 SEG_RETRY_MAX = _CFG.get("seg_retry_max", 20)
 SEG_RETRY_DELAY = _CFG.get("seg_retry_delay", 1)
+# playlist（master/media）解析阶段的请求重试：源站临时 5xx 抽风时，这一层
+# 若过早放弃会直接判整部影片失败。故给足重试次数与退避上限，扛过几十秒级故障。
+PLAYLIST_RETRY_MAX = _CFG.get("playlist_retry_max", 10)
+PLAYLIST_RETRY_BACKOFF = _CFG.get("playlist_retry_backoff", 1.0)
+PLAYLIST_RETRY_BACKOFF_MAX = _CFG.get("playlist_retry_backoff_max", 60.0)
 MIN_BITRATE_KBPS = _CFG.get("min_bitrate_kbps", 1850)
 # 缺片保护阈值：缺片率超过 MAX_MISSING_RATIO 且缺片数超过豁免量，判失败可重下。
 MAX_MISSING_RATIO = _CFG.get("max_missing_ratio", 0.02)
@@ -96,14 +101,43 @@ MIN_MISSING_ALLOWANCE = _CFG.get("min_missing_allowance", 1)
 
 # ---- R2 上传配置 ----
 UPLOAD_PENDING_LOG = resolve_file(_CFG.get("upload_pending_log"), "upload_pending.jsonl")
+def _load_dotenv(path):
+    """轻量解析同目录 .env（KEY=VALUE，支持 # 注释与引号），不覆盖已存在的环境变量。
+    不引入 python-dotenv 依赖，保持最小改动。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv(os.path.join(str(_SCRIPT_DIR), ".env"))
+
+
+def _s3_secret(cfg_key, env_key):
+    """敏感字段优先取环境变量；环境变量缺省时回退 config.yaml（便于本地调试）。"""
+    env_val = os.environ.get(env_key, "").strip()
+    if env_val:
+        return env_val
+    return (_S3_CFG.get(cfg_key, "") or "").strip()
+
+
 _S3_CFG = _CFG.get("s3", {}) or {}
 S3_ENABLED = bool(_S3_CFG.get("enabled", False))
-S3_ENDPOINT_URL = _S3_CFG.get("endpoint_url", "") or ""
+S3_ENDPOINT_URL = _s3_secret("endpoint_url", "R2_ENDPOINT_URL")
 S3_REGION = _S3_CFG.get("region", "auto") or "auto"
-S3_BUCKET = _S3_CFG.get("bucket", "") or ""
+S3_BUCKET = _s3_secret("bucket", "R2_BUCKET")
 S3_PREFIX = (_S3_CFG.get("prefix", "movies") or "").strip("/")
-S3_ACCESS_KEY = _S3_CFG.get("access_key", "") or ""
-S3_SECRET_KEY = _S3_CFG.get("secret_key", "") or ""
+S3_ACCESS_KEY = _s3_secret("access_key", "R2_ACCESS_KEY")
+S3_SECRET_KEY = _s3_secret("secret_key", "R2_SECRET_KEY")
 UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
 MAX_PENDING_UPLOADS = _S3_CFG.get("max_pending_uploads", 64)
 UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
@@ -280,9 +314,14 @@ def get_session():
 
 
 def request_with_retry(
-    method, url, retries=3, backoff=0.5, as_text=False, **kwargs
+    method, url, retries=3, backoff=0.5, backoff_max=45.0, as_text=False,
+    **kwargs
 ):
-    """发起 HTTP 请求；成功时返回 str 或 bytes。"""
+    """发起 HTTP 请求；成功时返回 str 或 bytes。
+
+    退避采用指数增长并封顶到 backoff_max，附加少量抖动，避免多线程同时重试；
+    这样 playlist 解析等关键请求能扛过源站几十秒级的临时 5xx 抽风。
+    """
     session = get_session()
     kwargs.setdefault("timeout", 30)
 
@@ -310,7 +349,9 @@ def request_with_retry(
                 record_block_status(status)
             if attempt == retries - 1:
                 break
-            time.sleep(backoff * (2**attempt))
+            wait = min(backoff * (2**attempt), backoff_max)
+            wait += random.uniform(0, min(1.0, wait * 0.2))
+            time.sleep(wait)
 
     raise RuntimeError(f"请求失败: {url}; {last_error}") from last_error
 
@@ -492,13 +533,21 @@ def remove_upload_failure_from_log(tmdb_id):
         os.replace(tmp_path, FAILED_LOG)
 
 
-def build_s3_key(local_path):
-    """把本地成品路径映射为 R2 对象键，保留 movie_00001/xxx.mp4 目录结构。
+def build_s3_key(local_path, year=None):
+    """把本地成品映射为 R2 对象键，按「发布年份/上传日期」分层。
 
-    如 BASE_DIR/movie_000001/12345.mp4 -> {S3_PREFIX}/movie_000001/12345.mp4
+    规则：{S3_PREFIX}/{发布年份}/{上传日期YYYYMMDD}/{文件名}
+    如成品 12345.mp4、发布年份 2000、上传日 20260901 ->
+        {S3_PREFIX}/2000/20260901/12345.mp4
+    year 缺失时用 unknown_year 兜底，避免拼出畸形 key。
+    上传日期取上传发生当天的本地系统日期。
     """
-    rel = os.path.relpath(local_path, BASE_DIR).replace(os.sep, "/")
-    return f"{S3_PREFIX}/{rel}" if S3_PREFIX else rel
+    filename = os.path.basename(local_path)
+    year_seg = str(year).strip() if year not in (None, "") else "unknown_year"
+    date_seg = time.strftime("%Y%m%d")
+    parts = [S3_PREFIX, year_seg, date_seg, filename] if S3_PREFIX \
+        else [year_seg, date_seg, filename]
+    return "/".join(parts)
 
 
 def upload_to_r2(local_path, s3_key):
@@ -632,7 +681,12 @@ def move_to_target_folder(temp_mp4, tmdb_id):
 # ---------- M3U8 解析 ----------
 def parse_master_playlist(master_url):
     """返回 [(resolution, media_playlist_url, declared_bandwidth_kbps), ...]。"""
-    text = request_with_retry("GET", master_url, as_text=True)
+    text = request_with_retry(
+        "GET", master_url, as_text=True,
+        retries=PLAYLIST_RETRY_MAX,
+        backoff=PLAYLIST_RETRY_BACKOFF,
+        backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
+    )
     lines = [line.strip() for line in text.splitlines()]
     variants = []
 
@@ -677,7 +731,12 @@ def parse_media_playlist(playlist_url):
     该段必须写在所有媒体分片之前，否则产出的文件无法解码。TS 没有
     init 段，返回 None。
     """
-    text = request_with_retry("GET", playlist_url, as_text=True)
+    text = request_with_retry(
+        "GET", playlist_url, as_text=True,
+        retries=PLAYLIST_RETRY_MAX,
+        backoff=PLAYLIST_RETRY_BACKOFF,
+        backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
+    )
     lines = [line.strip() for line in text.splitlines()]
     init_url = None
 
@@ -987,6 +1046,7 @@ def process_one_entry(entry, processed_ids):
     normalized_id = normalize_tmdb_id(tmdb_id)
     title = entry.get("title", "")
     url = entry.get("url", "")
+    year = entry.get("year")
 
     if not normalized_id or not url:
         return tmdb_id, False, {"error": "缺少 tmdbId 或 url"}
@@ -1210,6 +1270,7 @@ def process_one_entry(entry, processed_ids):
             "tmdbId": tmdb_id,
             "normalized_id": normalized_id,
             "title": title,
+            "year": year,
             "url": url,
             "final_ts": final_ts,
             "temp_mp4": temp_mp4,
@@ -1261,6 +1322,7 @@ def finalize_one_entry(conversion_job, processed_ids):
         success_info = {
             "tmdbId": tmdb_id,
             "title": conversion_job["title"],
+            "year": conversion_job.get("year"),
             "url": conversion_job["url"],
             "final_path": final_path,
             "bitrate_kbps": conversion_job["bitrate_kbps"],
@@ -1303,7 +1365,7 @@ def upload_one_entry(success_info):
               flush=True)
         return tmdb_id, True, success_info
 
-    s3_key = build_s3_key(local_path)
+    s3_key = build_s3_key(local_path, success_info.get("year"))
     ok, reason = upload_to_r2(local_path, s3_key)
     if ok:
         success_info["uploaded"] = True
@@ -1495,103 +1557,124 @@ def _run_pipeline():
             for entry in entries
         }
 
-        # 每当一部影片下载完成，下载线程会立刻领取下一条；与此同时，
-        # 主线程把完成的 TS 交给独立的转封装线程池。
-        for future in as_completed(download_future_to_entry):
-            entry = download_future_to_entry[future]
-            try:
-                tmdb_id, download_success, info = future.result()
-            except Exception as exc:
-                tmdb_id = entry.get("tmdbId")
-                download_success = False
-                info = {"error": str(exc)}
+        # 单一事件循环驱动的真三级流水线：所有在途 future（下载/转封装/上传）
+        # 放进同一个 pending 集合，用 wait(FIRST_COMPLETED) 取最先完成的任意一个，
+        # 按其阶段就地推进到下一级。这样每部影片一完成当前阶段就立即流入下一阶段——
+        # 下载完立刻转封装、转封装完立刻上传，三级真正并行流动，互不阻塞。
+        #
+        # 关键：绝不再出现“主线程被某一阶段的全量消费卡住、导致上传迟迟不启动”的
+        # 伪流水线；只要一部影片转封装完成且上传信号量允许，就立即上传，从而把
+        # 本地磁盘占用钳制在 MAX_PENDING_UPLOADS 规模，避免堆积爆盘。
+        stage_of = {}  # future -> "download" | "conversion" | "upload"
+        for f in download_future_to_entry:
+            stage_of[f] = "download"
 
-            if download_success:
-                conversion_future = conversion_executor.submit(
-                    finalize_one_entry, info, processed_ids
-                )
-                conversion_future_to_entry[conversion_future] = entry
-                continue
+        pending = set(download_future_to_entry.keys())
+        submitted_conversions = 0
+        submitted_uploads = 0
 
-            if info.get("error") not in ignored_errors:
-                failed_info = {
-                    "tmdbId": tmdb_id,
-                    "title": entry.get("title", ""),
-                    "url": entry.get("url", ""),
-                    "error": info.get("error", "未知错误"),
-                    "stage": "download",
-                }
-                write_log(FAILED_LOG, failed_info)
-                print(f"下载失败: {tmdb_id}: {failed_info['error']}")
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                pending.discard(future)
+                stage = stage_of.pop(future, None)
 
-        pending_conversion_count = sum(
-            1 for future in conversion_future_to_entry if not future.done()
-        )
+                if stage == "download":
+                    entry = download_future_to_entry[future]
+                    try:
+                        tmdb_id, download_success, info = future.result()
+                    except Exception as exc:
+                        tmdb_id = entry.get("tmdbId")
+                        download_success = False
+                        info = {"error": str(exc)}
+
+                    if download_success:
+                        conversion_future = conversion_executor.submit(
+                            finalize_one_entry, info, processed_ids
+                        )
+                        conversion_future_to_entry[conversion_future] = entry
+                        stage_of[conversion_future] = "conversion"
+                        pending.add(conversion_future)
+                        submitted_conversions += 1
+                        continue
+
+                    if info.get("error") not in ignored_errors:
+                        failed_info = {
+                            "tmdbId": tmdb_id,
+                            "title": entry.get("title", ""),
+                            "url": entry.get("url", ""),
+                            "error": info.get("error", "未知错误"),
+                            "stage": "download",
+                        }
+                        write_log(FAILED_LOG, failed_info)
+                        print(f"下载失败: {tmdb_id}: {failed_info['error']}")
+
+                elif stage == "conversion":
+                    entry = conversion_future_to_entry[future]
+                    try:
+                        tmdb_id, conversion_success, info = future.result()
+                    except Exception as exc:
+                        tmdb_id = entry.get("tmdbId")
+                        conversion_success = False
+                        info = {"error": str(exc)}
+
+                    if not conversion_success:
+                        failed_info = {
+                            "tmdbId": tmdb_id,
+                            "title": entry.get("title", ""),
+                            "url": entry.get("url", ""),
+                            "error": info.get("error", "未知错误"),
+                            "stage": "conversion",
+                        }
+                        write_log(FAILED_LOG, failed_info)
+                        print(f"转封装失败: {tmdb_id}: {failed_info['error']}")
+                        continue
+
+                    # 转封装成功 -> 立即提交上传。反压：先 acquire 信号量（限制
+                    # 在途+排队的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载
+                    # 会在此阻塞主循环，从而钳制本地磁盘占用上限。release 由 future
+                    # 完成回调对称释放，保证无论上传成功/异常/取消都不泄漏信号量。
+                    upload_semaphore.acquire()
+                    upload_future = upload_executor.submit(
+                        upload_one_entry, info
+                    )
+                    upload_future.add_done_callback(
+                        lambda _f: upload_semaphore.release()
+                    )
+                    upload_future_to_entry[upload_future] = entry
+                    stage_of[upload_future] = "upload"
+                    pending.add(upload_future)
+                    submitted_uploads += 1
+
+                elif stage == "upload":
+                    entry = upload_future_to_entry[future]
+                    try:
+                        tmdb_id, upload_success, info = future.result()
+                    except Exception as exc:
+                        tmdb_id = entry.get("tmdbId")
+                        upload_success = False
+                        info = {"error": str(exc)}
+
+                    if not upload_success:
+                        # upload_one_entry 内部已写 pending 与
+                        # SUCCESS_LOG(uploaded=false)，这里再落一条 FAILED_LOG
+                        # 便于统计上传阶段失败。
+                        failed_info = {
+                            "tmdbId": tmdb_id,
+                            "title": entry.get("title", ""),
+                            "url": entry.get("url", ""),
+                            "error": info.get("error", "未知错误"),
+                            "stage": "upload",
+                        }
+                        write_log(FAILED_LOG, failed_info)
+                        print(f"上传失败: {tmdb_id}: {failed_info['error']}")
+
+        # while pending 循环退出，即代表所有下载/转封装/上传 future 均已完成。
+        # 这是数据完整性的硬保证：主循环不会提前退出而遗漏在途上传。
         print(
-            f"所有分片下载任务已结束，共进入转封装队列 "
-            f"{len(conversion_future_to_entry)} 部；"
-            f"当前仍有 {pending_conversion_count} 部待完成..."
+            f"三级流水线全部完成：转封装 {submitted_conversions} 部，"
+            f"上传 {submitted_uploads} 部。"
         )
-
-        for future in as_completed(conversion_future_to_entry):
-            entry = conversion_future_to_entry[future]
-            try:
-                tmdb_id, conversion_success, info = future.result()
-            except Exception as exc:
-                tmdb_id = entry.get("tmdbId")
-                conversion_success = False
-                info = {"error": str(exc)}
-
-            if not conversion_success:
-                failed_info = {
-                    "tmdbId": tmdb_id,
-                    "title": entry.get("title", ""),
-                    "url": entry.get("url", ""),
-                    "error": info.get("error", "未知错误"),
-                    "stage": "conversion",
-                }
-                write_log(FAILED_LOG, failed_info)
-                print(f"转封装失败: {tmdb_id}: {failed_info['error']}")
-                continue
-
-            # 转封装成功 -> 提交上传。反压：先 acquire 信号量（限制在途+排队
-            # 的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载会在此阻塞，
-            # 从而钳制本地磁盘占用上限。release 由 future 完成回调对称释放，
-            # 保证无论上传成功/异常/取消都不会泄漏信号量（避免耗尽后死锁）。
-            upload_semaphore.acquire()
-            upload_future = upload_executor.submit(upload_one_entry, info)
-            upload_future.add_done_callback(
-                lambda _f: upload_semaphore.release()
-            )
-            upload_future_to_entry[upload_future] = entry
-
-        # 退出前必须 wait 所有上传池任务跑完——这是数据完整性的硬保证，
-        # 否则 with 块退出会等线程池但成品可能尚未落到远端。
-        print(
-            f"所有转封装任务已结束，共进入上传队列 "
-            f"{len(upload_future_to_entry)} 部；等待全部上传完成..."
-        )
-        for future in as_completed(upload_future_to_entry):
-            entry = upload_future_to_entry[future]
-            try:
-                tmdb_id, upload_success, info = future.result()
-            except Exception as exc:
-                tmdb_id = entry.get("tmdbId")
-                upload_success = False
-                info = {"error": str(exc)}
-
-            if not upload_success:
-                # upload_one_entry 内部已写 pending 与 SUCCESS_LOG(uploaded=false)，
-                # 这里再落一条 FAILED_LOG 便于统计上传阶段失败。
-                failed_info = {
-                    "tmdbId": tmdb_id,
-                    "title": entry.get("title", ""),
-                    "url": entry.get("url", ""),
-                    "error": info.get("error", "未知错误"),
-                    "stage": "upload",
-                }
-                write_log(FAILED_LOG, failed_info)
-                print(f"上传失败: {tmdb_id}: {failed_info['error']}")
 
 
 def reupload_pending():
