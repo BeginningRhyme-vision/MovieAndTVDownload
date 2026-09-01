@@ -56,6 +56,47 @@ def build_proxy():
     return {"http": proxy_url, "https": proxy_url}
 
 
+# ---------- 元数据补全 ----------
+# 从 movies.jsonl 预加载 tmdb_id -> 元数据 映射，供取流成功时把静态元数据
+# 一并写进 results.jsonl（下游 download_movies 据此拼 R2 路径 {year}/... 等）。
+# 纯内存字典查表，无运行时探测；文件缺失时返回空表（各字段自然缺省）。
+
+
+def load_movie_metadata():
+    meta_path = Path(_CFG.get("metadata", "movies.jsonl"))
+    if not meta_path.is_absolute():
+        meta_path = Path(__file__).with_name(str(meta_path))
+    table = {}
+    if not meta_path.exists():
+        print(f"[metadata] 未找到 {meta_path}，results.jsonl 将不含元数据字段")
+        return table
+    with open(meta_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tid = m.get("tmdb_id")
+            if tid is None:
+                continue
+            table[str(tid)] = {
+                "year": m.get("start_year"),
+                "original_title": m.get("original_title"),
+                "runtime_minutes": m.get("runtime_minutes"),
+                "genres": m.get("genres", []),
+                "title_type": m.get("title_type"),
+                "imdb_id": m.get("imdb_id"),
+            }
+    print(f"[metadata] 已加载 {len(table)} 条影片元数据")
+    return table
+
+
+_MOVIE_META = load_movie_metadata()
+
+
 # ---------- 辅助函数 ----------
 def validate(data, path):
     if data.get("status") != 200:
@@ -91,7 +132,7 @@ def process_tmdb_id(tmdb_id):
     """处理单个 TMDB ID，仅对瞬时错误重试。
 
     返回 (status, 结果字典或None)，status 三态供多轮捞回区分：
-      - "ok"    成功，附结果字典 {urls, tmdbId, title}
+      - "ok"    成功，附结果字典 {urls, tmdbId, title, + movies.jsonl 静态元数据}
       - "dead"  真无源的干净404 → 永久排除，绝不再抓
       - "retry" 瞬时错误（含页面提取不到加密文本）换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
     """
@@ -190,12 +231,16 @@ def process_tmdb_id(tmdb_id):
                         continue
 
                 if urls and result_tmdb_id:
-                    # 收集到至少一个可用节点，返回全部备用 url
-                    return "ok", {
+                    # 收集到至少一个可用节点，返回全部备用 url，并合并该片静态元数据
+                    # （year/original_title/... 供下游拼 R2 路径与后续用途）。
+                    # 用入参 tmdb_id 查表：它就是 ids.txt / movies.jsonl 的 key，最稳。
+                    result = {
                         "urls": urls,
                         "tmdbId": result_tmdb_id,
                         "title": result_title,
                     }
+                    result.update(_MOVIE_META.get(str(tmdb_id), {}))
+                    return "ok", result
 
                 # 所有服务器都尝试失败
                 raise Exception(f"All servers failed for {tmdb_id}. Last error: {last_server_error}")

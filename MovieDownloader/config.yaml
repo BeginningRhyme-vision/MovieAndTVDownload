@@ -50,6 +50,10 @@ fetch_movie_metadata:
 tmdb_ids_to_links:
   # 输入：待解析的 tmdb_id 列表（filter_to_ids.py 的产物）
   input: "ids.txt"
+  # 影片静态元数据源（fetch_movie_metadata.py 的产物）。取流成功时按 tmdb_id 查表，
+  # 把 year/original_title/runtime_minutes/genres/title_type/imdb_id 合并进 output，
+  # 供下游 download_movies 拼 R2 路径 {year}/... 及后续用途。缺失则各字段留空。
+  metadata: "movies.jsonl"
   # 输出：解析成功的结果（含 m3u8 地址）
   output: "results.jsonl"
   # 解析失败的 tmdb_id 记录
