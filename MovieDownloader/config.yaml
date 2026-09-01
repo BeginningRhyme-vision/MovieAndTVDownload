@@ -63,6 +63,13 @@ tmdb_ids_to_links:
   # 现在只有瞬时错误(SSL/超时/5xx)才重试，真无源404直接跳过不sleep，故 delay 缩短到 1
   max_retries: 3
   retry_delay: 1
+  # ---- 多轮捞回：整批跑完后对“瞬时耗尽”的 ID 自动重跑，直到清零或达上限 ----
+  # 进程内不定轮循环，替代旧的外部 retry_runner.sh：
+  #   - 单 ID 在 process_tmdb_id 内换 IP 重试 max_retries 次仍失败(瞬时耗尽) → 下一轮重跑；
+  #   - 真无源404 → 永久排除，绝不再抓；
+  #   - output 直接就是全部轮次成功结果的合并（原 total_results.jsonl）。
+  # max_rounds 为兜底上限（含第一轮），防极端情况死循环。
+  max_rounds: 8
   # 单个 HTTP 请求超时（秒）。启用 Session 连接复用后握手更快。
   # 分阶段实测：正常各阶段中位 0.5~3.7s、单请求 P90≈15s、取流循环 max≈13s，
   # 20s 给卡死请求留太久空耗线程；降到 12s 可让长尾/卡死请求早 3~8s 放弃，

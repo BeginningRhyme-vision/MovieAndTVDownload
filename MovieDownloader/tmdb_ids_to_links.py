@@ -82,12 +82,19 @@ def _is_retriable(exc):
         "500", "502", "503", "504",
         "API Error",  # enc/dec 服务瞬时非200，换次重试可能过
         "No servers found",  # 偶发 server 列表空，重试可能拿到
+        "Extract failed (retriable)",  # 页面200但提取不到加密文本：可能撞Cloudflare挑战页，换IP重试
     )
     return any(m in msg for m in retriable_markers)
 
 
 def process_tmdb_id(tmdb_id):
-    """处理单个 TMDB ID，仅对瞬时错误重试，返回 (成功标志, 结果字典或None)"""
+    """处理单个 TMDB ID，仅对瞬时错误重试。
+
+    返回 (status, 结果字典或None)，status 三态供多轮捞回区分：
+      - "ok"    成功，附结果字典 {urls, tmdbId, title}
+      - "dead"  真无源的干净404 → 永久排除，绝不再抓
+      - "retry" 瞬时错误（含页面提取不到加密文本）换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
+    """
     last_exception = None
     for attempt in range(1, MAX_RETRIES + 1):
         # 每个 id、每次重试用一个独立 Session：
@@ -113,8 +120,10 @@ def process_tmdb_id(tmdb_id):
                     if match:
                         text = match.group(1)
                     else:
-                        print(f'Failed to extract encrypted text from page for: {tmdb_id}')
-                        return None, None
+                        # 页面 200 但提取不到加密文本：可能真无源，也可能是本次代理 IP
+                        # 撞上 Cloudflare 挑战页/半截 HTML。抛可重试异常走换 IP 重试通道，
+                        # 换几个出口 IP 仍提取不到才由重试耗尽逻辑收敛（更可能是真无源）。
+                        raise Exception(f"Extract failed (retriable) for {tmdb_id}")
 
                 # 2. 调用 enc-vidup 获取 parts
                 enc_vidup = f"{API}/enc-vidup?text={text}"
@@ -143,8 +152,11 @@ def process_tmdb_id(tmdb_id):
                 if not servers_decrypted:
                     raise Exception("No servers found")
 
-                # ========== 关键改动：遍历所有服务器，逐个尝试 ==========
+                # ========== 方案C：遍历所有服务器，收集全部可用 url ==========
                 last_server_error = None
+                urls = []
+                result_tmdb_id = None
+                result_title = None
                 for server in servers_decrypted:
                     try:
                         data_val = server['data']
@@ -160,23 +172,30 @@ def process_tmdb_id(tmdb_id):
                         data = resp.json()
                         stream_decrypted = validate(data, dec_vidup)
 
-                        result = {
-                            "url": stream_decrypted.get("url"),
-                            "tmdbId": stream_decrypted.get("tmdbId"),
-                            "title": stream_decrypted.get("title")
-                        }
-                        if result["url"] and result["tmdbId"]:
-                            # 成功获取数据，返回结果
-                            return True, result
+                        url = stream_decrypted.get("url")
+                        tid = stream_decrypted.get("tmdbId")
+                        if url and tid:
+                            if url not in urls:
+                                urls.append(url)
+                            # tmdbId/title 各 server 一致，取首个成功的即可
+                            if result_tmdb_id is None:
+                                result_tmdb_id = tid
+                                result_title = stream_decrypted.get("title")
                         else:
-                            # 数据不完整，视为失败，继续尝试下一个服务器
                             last_server_error = "Missing url or tmdbId in decrypted data"
-                            continue
                     except Exception as e:
                         last_server_error = e
                         server_name = server.get('name', 'unknown')
                         print(f"  Server '{server_name}' failed: {e}")
                         continue
+
+                if urls and result_tmdb_id:
+                    # 收集到至少一个可用节点，返回全部备用 url
+                    return "ok", {
+                        "urls": urls,
+                        "tmdbId": result_tmdb_id,
+                        "title": result_title,
+                    }
 
                 # 所有服务器都尝试失败
                 raise Exception(f"All servers failed for {tmdb_id}. Last error: {last_server_error}")
@@ -186,14 +205,15 @@ def process_tmdb_id(tmdb_id):
                 # 真无源的干净 404 不重试，直接失败退出，省掉 2/3 的无用请求与 sleep
                 if not _is_retriable(e):
                     print(f"  [无源 404] {tmdb_id}: {e}")
-                    return False, None
+                    return "dead", None
                 print(f"  [Attempt {attempt}/{MAX_RETRIES}] 瞬时错误 for {tmdb_id}: {e}")
                 if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY)
                 else:
                     print(f"  All {MAX_RETRIES} attempts failed for ID {tmdb_id}")
 
-    return False, None
+    # 瞬时错误重试耗尽 → 交给多轮捞回，下一轮重跑
+    return "retry", None
 
 
 def load_processed_ids(results_file, fail_file):
@@ -219,6 +239,55 @@ def load_processed_ids(results_file, fail_file):
     return processed
 
 
+def run_batch(to_process, results_file, fail_file, max_workers):
+    """并发处理一批 ID，实时落盘 ok/dead，返回本批“瞬时耗尽”待重跑的 ID 列表。
+
+      - "ok"    → 追加写 results_file（output）
+      - "dead"  → 追加写 fail_file，永久排除
+      - "retry" → 不落盘，收集返回，交给上层多轮循环下一轮重跑
+    """
+    lock = threading.Lock()
+    ok_count = 0
+    dead_count = 0
+    retry_ids = []
+
+    def process_one(tid):
+        status, result = process_tmdb_id(tid)
+        with lock:
+            if status == "ok" and result:
+                with open(results_file, 'a', encoding='utf-8') as f:
+                    f.write(json.dumps(result, ensure_ascii=False) + '\n')
+                print(f"✅ SUCCESS: {result.get('title')} ({result.get('tmdbId')})")
+            elif status == "retry":
+                retry_ids.append(tid)
+                print(f"🔁 RETRY-LATER: {tid}")
+            else:  # "dead" 或异常兜底
+                with open(fail_file, 'a', encoding='utf-8') as f:
+                    f.write(f"{tid}\n")
+                print(f"❌ DEAD: {tid}")
+        return status
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_one, tid): tid for tid in to_process}
+        for future in as_completed(futures):
+            tid = futures[future]
+            try:
+                status = future.result()
+                if status == "ok":
+                    ok_count += 1
+                elif status == "retry":
+                    pass  # 已收集进 retry_ids
+                else:
+                    dead_count += 1
+            except Exception as e:
+                print(f"⚠️  Unexpected exception for {tid}: {e}")
+                with lock:
+                    retry_ids.append(tid)
+
+    print(f"\n本批完成 | 成功 {ok_count} | 真无源 {dead_count} | 待重跑 {len(retry_ids)}")
+    return retry_ids
+
+
 def main():
     ids_file = Path(_CFG.get("input", "ids.txt"))
     results_file = Path(_CFG.get("output", "results.jsonl"))
@@ -239,45 +308,35 @@ def main():
         print("All IDs processed.")
         return
 
-    # 多线程配置
-    MAX_WORKERS = _CFG.get("max_workers", 20)  # 并发线程数，可调整
-    lock = threading.Lock()  # 文件写入锁
-    success_count = 0
-    fail_count = 0
+    max_workers = _CFG.get("max_workers", 20)
+    max_rounds = _CFG.get("max_rounds", 8)
 
-    def process_one(tid):
-        """线程执行的包装函数，负责调用处理并写入结果"""
-        success, result = process_tmdb_id(tid)
-        with lock:
-            if success and result:
-                with open(results_file, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(result, ensure_ascii=False) + '\n')
-                print(f"✅ SUCCESS: {result.get('title')} ({result.get('tmdbId')})")
-                return True
-            else:
-                with open(fail_file, 'a', encoding='utf-8') as f:
+    # ---- 内嵌多轮捞回：首轮跑全部，之后每轮只重跑上一轮“瞬时耗尽”的 ID ----
+    # ok 累加进 output、dead 累加进 fail_file 均在 run_batch 内实时落盘，
+    # 故 output 执行完即为“原结果 + 捞回结果”的合并（原 total_results.jsonl）。
+    pending = to_process
+    round_no = 0
+    while pending:
+        round_no += 1
+        print(f"\n{'=' * 70}")
+        print(f"==> 第 {round_no}/{max_rounds} 轮 | 待处理 {len(pending)} 个 ID")
+        print(f"{'=' * 70}")
+
+        retry_ids = run_batch(pending, results_file, fail_file, max_workers)
+
+        if not retry_ids:
+            print("\n==> 瞬时失败已清零，所有有源 ID 已捞干净，正常结束。")
+            break
+        if round_no >= max_rounds:
+            # 达上限仍未捞回的，写入 fail_file 归档（视为难以捞回）
+            with open(fail_file, 'a', encoding='utf-8') as f:
+                for tid in retry_ids:
                     f.write(f"{tid}\n")
-                print(f"❌ FAILED: {tid}")
-                return False
+            print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(retry_ids)} 个瞬时失败 ID 归入 fail_file。")
+            break
+        pending = retry_ids
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(process_one, tid): tid for tid in to_process}
-        for future in as_completed(futures):
-            tid = futures[future]
-            try:
-                ok = future.result()
-                if ok:
-                    success_count += 1
-                else:
-                    fail_count += 1
-            except Exception as e:
-                print(f"⚠️  Unexpected exception for {tid}: {e}")
-                with lock:
-                    with open(fail_file, 'a', encoding='utf-8') as f:
-                        f.write(f"{tid}\n")
-                fail_count += 1
-
-    print(f"\nDone. Success: {success_count}, Failed: {fail_count}")
+    print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
 
 
 if __name__ == "__main__":
