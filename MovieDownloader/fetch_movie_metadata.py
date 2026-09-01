@@ -6,6 +6,7 @@ IMDB 全量电影 + TMDB ID 转换 → JSONL
 import csv
 import gzip
 import json
+import os
 import time
 import logging
 import requests
@@ -22,6 +23,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
 
 
+def _load_dotenv(path):
+    """轻量解析同目录 .env（KEY=VALUE，支持 # 注释与引号），不覆盖已存在的环境变量。
+    不引入 python-dotenv 依赖，保持最小改动。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv(str(Path(__file__).with_name(".env")))
+
+
 def load_config() -> dict:
     """读取项目统一配置文件中本脚本对应的段落。"""
     if not CONFIG_PATH.exists():
@@ -36,9 +58,12 @@ def load_config() -> dict:
 
 _CFG = load_config()
 
-TMDB_API_KEY = _CFG.get("tmdb_api_key") or ""
+# TMDB API Key：敏感项，优先取环境变量 TMDB_API_KEY（同目录 .env），
+# 缺省时才回退 config.yaml（便于本地调试）。
+TMDB_API_KEY = (os.environ.get("TMDB_API_KEY", "").strip()
+                or (_CFG.get("tmdb_api_key") or "").strip())
 if not TMDB_API_KEY:
-    raise SystemExit("请在 config.yaml 的 fetch_movie_metadata.tmdb_api_key 填写 TMDB API Key")
+    raise SystemExit("请在 .env 配置 TMDB_API_KEY（或 config.yaml 的 fetch_movie_metadata.tmdb_api_key）")
 tmdb.API_KEY = TMDB_API_KEY
 
 DATA_DIR = Path(_CFG.get("data_dir", "imdb_data"))

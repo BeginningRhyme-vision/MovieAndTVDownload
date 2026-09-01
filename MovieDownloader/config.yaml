@@ -17,8 +17,9 @@
 # fetch_movie_metadata.py —— 抓取 IMDB 全量电影元数据并转换 TMDB ID
 # ----------------------------------------------------------------------------
 fetch_movie_metadata:
-  # TMDB API Key：在 https://www.themoviedb.org 申请。必填，留空会直接报错退出
-  tmdb_api_key: "83ee7d0b61b4623ae794e741a5883d34"
+  # TMDB API Key：敏感项，请配置到同目录 .env 的 TMDB_API_KEY（见 .env.example）。
+  # 环境变量优先；此处留空，仅作本地调试回退。生产环境务必留空。
+  tmdb_api_key: ""
 
   # 只保留哪些 IMDB 条目类型（title.basics 的 titleType 列）。
   # 常见值：movie / tvSeries / short / tvMovie ...；这里默认只要电影
@@ -79,13 +80,15 @@ tmdb_ids_to_links:
   # 20s 给卡死请求留太久空耗线程；降到 12s 可让长尾/卡死请求早 3~8s 放弃，
   # 且仍高于所有正常阶段的 max，不会误杀正常较慢响应。
   timeout: 12
-  # 代理配置：vidup.to 有 Cloudflare 机房 IP 拦截，直连会 403，需走住宅代理
+  # 代理配置：vidup.to 有 Cloudflare 机房 IP 拦截，直连会 403，需走住宅代理。
+  # 敏感项 user/password 请配置到同目录 .env 的 PROXY_USER / PROXY_PASSWORD（见 .env.example）。
+  # 环境变量优先；此处 user/password 留空，仅作本地调试回退。生产环境务必留空。
   proxy:
     # true=启用下方代理，false=直连
     enabled: true
     host: "unmetered.residential.proxyrack.net"
-    user: "daran"
-    password: "TYQSUK9-3VKDM4M-MH365O9-HPDIYIG-O9YHYN9-FXCSKNO-QMS83CJ"
+    user: ""
+    password: ""
     # 端口范围 [起, 止]，每次请求随机取一个端口以更换出口 IP
     port_range: [9000, 9050]
 
@@ -177,7 +180,8 @@ download_movies:
 # 【预留】对应脚本尚未接入本配置，后续改造时启用
 # ----------------------------------------------------------------------------
 fetch_subtitles:
-  # SubDL API Key：在 https://subdl.com/panel/api 免费申请。必填
+  # SubDL API Key：敏感项，请配置到同目录 .env 的 SUBDL_API_KEY（见 .env.example）。
+  # 注：本脚本目前直接从 .env 读取该 key，不读取本段其余字段（预留）。
   subdl_api_key: ""
   # 输入：download_movies.py 的成功日志
   success_log: "success.jsonl"

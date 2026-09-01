@@ -19,8 +19,33 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+from pathlib import Path
+
+
+def _load_dotenv(path):
+    """轻量解析同目录 .env（KEY=VALUE，支持 # 注释与引号），不覆盖已存在的环境变量。
+    不引入 python-dotenv 依赖，保持最小改动。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv(str(Path(__file__).with_name(".env")))
+
 # ========== 配置 ==========
-SUBDL_API_KEY = ""  # 在 https://subdl.com/panel/api 免费申请后填入
+# SubDL API Key：敏感项，优先环境变量 SUBDL_API_KEY（同目录 .env）。
+# 在 https://subdl.com/panel/api 免费申请后填入 .env。
+SUBDL_API_KEY = os.environ.get("SUBDL_API_KEY", "").strip()
 
 SUCCESS_LOG = "success.jsonl"
 SUBTITLE_DIR = "/mnt/MovieAndTVDownload/subtitles"

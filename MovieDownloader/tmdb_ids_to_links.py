@@ -2,12 +2,34 @@ import random
 from curl_cffi import requests
 import re
 import json
+import os
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 import yaml
+
+
+def _load_dotenv(path):
+    """轻量解析同目录 .env（KEY=VALUE，支持 # 注释与引号），不覆盖已存在的环境变量。
+    不引入 python-dotenv 依赖，保持最小改动。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv(str(Path(__file__).with_name(".env")))
 
 
 def load_config():
@@ -22,6 +44,15 @@ def load_config():
 
 _CFG = load_config()
 _PROXY_CFG = _CFG.get("proxy", {}) or {}
+
+
+def _proxy_secret(cfg_key, env_key):
+    """代理凭据：优先取环境变量（同目录 .env），缺省时回退 config.yaml（便于本地调试）。"""
+    env_val = os.environ.get(env_key, "").strip()
+    if env_val:
+        return env_val
+    return (_PROXY_CFG.get(cfg_key, "") or "").strip()
+
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
@@ -42,9 +73,21 @@ TIMEOUT = _CFG.get("timeout", 20)  # 单个 HTTP 请求超时（秒）
 # 注意：vidup.to 有 Cloudflare 机房 IP 拦截，直连会返回 403，必须走住宅代理
 USE_PROXY = _PROXY_CFG.get("enabled", True)
 PROXY_HOST = _PROXY_CFG.get("host", "unmetered.residential.proxyrack.net")
-PROXY_USER = _PROXY_CFG.get("user", "daran")
-PROXY_PASS = _PROXY_CFG.get("password", "TYQSUK9-3VKDM4M-MH365O9-HPDIYIG-O9YHYN9-FXCSKNO-QMS83CJ")
+# 代理账号密码为敏感项：优先环境变量 PROXY_USER / PROXY_PASSWORD（同目录 .env），
+# config.yaml 里对应字段应留空，仅作本地调试回退。
+PROXY_USER = _proxy_secret("user", "PROXY_USER")
+PROXY_PASS = _proxy_secret("password", "PROXY_PASSWORD")
 PROXY_PORT_RANGE = tuple(_PROXY_CFG.get("port_range", (9000, 9050)))  # 每次随机取一个端口，换一个出口 IP
+
+# 启动期校验：启用代理但凭据缺失时立刻报错退出，避免拼出畸形代理 URL
+# （http://:@host:port）后每个 ID 静默跑成一堆 403/失败。凭据须落在同目录 .env。
+if USE_PROXY and (not PROXY_USER or not PROXY_PASS):
+    _missing = [n for n, v in (("PROXY_USER", PROXY_USER), ("PROXY_PASSWORD", PROXY_PASS)) if not v]
+    raise SystemExit(
+        f"代理已启用（proxy.enabled=true）但缺少凭据：{', '.join(_missing)}。"
+        "请在同目录 .env 配置 PROXY_USER / PROXY_PASSWORD"
+        "（或将 config.yaml 的 tmdb_ids_to_links.proxy.enabled 设为 false 直连）。"
+    )
 
 
 def build_proxy():
