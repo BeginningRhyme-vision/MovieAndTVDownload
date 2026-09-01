@@ -73,6 +73,16 @@ def resolve_file(value, default_name):
 INPUT_JSONL = resolve_file(_CFG.get("input"), "results.jsonl")
 SUCCESS_LOG = resolve_file(_CFG.get("success_log"), "success.jsonl")
 FAILED_LOG = resolve_file(_CFG.get("failed_log"), "failed.jsonl")
+
+# ---- 多轮下载配置 ----
+_MULTI_ROUND_CFG = _CFG.get("multi_round", {}) or {}
+MULTI_ROUND_ENABLED = _MULTI_ROUND_CFG.get("enabled", False)
+# 最大轮次至少为 1（含第一轮）；关闭多轮时强制 1 轮。
+MAX_ROUNDS = max(1, int(_MULTI_ROUND_CFG.get("max_rounds", 1))) if MULTI_ROUND_ENABLED else 1
+ROUND_COOLDOWN_SECONDS = max(0, int(_MULTI_ROUND_CFG.get("cooldown_seconds", 300)))
+# 两个独立的下载态状态文件（区别于 SUCCESS_LOG/FAILED_LOG）。
+DOWNLOAD_OK_LOG = resolve_file(_CFG.get("download_ok_log"), "download_ok.jsonl")
+DOWNLOAD_FAIL_LOG = resolve_file(_CFG.get("download_fail_log"), "download_fail.jsonl")
 BASE_DIR = resolve_dir(_CFG.get("base_dir"), "downloads")
 FOLDER_PREFIX = _CFG.get("folder_prefix", "movie_")
 MAX_VIDEOS_PER_FOLDER = _CFG.get("max_videos_per_folder", 1000)
@@ -351,6 +361,11 @@ def request_with_retry(
                 break
             wait = min(backoff * (2**attempt), backoff_max)
             wait += random.uniform(0, min(1.0, wait * 0.2))
+            status_hint = f"HTTP {status}" if status else type(exc).__name__
+            print(
+                f"  请求重试 {attempt + 1}/{retries - 1} ({status_hint})，"
+                f"{wait:.1f}s 后重试: {url}"
+            )
             time.sleep(wait)
 
     raise RuntimeError(f"请求失败: {url}; {last_error}") from last_error
@@ -446,6 +461,40 @@ def write_log(log_file, data):
     with log_lock:
         with open(log_file, "a", encoding="utf-8") as file:
             file.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def truncate_log(log_file):
+    """清空（重建）状态文件。用于每轮开头重置 download_fail 状态。"""
+    with log_lock:
+        with open(log_file, "w", encoding="utf-8") as file:
+            file.write("")
+
+
+# 确定性失败关键字：命中即判为“重试也没用”，绝不进入下一轮下载。
+# 这些错误来自 process_one_entry 抛出的 RuntimeError 文案或早返回 error。
+_PERMANENT_FAILURE_MARKERS = (
+    "缺少 tmdbId 或 url",
+    "没有找到媒体播放列表",       # master 解析出来是空
+    "没有找到 1080p",             # 声明分辨率全部不达标
+    "低于 1080p",                 # 实测分辨率不达标
+    "无法探测该流的分辨率",
+    "服务器返回的不是视频分片",   # 源返回 HTML/m3u8，通常是无效源
+)
+
+
+def _classify_failure(error_msg):
+    """判断一次下载失败是否值得下一轮重试。
+
+    返回 True 表示“可重试”（瞬时错误：5xx/超时/SSL/连接/缺片率过高等），
+    返回 False 表示“确定性失败”（画质不达标、无源、缺字段等，重下同样结果）。
+    策略：默认可重试（瞬时问题更常见且重试成本可控），仅当命中确定性关键字时判不可重试。
+    """
+    if not error_msg:
+        return True
+    for marker in _PERMANENT_FAILURE_MARKERS:
+        if marker in error_msg:
+            return False
+    return True
 
 
 def update_success_log(tmdb_id, new_record):
@@ -1049,7 +1098,7 @@ def process_one_entry(entry, processed_ids):
     year = entry.get("year")
 
     if not normalized_id or not url:
-        return tmdb_id, False, {"error": "缺少 tmdbId 或 url"}
+        return tmdb_id, False, {"error": "缺少 tmdbId 或 url", "retriable": False}
 
     # 原子地检查“历史已完成”和“当前正在处理”，防止并发重复下载。
     with processing_lock:
@@ -1288,7 +1337,8 @@ def process_one_entry(entry, processed_ids):
         return tmdb_id, True, conversion_job
 
     except Exception as exc:
-        return tmdb_id, False, {"error": str(exc)}
+        msg = str(exc)
+        return tmdb_id, False, {"error": msg, "retriable": _classify_failure(msg)}
     finally:
         # 下载成功后临时文件和 ID 锁交给转封装阶段管理。
         if not handed_off_to_conversion:
@@ -1539,6 +1589,7 @@ def _run_pipeline():
     }
     conversion_future_to_entry = {}
     upload_future_to_entry = {}
+    download_future_to_entry = {}
 
     print(
         f"启动三级流水线: {MAX_WORKERS} 个下载槽位，"
@@ -1547,134 +1598,225 @@ def _run_pipeline():
         f"（反压上限 {MAX_PENDING_UPLOADS} 在途上传，S3 上传="
         f"{'开启' if S3_ENABLED else '关闭'}）"
     )
+    if MULTI_ROUND_ENABLED and MAX_ROUNDS > 1:
+        print(
+            f"多轮下载已启用：最多 {MAX_ROUNDS} 轮，"
+            f"轮次间冷却 {ROUND_COOLDOWN_SECONDS}s；"
+            f"仅“可重试”的下载失败会进入下一轮。"
+        )
+
+    # 单一事件循环驱动的真三级流水线：所有在途 future（下载/转封装/上传）
+    # 放进同一个 pending 集合，用 wait(FIRST_COMPLETED) 取最先完成的任意一个，
+    # 按其阶段就地推进到下一级。这样每部影片一完成当前阶段就立即流入下一阶段——
+    # 下载完立刻转封装、转封装完立刻上传，三级真正并行流动，互不阻塞。
+    #
+    # 多轮（方案 A）：pending / stage_of / 三个 future 映射 / 三个线程池 全部建在
+    # 多轮循环之外，跨轮存活。每轮只向 pending 注入“本轮待下载”的下载 future；
+    # 上一轮遗留的转封装/上传 future 仍在同一 pending 里被顺带推进，与本轮下载
+    # 真正并行——新一轮无需等上一轮排空（它们是已下载成功的片，与本轮要重下的
+    # 失败片天然不相交）。仅在全部轮次结束后统一排空剩余在途任务。
+    stage_of = {}  # future -> "download" | "conversion" | "upload"
+    pending = set()
+    stats = {"conversions": 0, "uploads": 0}
+
+    def handle_done_future(future, round_failed_retriable):
+        """处理一个已完成的 future，按其阶段推进流水线。
+
+        round_failed_retriable 为本轮“可重试下载失败”的收集器（list）；
+        末轮排空阶段传 None（此时 pending 里只会剩转封装/上传，不会命中下载分支）。
+        """
+        stage = stage_of.pop(future, None)
+
+        if stage == "download":
+            entry = download_future_to_entry.pop(future)
+            try:
+                tmdb_id, download_success, info = future.result()
+            except Exception as exc:
+                tmdb_id = entry.get("tmdbId")
+                download_success = False
+                info = {"error": str(exc), "retriable": _classify_failure(str(exc))}
+
+            if download_success:
+                # 下载成功：写独立的下载态状态文件（只记下载，不含转封装/上传）。
+                write_log(DOWNLOAD_OK_LOG, {
+                    "tmdbId": tmdb_id,
+                    "title": entry.get("title", ""),
+                    "year": entry.get("year"),
+                })
+                conversion_future = conversion_executor.submit(
+                    finalize_one_entry, info, processed_ids
+                )
+                conversion_future_to_entry[conversion_future] = entry
+                stage_of[conversion_future] = "conversion"
+                pending.add(conversion_future)
+                stats["conversions"] += 1
+                return
+
+            error_msg = info.get("error", "未知错误")
+            # “已处理/处理中”属跳过而非失败：不写任何失败记录、不进下一轮。
+            if error_msg in ignored_errors:
+                return
+
+            retriable = bool(info.get("retriable", True))
+            write_log(FAILED_LOG, {
+                "tmdbId": tmdb_id,
+                "title": entry.get("title", ""),
+                "url": entry.get("url", ""),
+                "error": error_msg,
+                "stage": "download",
+            })
+            # 下载态状态文件：本轮下载失败逐条记录（含可否重试）。
+            write_log(DOWNLOAD_FAIL_LOG, {
+                "tmdbId": tmdb_id,
+                "title": entry.get("title", ""),
+                "error": error_msg,
+                "retriable": retriable,
+            })
+            print(
+                f"下载失败: {tmdb_id}: {error_msg}"
+                f"（{'可重试' if retriable else '确定性失败,不重试'}）"
+            )
+            # 仅“可重试”的失败进入下一轮；确定性失败绝不重下。
+            if retriable and round_failed_retriable is not None:
+                round_failed_retriable.append(entry)
+
+        elif stage == "conversion":
+            entry = conversion_future_to_entry.pop(future)
+            try:
+                tmdb_id, conversion_success, info = future.result()
+            except Exception as exc:
+                tmdb_id = entry.get("tmdbId")
+                conversion_success = False
+                info = {"error": str(exc)}
+
+            if not conversion_success:
+                write_log(FAILED_LOG, {
+                    "tmdbId": tmdb_id,
+                    "title": entry.get("title", ""),
+                    "url": entry.get("url", ""),
+                    "error": info.get("error", "未知错误"),
+                    "stage": "conversion",
+                })
+                print(f"转封装失败: {tmdb_id}: {info.get('error', '未知错误')}")
+                return
+
+            # 转封装成功 -> 立即提交上传。反压：先 acquire 信号量（限制
+            # 在途+排队的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载
+            # 会在此阻塞主循环，从而钳制本地磁盘占用上限。release 由 future
+            # 完成回调对称释放，保证无论上传成功/异常/取消都不泄漏信号量。
+            upload_semaphore.acquire()
+            upload_future = upload_executor.submit(upload_one_entry, info)
+            upload_future.add_done_callback(
+                lambda _f: upload_semaphore.release()
+            )
+            upload_future_to_entry[upload_future] = entry
+            stage_of[upload_future] = "upload"
+            pending.add(upload_future)
+            stats["uploads"] += 1
+
+        elif stage == "upload":
+            entry = upload_future_to_entry.pop(future)
+            try:
+                tmdb_id, upload_success, info = future.result()
+            except Exception as exc:
+                tmdb_id = entry.get("tmdbId")
+                upload_success = False
+                info = {"error": str(exc)}
+
+            if not upload_success:
+                # upload_one_entry 内部已写 pending 与
+                # SUCCESS_LOG(uploaded=false)，这里再落一条 FAILED_LOG
+                # 便于统计上传阶段失败。
+                write_log(FAILED_LOG, {
+                    "tmdbId": tmdb_id,
+                    "title": entry.get("title", ""),
+                    "url": entry.get("url", ""),
+                    "error": info.get("error", "未知错误"),
+                    "stage": "upload",
+                })
+                print(f"上传失败: {tmdb_id}: {info.get('error', '未知错误')}")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as download_executor, \
             ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as conversion_executor, \
             ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as upload_executor:
-        download_future_to_entry = {
-            download_executor.submit(
-                process_one_entry, entry, processed_ids
-            ): entry
-            for entry in entries
-        }
 
-        # 单一事件循环驱动的真三级流水线：所有在途 future（下载/转封装/上传）
-        # 放进同一个 pending 集合，用 wait(FIRST_COMPLETED) 取最先完成的任意一个，
-        # 按其阶段就地推进到下一级。这样每部影片一完成当前阶段就立即流入下一阶段——
-        # 下载完立刻转封装、转封装完立刻上传，三级真正并行流动，互不阻塞。
-        #
-        # 关键：绝不再出现“主线程被某一阶段的全量消费卡住、导致上传迟迟不启动”的
-        # 伪流水线；只要一部影片转封装完成且上传信号量允许，就立即上传，从而把
-        # 本地磁盘占用钳制在 MAX_PENDING_UPLOADS 规模，避免堆积爆盘。
-        stage_of = {}  # future -> "download" | "conversion" | "upload"
-        for f in download_future_to_entry:
-            stage_of[f] = "download"
+        current_batch = entries
+        round_no = 1
+        while True:
+            # 每轮开头清空 download_fail 状态文件，只记录本轮下载失败。
+            truncate_log(DOWNLOAD_FAIL_LOG)
+            if MULTI_ROUND_ENABLED and MAX_ROUNDS > 1:
+                print(
+                    f"\n===== 下载轮次 {round_no}/{MAX_ROUNDS}："
+                    f"本轮待下载 {len(current_batch)} 部 =====",
+                    flush=True,
+                )
 
-        pending = set(download_future_to_entry.keys())
-        submitted_conversions = 0
-        submitted_uploads = 0
+            # 注入本轮下载 future，并单独跟踪“本轮下载 future”集合。
+            round_download_futures = set()
+            for entry in current_batch:
+                f = download_executor.submit(
+                    process_one_entry, entry, processed_ids
+                )
+                download_future_to_entry[f] = entry
+                stage_of[f] = "download"
+                pending.add(f)
+                round_download_futures.add(f)
 
+            round_failed_retriable = []
+
+            # 关键：只等“本轮下载 future”全部离开 download 阶段即算本轮下载完成，
+            # 不等 pending 全空。上一轮遗留的转封装/上传在同一循环里并行推进，
+            # 但不阻塞本轮判定——这正是方案 A 的并行精髓。
+            remaining_downloads = set(round_download_futures)
+            while remaining_downloads:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.discard(future)
+                    if future in remaining_downloads:
+                        remaining_downloads.discard(future)
+                    handle_done_future(future, round_failed_retriable)
+
+            # 本轮下载全部有结论，决定是否再来一轮。
+            if not round_failed_retriable:
+                if MULTI_ROUND_ENABLED and MAX_ROUNDS > 1:
+                    print("\n本轮无可重试的下载失败，多轮下载提前结束。", flush=True)
+                break
+            if round_no >= MAX_ROUNDS:
+                print(
+                    f"\n已达最大轮次 {MAX_ROUNDS}，仍有 "
+                    f"{len(round_failed_retriable)} 部下载失败未成功，停止重试。",
+                    flush=True,
+                )
+                break
+
+            print(
+                f"\n本轮有 {len(round_failed_retriable)} 部可重试下载失败，"
+                f"冷却 {ROUND_COOLDOWN_SECONDS}s 后进入第 {round_no + 1} 轮...",
+                flush=True,
+            )
+            if ROUND_COOLDOWN_SECONDS > 0:
+                time.sleep(ROUND_COOLDOWN_SECONDS)
+            current_batch = round_failed_retriable
+            round_no += 1
+
+        # 多轮下载结束，但 pending 里可能还有末轮的转封装/上传在途 -> 显式排空，
+        # 确保所有失败/成功记录都在循环内被处理（而非交给 with 退出时静默等待）。
+        if pending:
+            print(
+                f"\n下载轮次结束，等待剩余 {len(pending)} 个转封装/上传任务完成...",
+                flush=True,
+            )
         while pending:
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
                 pending.discard(future)
-                stage = stage_of.pop(future, None)
+                handle_done_future(future, None)
 
-                if stage == "download":
-                    entry = download_future_to_entry[future]
-                    try:
-                        tmdb_id, download_success, info = future.result()
-                    except Exception as exc:
-                        tmdb_id = entry.get("tmdbId")
-                        download_success = False
-                        info = {"error": str(exc)}
-
-                    if download_success:
-                        conversion_future = conversion_executor.submit(
-                            finalize_one_entry, info, processed_ids
-                        )
-                        conversion_future_to_entry[conversion_future] = entry
-                        stage_of[conversion_future] = "conversion"
-                        pending.add(conversion_future)
-                        submitted_conversions += 1
-                        continue
-
-                    if info.get("error") not in ignored_errors:
-                        failed_info = {
-                            "tmdbId": tmdb_id,
-                            "title": entry.get("title", ""),
-                            "url": entry.get("url", ""),
-                            "error": info.get("error", "未知错误"),
-                            "stage": "download",
-                        }
-                        write_log(FAILED_LOG, failed_info)
-                        print(f"下载失败: {tmdb_id}: {failed_info['error']}")
-
-                elif stage == "conversion":
-                    entry = conversion_future_to_entry[future]
-                    try:
-                        tmdb_id, conversion_success, info = future.result()
-                    except Exception as exc:
-                        tmdb_id = entry.get("tmdbId")
-                        conversion_success = False
-                        info = {"error": str(exc)}
-
-                    if not conversion_success:
-                        failed_info = {
-                            "tmdbId": tmdb_id,
-                            "title": entry.get("title", ""),
-                            "url": entry.get("url", ""),
-                            "error": info.get("error", "未知错误"),
-                            "stage": "conversion",
-                        }
-                        write_log(FAILED_LOG, failed_info)
-                        print(f"转封装失败: {tmdb_id}: {failed_info['error']}")
-                        continue
-
-                    # 转封装成功 -> 立即提交上传。反压：先 acquire 信号量（限制
-                    # 在途+排队的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载
-                    # 会在此阻塞主循环，从而钳制本地磁盘占用上限。release 由 future
-                    # 完成回调对称释放，保证无论上传成功/异常/取消都不泄漏信号量。
-                    upload_semaphore.acquire()
-                    upload_future = upload_executor.submit(
-                        upload_one_entry, info
-                    )
-                    upload_future.add_done_callback(
-                        lambda _f: upload_semaphore.release()
-                    )
-                    upload_future_to_entry[upload_future] = entry
-                    stage_of[upload_future] = "upload"
-                    pending.add(upload_future)
-                    submitted_uploads += 1
-
-                elif stage == "upload":
-                    entry = upload_future_to_entry[future]
-                    try:
-                        tmdb_id, upload_success, info = future.result()
-                    except Exception as exc:
-                        tmdb_id = entry.get("tmdbId")
-                        upload_success = False
-                        info = {"error": str(exc)}
-
-                    if not upload_success:
-                        # upload_one_entry 内部已写 pending 与
-                        # SUCCESS_LOG(uploaded=false)，这里再落一条 FAILED_LOG
-                        # 便于统计上传阶段失败。
-                        failed_info = {
-                            "tmdbId": tmdb_id,
-                            "title": entry.get("title", ""),
-                            "url": entry.get("url", ""),
-                            "error": info.get("error", "未知错误"),
-                            "stage": "upload",
-                        }
-                        write_log(FAILED_LOG, failed_info)
-                        print(f"上传失败: {tmdb_id}: {failed_info['error']}")
-
-        # while pending 循环退出，即代表所有下载/转封装/上传 future 均已完成。
-        # 这是数据完整性的硬保证：主循环不会提前退出而遗漏在途上传。
+        # 至此所有下载/转封装/上传 future 均已完成，数据完整性得到保证。
         print(
-            f"三级流水线全部完成：转封装 {submitted_conversions} 部，"
-            f"上传 {submitted_uploads} 部。"
+            f"三级流水线全部完成：转封装 {stats['conversions']} 部，"
+            f"上传 {stats['uploads']} 部。"
         )
 
 

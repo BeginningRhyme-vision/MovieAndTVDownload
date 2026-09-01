@@ -88,6 +88,17 @@ download_movies:
   input: "picked_by_year.jsonl"
   success_log: "success.jsonl"
   failed_log: "failed.jsonl"
+  # ---- 多轮下载：对因瞬时错误(5xx/超时/SSL/缺片等)下载失败且可重试的影片自动重跑 ----
+  # 确定性失败（404/无源、画质不达标、缺 tmdbId/url）绝不进入下一轮，避免白费流量。
+  multi_round:
+    enabled: true           # false=只跑一轮（等价旧行为）
+    max_rounds: 3           # 最大下载轮次（含第一轮）
+    cooldown_seconds: 300   # 轮次之间的冷却等待（秒）
+  # 两个独立于 success.jsonl/failed.jsonl 的下载态状态文件，全程可查当前下载进度：
+  #   download_ok_log   —— 累计追加，每部“下载”成功一条（不含转封装/上传）
+  #   download_fail_log —— 每轮开头清空重写，只记本轮“下载”失败的影片
+  download_ok_log: "download_ok.jsonl"
+  download_fail_log: "download_fail.jsonl"
   # 视频落盘根目录与临时工作目录。
   # 支持三种写法：
   #   1) 相对路径（如 downloads）—— 以脚本所在目录 MovieDownloader/ 为根，
