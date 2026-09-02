@@ -1550,8 +1550,32 @@ def preflight_check_s3():
     )
 
 
+def preflight_check_ffmpeg():
+    """启动前预检 ffmpeg/ffprobe 是否在 PATH 中：缺失则 fail-fast 退出。
+
+    二者是转封装（TS->MP4）与分辨率探测的硬依赖，若缺失会导致每部影片
+    在转封装阶段静默失败进 failed.jsonl，白跑整轮下载。故在此提前拦截。
+    """
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if missing:
+        reason = (
+            f"未找到外部工具：{', '.join(missing)}。"
+            "请先安装 ffmpeg（含 ffprobe）并加入 PATH，否则转封装会全部失败。"
+        )
+        print(f"[ffmpeg 预检失败] {reason}", flush=True)
+        write_log(FAILED_LOG, {
+            "stage": "preflight",
+            "error": reason,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        release_main_lock()
+        sys.exit(1)
+    print("[ffmpeg 预检通过] ffmpeg 与 ffprobe 均已就绪", flush=True)
+
+
 def main():
     acquire_main_lock()
+    preflight_check_ffmpeg()
     if S3_ENABLED:
         preflight_check_s3()
     monitor_thread = None

@@ -279,7 +279,9 @@ def process_tmdb_id(tmdb_id):
                     # 用入参 tmdb_id 查表：它就是 ids.txt / movies.jsonl 的 key，最稳。
                     result = {
                         "urls": urls,
-                        "tmdbId": result_tmdb_id,
+                        # 恒用入参 tmdb_id（ids.txt / movies.jsonl 的 key），
+                        # 保证全链路 tmdbId 一致：续跑去重、元数据查表、下游 R2 路径与文件名都对得上。
+                        "tmdbId": tmdb_id,
                         "title": result_title,
                     }
                     result.update(_MOVIE_META.get(str(tmdb_id), {}))
