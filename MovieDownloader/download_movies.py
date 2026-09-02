@@ -148,7 +148,7 @@ S3_ENABLED = bool(_S3_CFG.get("enabled", False))
 S3_ENDPOINT_URL = _s3_secret("endpoint_url", "R2_ENDPOINT_URL")
 S3_REGION = _S3_CFG.get("region", "auto") or "auto"
 S3_BUCKET = _s3_secret("bucket", "R2_BUCKET")
-S3_PREFIX = (_S3_CFG.get("prefix", "movies") or "").strip("/")
+S3_PREFIX = (_S3_CFG.get("prefix", "") or "").strip("/")
 S3_ACCESS_KEY = _s3_secret("access_key", "R2_ACCESS_KEY")
 S3_SECRET_KEY = _s3_secret("secret_key", "R2_SECRET_KEY")
 UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
@@ -161,7 +161,7 @@ DELETE_LOCAL_AFTER_UPLOAD = bool(_S3_CFG.get("delete_local_after_upload", True))
 _DISK_CFG = _CFG.get("disk_guard", {}) or {}
 DISK_GUARD_ENABLED = bool(_DISK_CFG.get("enabled", True))
 DISK_HIGH_WATERMARK = float(_DISK_CFG.get("high_watermark", 0.85))
-DISK_LOW_WATERMARK = float(_DISK_CFG.get("low_watermark", 0.80))
+DISK_LOW_WATERMARK = float(_DISK_CFG.get("low_watermark", 0.75))
 DISK_CHECK_INTERVAL = float(_DISK_CFG.get("check_interval", 5))
 # 防误配：低水位必须严格小于高水位，否则清闸后永远无法恢复放行（下载卡死）。
 if DISK_LOW_WATERMARK >= DISK_HIGH_WATERMARK:

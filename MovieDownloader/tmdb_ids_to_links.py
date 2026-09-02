@@ -65,8 +65,8 @@ PAGE_HEADERS = {k: v for k, v in HEADERS.items() if k != "X-Requested-With"}
 
 API = _CFG.get("api", "https://enc-dec.app/api")
 MAX_RETRIES = _CFG.get("max_retries", 3)
-RETRY_DELAY = _CFG.get("retry_delay", 2)  # 秒
-TIMEOUT = _CFG.get("timeout", 20)  # 单个 HTTP 请求超时（秒）
+RETRY_DELAY = _CFG.get("retry_delay", 1)  # 秒
+TIMEOUT = _CFG.get("timeout", 12)  # 单个 HTTP 请求超时（秒）
 
 
 # 代理开关：设为 True 时启用下方代理，False 则直连
@@ -396,7 +396,7 @@ def main():
         print("All IDs processed.")
         return
 
-    max_workers = _CFG.get("max_workers", 20)
+    max_workers = _CFG.get("max_workers", 50)
     max_rounds = _CFG.get("max_rounds", 8)
 
     # ---- 内嵌多轮捞回：首轮跑全部，之后每轮只重跑上一轮“瞬时耗尽”的 ID ----
