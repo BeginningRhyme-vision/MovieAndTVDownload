@@ -107,6 +107,10 @@ PLAYLIST_RETRY_BACKOFF_MAX = _CFG.get("playlist_retry_backoff_max", 60.0)
 # 坏节点快速判定并换下一个备用节点；末节点/单节点仍用 PLAYLIST_RETRY_MAX 死磕。
 PLAYLIST_RETRY_FALLBACK = _CFG.get("playlist_retry_fallback", 3)
 MIN_BITRATE_KBPS = _CFG.get("min_bitrate_kbps", 1850)
+# 按编码分档的 1080p 最低码率：HEVC/AV1 同主观画质更省码率，单独设等效阈值，
+# 避免用 H.264 基准误杀高效编码的清晰片。未知编码回退 H.264 基准，从严不误放。
+MIN_BITRATE_KBPS_HEVC = _CFG.get("min_bitrate_kbps_hevc", 1100)
+MIN_BITRATE_KBPS_AV1 = _CFG.get("min_bitrate_kbps_av1", 925)
 # 缺片保护阈值：缺片率超过 MAX_MISSING_RATIO 且缺片数超过豁免量，判失败可重下。
 MAX_MISSING_RATIO = _CFG.get("max_missing_ratio", 0.02)
 # 小样本豁免：允许至少丢这么多片而不触发阈值（与比例阈值取较大者）。
@@ -481,6 +485,7 @@ _PERMANENT_FAILURE_MARKERS = (
     "没有找到 1080p",             # 声明分辨率全部不达标
     "低于 1080p",                 # 实测分辨率不达标
     "无法探测该流的分辨率",
+    "未达到",                     # 1080p 码率未达标（单流"未达到 N kbps"/兜底"未达到按编码分档的门槛"）
     "服务器返回的不是视频分片",   # 源返回 HTML/m3u8，通常是无效源
 )
 
@@ -881,6 +886,49 @@ def probe_resolution(sample_path):
     return parse_resolution(result.stdout.strip())
 
 
+def probe_codec(sample_path):
+    """用 ffprobe 读取采样文件的视频编码名（小写，如 h264/hevc/av1）；失败返回 None。"""
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        sample_path,
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=120,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    codec = result.stdout.strip().lower()
+    return codec or None
+
+
+def min_bitrate_for_codec(codec):
+    """按视频编码返回 1080p 档的最低码率门槛（kbps）。
+
+    HEVC/AV1 同主观画质比 H.264 更省码率，单独设等效阈值以最大化留存；
+    未知或探测失败的编码回退 H.264 基准，从严处理不误放伪高清。
+    """
+    if codec in ("hevc", "h265"):
+        return MIN_BITRATE_KBPS_HEVC
+    if codec in ("av1", "av01"):
+        return MIN_BITRATE_KBPS_AV1
+    return MIN_BITRATE_KBPS
+
+
 def resolution_tier(size):
     """
     按高度归类画质档位，数值越大画质越高。
@@ -1225,11 +1273,20 @@ def process_one_entry(entry, processed_ids):
                 print(f"  流 {actual_resolution} 采样码率: {bitrate:.0f} kbps")
 
                 # 恰好 1080p 档要求码率达标；更高分辨率不再设码率门槛。
-                if tier == 1 and bitrate <= MIN_BITRATE_KBPS:
-                    raise RuntimeError(
-                        f"1080p 流码率 {bitrate:.0f} kbps "
-                        f"未达到 {MIN_BITRATE_KBPS} kbps"
+                # 码率门槛按视频编码分档：HEVC/AV1 更省码率，用等效阈值避免误杀清晰片。
+                if tier == 1:
+                    codec = probe_codec(sample_path)
+                    min_bitrate = min_bitrate_for_codec(codec)
+                    codec_label = codec or "unknown"
+                    print(
+                        f"  流 {actual_resolution} 编码 {codec_label}，"
+                        f"码率门槛 {min_bitrate} kbps"
                     )
+                    if bitrate <= min_bitrate:
+                        raise RuntimeError(
+                            f"1080p 流（{codec_label}）码率 {bitrate:.0f} kbps "
+                            f"未达到 {min_bitrate} kbps"
+                        )
 
                 # 分辨率优先，同档位下再比码率。
                 better = tier > best_tier or (
@@ -1257,7 +1314,7 @@ def process_one_entry(entry, processed_ids):
         if not best_sample_path:
             raise RuntimeError(
                 "没有可用的流：候选流全部低于 1080p、采样失败，"
-                f"或 1080p 流码率未达到 {MIN_BITRATE_KBPS} kbps"
+                "或 1080p 流码率未达到按编码分档的门槛"
             )
 
         print(
