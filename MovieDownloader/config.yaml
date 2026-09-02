@@ -99,7 +99,9 @@ tmdb_ids_to_links:
 # ----------------------------------------------------------------------------
 download_movies:
   # 输入与日志
-  input: "picked_by_year.jsonl"
+  # 全量下载直接消费取流产物 results.jsonl（自带 year 等元数据，见 §8.8）；
+  # picked_by_year.jsonl 仅为按年份抽样的测试输入，全量不经过 pick_by_year。
+  input: "results.jsonl"
   success_log: "success.jsonl"
   failed_log: "failed.jsonl"
   # ---- 多轮下载：对因瞬时错误(5xx/超时/SSL/缺片等)下载失败且可重试的影片自动重跑 ----
@@ -162,7 +164,7 @@ download_movies:
     max_pending_uploads: 64  # 反压阈值：在途+排队上传数达到此值就阻塞下载，防磁盘撑爆
     upload_retry_max: 5      # 单文件上传最大重试次数
     upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避）
-    delete_local_after_upload: false  # 上传成功后删除本地 mp4
+    delete_local_after_upload: true   # 上传成功后删除本地 mp4（全量必开，否则磁盘累积撑爆）
   # ---- 磁盘水位监控（兜底）----
   # 反压按"上传数量"封顶，兜不住大文件/上传持续失败堆积/enabled=false 等场景。
   # 水位监控按 base_dir 所在磁盘的实际占用百分比做终极熔断：
