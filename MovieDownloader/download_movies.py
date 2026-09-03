@@ -1054,7 +1054,9 @@ def download_segments(
     否则前面已经写入的批次会被清空。
 
     单个分片耗尽重试次数后会记录并跳过，不中止整部影片。返回值为：
-    (成功写入的字节数, 失败分片索引列表)。
+    (成功写入的总字节数, 失败分片索引列表, init 段字节数)。
+    total_bytes 含 init 段字节；单独返回 init_bytes 便于调用方在按时长算码率时
+    扣除 init（init 段无时长，若不扣会使码率虚高，fMP4 采样场景尤甚）。
 
     init_url 用于 fMP4：该 init 段携带 moov（编解码参数），必须位于所有媒体
     分片之前。默认只在新建文件（start_idx == 0，wb 模式）时写入一次。
@@ -1066,11 +1068,12 @@ def download_segments(
 
     indices = list(range(start_idx, min(end_idx, len(segment_urls))))
     if not indices:
-        return 0, []
+        return 0, [], 0
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     mode = "ab" if os.path.exists(output_path) and start_idx > 0 else "wb"
     total_bytes = 0
+    init_bytes = 0
     failed_indices = []
 
     # 只打开一次：这是修复 PPS/SPS 丢失问题的核心。
@@ -1083,7 +1086,8 @@ def download_segments(
                 init_url, -1, SEG_RETRY_MAX, SEG_RETRY_DELAY
             )
             output_file.write(init_data)
-            total_bytes += len(init_data)
+            init_bytes = len(init_data)
+            total_bytes += init_bytes
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             next_submit = 0
@@ -1150,7 +1154,7 @@ def download_segments(
                 # 落盘后再补满窗口，保持 concurrency 个分片始终在途。
                 refill()
 
-    return total_bytes, sorted(failed_indices)
+    return total_bytes, sorted(failed_indices), init_bytes
 
 
 # ---------- FFmpeg ----------
@@ -1300,16 +1304,18 @@ def process_one_entry(entry, processed_ids):
                 # 正片，采样码率更代表全片。采样片单独成文件、测完即删、不复用为正片。
                 sample_start = (len(segment_urls) - sample_count) // 2
                 sample_end = sample_start + sample_count
-                sample_bytes, sample_failed_indices = download_segments(
-                    segment_urls,
-                    sample_path,
-                    start_idx=sample_start,
-                    end_idx=sample_end,
-                    concurrency=min(4, SEGMENT_CONCURRENCY),
-                    init_url=init_url,
-                    # 中间采样 start_idx>0 走 ab 模式不会自动写 init，强制补一次
-                    # moov，否则 fMP4 采样片缺编解码参数导致 ffprobe 探测失败。
-                    force_init=True,
+                sample_bytes, sample_failed_indices, sample_init_bytes = (
+                    download_segments(
+                        segment_urls,
+                        sample_path,
+                        start_idx=sample_start,
+                        end_idx=sample_end,
+                        concurrency=min(4, SEGMENT_CONCURRENCY),
+                        init_url=init_url,
+                        # 中间采样 start_idx>0 走 ab 模式不会自动写 init，强制补一次
+                        # moov，否则 fMP4 采样片缺编解码参数导致 ffprobe 探测失败。
+                        force_init=True,
+                    )
                 )
                 sample_failed_set = set(sample_failed_indices)
                 # 时长求和用真实分片索引区间 [sample_start, sample_end)，与
@@ -1344,7 +1350,9 @@ def process_one_entry(entry, processed_ids):
                         f"{MIN_RESOLUTION_HEIGHT}（容差 {LENIENCY:.2f}），跳过"
                     )
 
-                bitrate = sample_bytes * 8 / sample_duration / 1000
+                # 扣除 init 段字节：init 无时长，计入分子会让码率虚高（fMP4 尤甚）。
+                media_bytes = max(0, sample_bytes - sample_init_bytes)
+                bitrate = media_bytes * 8 / sample_duration / 1000
                 print(f"  流 {actual_resolution} 采样码率: {bitrate:.0f} kbps")
 
                 # 第 2 关 · 码率曲线：门槛按“该流自身高度”平方缩放并乘 LENIENCY，
@@ -1408,7 +1416,7 @@ def process_one_entry(entry, processed_ids):
             f"  并发下载全部 {len(best_segment_urls)} 个分片 "
             f"(并发数 {SEGMENT_CONCURRENCY})..."
         )
-        total_bytes, failed_segment_indices = download_segments(
+        total_bytes, failed_segment_indices, total_init_bytes = download_segments(
             best_segment_urls,
             final_ts,
             start_idx=0,
@@ -1423,8 +1431,10 @@ def process_one_entry(entry, processed_ids):
             for index, duration in enumerate(best_durations)
             if index not in failed_segment_set
         )
+        # 扣除 init 段字节（无时长）后再按整片时长算总码率，口径与采样一致。
+        media_total_bytes = max(0, total_bytes - total_init_bytes)
         total_bitrate = (
-            total_bytes * 8 / total_duration / 1000
+            media_total_bytes * 8 / total_duration / 1000
             if total_duration > 0
             else best_bitrate
         )
@@ -1587,32 +1597,58 @@ def upload_one_entry(success_info):
               flush=True)
         return tmdb_id, True, success_info
 
-    s3_key = build_s3_key(local_path, success_info.get("year"))
-    ok, reason = upload_to_r2(local_path, s3_key)
-    if ok:
-        success_info["uploaded"] = True
-        success_info["s3_key"] = s3_key
-        if DELETE_LOCAL_AFTER_UPLOAD:
-            remove_file(local_path)
-        write_log(SUCCESS_LOG, success_info)
-        print(f"  [{tmdb_id}] 上传成功: {s3_key}", flush=True)
-        return tmdb_id, True, success_info
+    # 从 build_s3_key 起整段包 try：即使 build_s3_key/write_log/write_pending
+    # 等抛异常，也在此兜底为“留本地 + 尽力写 pending + 返回失败”，绝不让异常逃逸
+    # 到调用方——否则成品既不删也不进 pending，reupload 无从感知、磁盘永久泄漏。
+    try:
+        s3_key = build_s3_key(local_path, success_info.get("year"))
+        ok, reason = upload_to_r2(local_path, s3_key)
+        if ok:
+            success_info["uploaded"] = True
+            success_info["s3_key"] = s3_key
+            if DELETE_LOCAL_AFTER_UPLOAD:
+                remove_file(local_path)
+            write_log(SUCCESS_LOG, success_info)
+            print(f"  [{tmdb_id}] 上传成功: {s3_key}", flush=True)
+            return tmdb_id, True, success_info
 
-    # 上传失败：保留本地文件，写 SUCCESS_LOG(uploaded=false) 防重下 + 写 pending。
-    success_info["uploaded"] = False
-    success_info["s3_key"] = s3_key
-    write_log(SUCCESS_LOG, success_info)
-    write_pending({
-        "tmdbId": tmdb_id,
-        "title": success_info.get("title", ""),
-        "year": success_info.get("year"),
-        "local_path": local_path,
-        "s3_key": s3_key,
-        "fail_reason": reason,
-        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-    })
-    print(f"  [{tmdb_id}] 上传失败，已留本地待补传: {reason}", flush=True)
-    return tmdb_id, False, {"error": f"上传失败: {reason}"}
+        # 上传失败：保留本地文件，写 SUCCESS_LOG(uploaded=false) 防重下 + 写 pending。
+        success_info["uploaded"] = False
+        success_info["s3_key"] = s3_key
+        write_log(SUCCESS_LOG, success_info)
+        write_pending({
+            "tmdbId": tmdb_id,
+            "title": success_info.get("title", ""),
+            "year": success_info.get("year"),
+            "local_path": local_path,
+            "s3_key": s3_key,
+            "fail_reason": reason,
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        print(f"  [{tmdb_id}] 上传失败，已留本地待补传: {reason}", flush=True)
+        return tmdb_id, False, {"error": f"上传失败: {reason}"}
+    except Exception as exc:
+        # 上传流程中任何未预期异常：尽力留本地并补写 pending（pending 写入若也
+        # 抛异常则再兜一层，至少保证本地文件不被删、日志有痕迹），返回失败。
+        reason = f"上传阶段异常: {exc}"
+        try:
+            write_pending({
+                "tmdbId": tmdb_id,
+                "title": success_info.get("title", ""),
+                "year": success_info.get("year"),
+                "local_path": local_path,
+                "s3_key": success_info.get("s3_key", ""),
+                "fail_reason": reason,
+                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        except Exception as pend_exc:
+            print(
+                f"  [{tmdb_id}] ⚠️ 上传异常且 pending 写入失败，本地文件已保留："
+                f"{local_path}（{pend_exc}）",
+                flush=True,
+            )
+        print(f"  [{tmdb_id}] 上传阶段异常，已留本地待补传: {exc}", flush=True)
+        return tmdb_id, False, {"error": reason}
 
 
 
@@ -1912,7 +1948,14 @@ def _run_pipeline():
             # 会在此阻塞主循环，从而钳制本地磁盘占用上限。release 由 future
             # 完成回调对称释放，保证无论上传成功/异常/取消都不泄漏信号量。
             upload_semaphore.acquire()
-            upload_future = upload_executor.submit(upload_one_entry, info)
+            # acquire 与 submit 之间若 submit 抛异常（如线程池已 shutdown），
+            # 已 acquire 的配额会永久泄漏、累积到上限致主循环死锁。故用 try 兜底：
+            # submit 失败立即 release，保证信号量对称。
+            try:
+                upload_future = upload_executor.submit(upload_one_entry, info)
+            except Exception:
+                upload_semaphore.release()
+                raise
             upload_future.add_done_callback(
                 lambda _f: upload_semaphore.release()
             )
