@@ -95,38 +95,38 @@ CONVERT_WORKERS = _CFG.get("convert_workers", 16)
 # 单部影片同时下载的分片数。
 SEGMENT_CONCURRENCY = _CFG.get("segment_concurrency", 64)
 TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
-SAMPLE_COUNT = _CFG.get("sample_count", 10)
-SEG_RETRY_MAX = _CFG.get("seg_retry_max", 20)
-SEG_RETRY_DELAY = _CFG.get("seg_retry_delay", 1)
+SAMPLE_COUNT = int(_CFG.get("sample_count", 10))
+SEG_RETRY_MAX = int(_CFG.get("seg_retry_max", 20))
+SEG_RETRY_DELAY = float(_CFG.get("seg_retry_delay", 1))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
-CONVERT_TIMEOUT = _CFG.get("convert_timeout", 1800)
+CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
 # playlist（master/media）解析阶段的请求重试：源站临时 5xx 抽风时，这一层
 # 若过早放弃会直接判整部影片失败。故给足重试次数与退避上限，扛过几十秒级故障。
-PLAYLIST_RETRY_MAX = _CFG.get("playlist_retry_max", 10)
-PLAYLIST_RETRY_BACKOFF = _CFG.get("playlist_retry_backoff", 1.0)
-PLAYLIST_RETRY_BACKOFF_MAX = _CFG.get("playlist_retry_backoff_max", 60.0)
+PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 10))
+PLAYLIST_RETRY_BACKOFF = float(_CFG.get("playlist_retry_backoff", 1.0))
+PLAYLIST_RETRY_BACKOFF_MAX = float(_CFG.get("playlist_retry_backoff_max", 60.0))
 # 方案C 分阶重试：多节点 fallback 时，非末节点用更小的 playlist 重试次数，
 # 坏节点快速判定并换下一个备用节点；末节点/单节点仍用 PLAYLIST_RETRY_MAX 死磕。
-PLAYLIST_RETRY_FALLBACK = _CFG.get("playlist_retry_fallback", 3)
-MIN_RESOLUTION_HEIGHT = _CFG.get("min_resolution_height", 1080)
+PLAYLIST_RETRY_FALLBACK = int(_CFG.get("playlist_retry_fallback", 3))
+MIN_RESOLUTION_HEIGHT = int(_CFG.get("min_resolution_height", 1080))
 # 唯一宽松系数：同时放宽“分辨率红线”与“码率门槛”两关（合并原来的两个容差系数）。
-LENIENCY = _CFG.get("leniency", 0.8)
+LENIENCY = float(_CFG.get("leniency", 0.8))
 # 各编码在 1080p 基准下的最低码率门槛（kbps）。实际门槛按该流自身高度平方缩放：
 #   门槛 = 基准[codec] × (h/1080)² × LENIENCY
 # HEVC/AV1/VP9 同主观画质更省码率，单独设等效基准；探测不到编码回退 H.264 基准（最严）。
 BITRATE_BASELINE = {
-    "h264": _CFG.get("bitrate_h264", 1850),
-    "hevc": _CFG.get("bitrate_hevc", 1100),
-    "av1": _CFG.get("bitrate_av1", 925),
-    "vp9": _CFG.get("bitrate_vp9", 1400),
+    "h264": float(_CFG.get("bitrate_h264", 1850)),
+    "hevc": float(_CFG.get("bitrate_hevc", 1100)),
+    "av1": float(_CFG.get("bitrate_av1", 925)),
+    "vp9": float(_CFG.get("bitrate_vp9", 1400)),
 }
 # 1080p 码率基准高度：门槛随 (实测高度/此值)² 缩放（码率需求 ∝ 像素数 ∝ 高度²）。
 _BITRATE_BASELINE_HEIGHT = 1080
 # 缺片保护阈值：缺片率超过 MAX_MISSING_RATIO 且缺片数超过豁免量，判失败可重下。
-MAX_MISSING_RATIO = _CFG.get("max_missing_ratio", 0.02)
+MAX_MISSING_RATIO = float(_CFG.get("max_missing_ratio", 0.02))
 # 小样本豁免：允许至少丢这么多片而不触发阈值（与比例阈值取较大者）。
-MIN_MISSING_ALLOWANCE = _CFG.get("min_missing_allowance", 1)
+MIN_MISSING_ALLOWANCE = int(_CFG.get("min_missing_allowance", 1))
 
 # ---- R2 上传配置 ----
 UPLOAD_PENDING_LOG = resolve_file(_CFG.get("upload_pending_log"), "upload_pending.jsonl")
@@ -1992,12 +1992,23 @@ def _run_pipeline():
             upload_semaphore.acquire()
             # acquire 与 submit 之间若 submit 抛异常（如线程池已 shutdown），
             # 已 acquire 的配额会永久泄漏、累积到上限致主循环死锁。故用 try 兜底：
-            # submit 失败立即 release，保证信号量对称。
+            # submit 失败立即 release 保证信号量对称，并就地写 FAILED_LOG 后 return
+            # （与转封装提交失败分支对称）——绝不 raise，否则异常逃逸出无 try 包裹的
+            # 主循环，剩余 pending 任务记录全部丢失、并可能卡死磁盘 gate。
+            # 成品 mp4 有意留本地（未删），待 reupload 阶段补传，不构成泄漏。
             try:
                 upload_future = upload_executor.submit(upload_one_entry, info)
-            except Exception:
+            except Exception as exc:
                 upload_semaphore.release()
-                raise
+                write_log(FAILED_LOG, {
+                    "tmdbId": tmdb_id,
+                    "title": entry.get("title", ""),
+                    "urls": entry.get("urls", []),
+                    "error": f"上传提交失败: {exc}",
+                    "stage": "upload",
+                })
+                print(f"上传提交失败: {tmdb_id}: {exc}")
+                return
             upload_future.add_done_callback(
                 lambda _f: upload_semaphore.release()
             )
