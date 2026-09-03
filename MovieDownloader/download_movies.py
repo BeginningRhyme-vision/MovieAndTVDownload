@@ -106,11 +106,20 @@ PLAYLIST_RETRY_BACKOFF_MAX = _CFG.get("playlist_retry_backoff_max", 60.0)
 # 方案C 分阶重试：多节点 fallback 时，非末节点用更小的 playlist 重试次数，
 # 坏节点快速判定并换下一个备用节点；末节点/单节点仍用 PLAYLIST_RETRY_MAX 死磕。
 PLAYLIST_RETRY_FALLBACK = _CFG.get("playlist_retry_fallback", 3)
-MIN_BITRATE_KBPS = _CFG.get("min_bitrate_kbps", 1850)
-# 按编码分档的 1080p 最低码率：HEVC/AV1 同主观画质更省码率，单独设等效阈值，
-# 避免用 H.264 基准误杀高效编码的清晰片。未知编码回退 H.264 基准，从严不误放。
-MIN_BITRATE_KBPS_HEVC = _CFG.get("min_bitrate_kbps_hevc", 1100)
-MIN_BITRATE_KBPS_AV1 = _CFG.get("min_bitrate_kbps_av1", 925)
+MIN_RESOLUTION_HEIGHT = _CFG.get("min_resolution_height", 1080)
+# 唯一宽松系数：同时放宽“分辨率红线”与“码率门槛”两关（合并原来的两个容差系数）。
+LENIENCY = _CFG.get("leniency", 0.8)
+# 各编码在 1080p 基准下的最低码率门槛（kbps）。实际门槛按该流自身高度平方缩放：
+#   门槛 = 基准[codec] × (h/1080)² × LENIENCY
+# HEVC/AV1/VP9 同主观画质更省码率，单独设等效基准；探测不到编码回退 H.264 基准（最严）。
+BITRATE_BASELINE = {
+    "h264": _CFG.get("bitrate_h264", 1850),
+    "hevc": _CFG.get("bitrate_hevc", 1100),
+    "av1": _CFG.get("bitrate_av1", 925),
+    "vp9": _CFG.get("bitrate_vp9", 1400),
+}
+# 1080p 码率基准高度：门槛随 (实测高度/此值)² 缩放（码率需求 ∝ 像素数 ∝ 高度²）。
+_BITRATE_BASELINE_HEIGHT = 1080
 # 缺片保护阈值：缺片率超过 MAX_MISSING_RATIO 且缺片数超过豁免量，判失败可重下。
 MAX_MISSING_RATIO = _CFG.get("max_missing_ratio", 0.02)
 # 小样本豁免：允许至少丢这么多片而不触发阈值（与比例阈值取较大者）。
@@ -482,10 +491,9 @@ def truncate_log(log_file):
 _PERMANENT_FAILURE_MARKERS = (
     "缺少 tmdbId 或 urls",
     "没有找到媒体播放列表",       # master 解析出来是空
-    "没有找到 1080p",             # 声明分辨率全部不达标
-    "低于 1080p",                 # 实测分辨率不达标
-    "无法探测该流的分辨率",
-    "未达到",                     # 1080p 码率未达标（单流"未达到 N kbps"/兜底"未达到按编码分档的门槛"）
+    "没有找到高度达标",           # 声明分辨率全部低于红线（含容差）
+    "低于红线",                   # 实测分辨率低于红线
+    "未达到",                     # 码率未达到按高度平方缩放的门槛
     "服务器返回的不是视频分片",   # 源返回 HTML/m3u8，通常是无效源
 )
 
@@ -916,37 +924,43 @@ def probe_codec(sample_path):
     return codec or None
 
 
-def min_bitrate_for_codec(codec):
-    """按视频编码返回 1080p 档的最低码率门槛（kbps）。
-
-    HEVC/AV1 同主观画质比 H.264 更省码率，单独设等效阈值以最大化留存；
-    未知或探测失败的编码回退 H.264 基准，从严处理不误放伪高清。
-    """
+def normalize_codec(codec):
+    """把 ffprobe 的 codec_name 归一成 BITRATE_BASELINE 的键；无法识别返回 None。"""
+    if not codec:
+        return None
+    codec = codec.lower()
+    if codec in ("h264", "avc"):
+        return "h264"
     if codec in ("hevc", "h265"):
-        return MIN_BITRATE_KBPS_HEVC
+        return "hevc"
     if codec in ("av1", "av01"):
-        return MIN_BITRATE_KBPS_AV1
-    return MIN_BITRATE_KBPS
+        return "av1"
+    if codec == "vp9":
+        return "vp9"
+    return None
 
 
-def resolution_tier(size):
+def bitrate_threshold(height, codec):
+    """单一码率曲线：按“该流自身实测高度 height”平方缩放并乘 LENIENCY。
+
+    门槛 = 基准[codec] × (height / 1080)² × LENIENCY
+    - height 用每个流自己的实测高度，不是红线（高分辨率流按自身高度算，
+      调低红线时也不会集体免检进伪高清）。
+    - codec 无法识别/探测失败时回退 H.264 基准（最严），依赖多轮重采样再探。
+    - 码率需求 ∝ 像素数 ∝ 高度²，故用平方缩放而非线性。
     """
-    按高度归类画质档位，数值越大画质越高。
+    key = normalize_codec(codec)
+    baseline = BITRATE_BASELINE.get(key, BITRATE_BASELINE["h264"])
+    scale = (height / _BITRATE_BASELINE_HEIGHT) ** 2
+    return baseline * scale * LENIENCY
 
-    用高度而不是宽度判断，因为宽银幕片源（如 3600x2160、2972x2160）宽度
-    差异很大，但高度能稳定反映实际清晰度档位。
+
+def meets_resolution_redline(height):
+    """分辨率红线（带 LENIENCY 容差）：实测高度 ≥ 红线×宽松系数 即过关。
+
+    容差用于救回准红线片（如红线 1080 时的 1072/900），避免差几像素被一刀切。
     """
-    if not size:
-        return -1
-
-    height = size[1]
-    if height >= 2160:
-        return 3
-    if height >= 1440:
-        return 2
-    if height >= 1080:
-        return 1
-    return 0
+    return height >= MIN_RESOLUTION_HEIGHT * LENIENCY
 
 
 # ---------- 分片下载 ----------
@@ -1191,26 +1205,35 @@ def process_one_entry(entry, processed_ids):
         if not variants:
             raise RuntimeError("没有找到媒体播放列表或清晰度变体")
 
-        # 分辨率优先：先按档位从高到低排，档位相同时优先试 BANDWIDTH 高的。
+        # 按声明分辨率高度从高到低排，高度相同时优先试 BANDWIDTH 高的。
         # 分辨率未知的流排在最后，等采样后用 ffprobe 探测真实分辨率。
         annotated = [
             (resolution, playlist_url, bandwidth, parse_resolution(resolution))
             for resolution, playlist_url, bandwidth in variants
         ]
-        # 已声明分辨率且低于 1080p 的流直接排除，不必浪费采样流量。
+        # 已声明分辨率且低于红线（含容差）的流直接排除，不必浪费采样流量。
+        # 未声明分辨率的流保留，等采样后用 ffprobe 探测真实高度再判。
         candidates = [
             item
             for item in annotated
-            if item[3] is None or resolution_tier(item[3]) >= 1
+            if item[3] is None or meets_resolution_redline(item[3][1])
         ]
         if not candidates:
-            raise RuntimeError("没有找到 1080p 或更高分辨率的流")
+            raise RuntimeError(
+                f"没有找到高度达标（≥ {MIN_RESOLUTION_HEIGHT}×{LENIENCY:.2f}）的流"
+            )
 
+        # 预排序：先试声明高度更高的流，同高度试声明 BANDWIDTH 更高的。
+        # 未声明分辨率（item[3] is None）用 -1 排最后，等采样后 ffprobe 探测再定夺。
         candidates.sort(
-            key=lambda item: (resolution_tier(item[3]), item[2]), reverse=True
+            key=lambda item: (
+                item[3][1] if item[3] else -1,
+                item[2],
+            ),
+            reverse=True,
         )
 
-        best_tier = -1
+        best_height = -1
         best_bitrate = 0.0
         best_resolution = None
         best_segment_urls = None
@@ -1259,43 +1282,47 @@ def process_one_entry(entry, processed_ids):
                 if actual_size is None:
                     actual_size = probe_resolution(sample_path)
                     if actual_size is None:
-                        raise RuntimeError("无法探测该流的分辨率")
+                        # 探测失败常是采样片本次没下全/损坏（瞬时抖动），
+                        # 不是真无高清流 → 判可重试，下一轮重采样有机会救回。
+                        raise RuntimeError("采样探测分辨率失败（可重试）")
                     actual_resolution = f"{actual_size[0]}x{actual_size[1]}"
                     print(f"  流 {resolution} 实测分辨率: {actual_resolution}")
 
-                tier = resolution_tier(actual_size)
-                if tier < 1:
+                height = actual_size[1]
+                # 第 1 关 · 分辨率红线（带 LENIENCY 容差）。
+                if not meets_resolution_redline(height):
                     raise RuntimeError(
-                        f"分辨率 {actual_resolution} 低于 1080p，跳过"
+                        f"分辨率 {actual_resolution} 低于红线 "
+                        f"{MIN_RESOLUTION_HEIGHT}（容差 {LENIENCY:.2f}），跳过"
                     )
 
                 bitrate = sample_bytes * 8 / sample_duration / 1000
                 print(f"  流 {actual_resolution} 采样码率: {bitrate:.0f} kbps")
 
-                # 恰好 1080p 档要求码率达标；更高分辨率不再设码率门槛。
-                # 码率门槛按视频编码分档：HEVC/AV1 更省码率，用等效阈值避免误杀清晰片。
-                if tier == 1:
-                    codec = probe_codec(sample_path)
-                    min_bitrate = min_bitrate_for_codec(codec)
-                    codec_label = codec or "unknown"
-                    print(
-                        f"  流 {actual_resolution} 编码 {codec_label}，"
-                        f"码率门槛 {min_bitrate} kbps"
+                # 第 2 关 · 码率曲线：门槛按“该流自身高度”平方缩放并乘 LENIENCY，
+                # 每个流一律按自身高度档卡码率（无免码率线）。探测不到编码回退 H.264 基准。
+                codec = probe_codec(sample_path)
+                min_bitrate = bitrate_threshold(height, codec)
+                codec_label = codec or "unknown"
+                print(
+                    f"  流 {actual_resolution} 编码 {codec_label}，"
+                    f"码率门槛 {min_bitrate:.0f} kbps"
+                )
+                if bitrate < min_bitrate:
+                    raise RuntimeError(
+                        f"分辨率 {actual_resolution} 流（{codec_label}）码率 "
+                        f"{bitrate:.0f} kbps 未达到 {min_bitrate:.0f} kbps"
                     )
-                    if bitrate <= min_bitrate:
-                        raise RuntimeError(
-                            f"1080p 流（{codec_label}）码率 {bitrate:.0f} kbps "
-                            f"未达到 {min_bitrate} kbps"
-                        )
 
-                # 分辨率优先，同档位下再比码率。
-                better = tier > best_tier or (
-                    tier == best_tier and bitrate > best_bitrate
+                # 择优：分辨率（实测高度）绝对优先，高度完全相同再比采样码率。
+                # 用实测高度而非粗档 tier，任意分辨率都能精确区分，降档也不退化。
+                better = height > best_height or (
+                    height == best_height and bitrate > best_bitrate
                 )
                 if better:
                     if best_sample_path and best_sample_path != sample_path:
                         remove_file(best_sample_path)
-                    best_tier = tier
+                    best_height = height
                     best_bitrate = bitrate
                     best_resolution = actual_resolution
                     best_segment_urls = segment_urls
@@ -1313,8 +1340,8 @@ def process_one_entry(entry, processed_ids):
 
         if not best_sample_path:
             raise RuntimeError(
-                "没有可用的流：候选流全部低于 1080p、采样失败，"
-                "或 1080p 流码率未达到按编码分档的门槛"
+                "没有可用的流：候选流全部低于红线、采样失败，"
+                "或码率未达到按高度缩放的门槛"
             )
 
         print(
