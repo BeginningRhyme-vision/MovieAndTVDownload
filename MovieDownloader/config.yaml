@@ -133,6 +133,9 @@ download_movies:
   sample_count: 10
   seg_retry_max: 20
   seg_retry_delay: 1
+  # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒完成，给足冗余；
+  # 防坏 TS/fMP4 让 ffmpeg 无限阻塞占死转封装线程。超时判失败(下次续跑重来)。
+  convert_timeout: 1800
   # ---- playlist(master/media)解析阶段的请求重试 ----
   # 源站临时 5xx 抽风时，这一层若过早放弃会直接判整部影片失败。
   # 给足重试次数与退避上限，扛过几十秒级故障。

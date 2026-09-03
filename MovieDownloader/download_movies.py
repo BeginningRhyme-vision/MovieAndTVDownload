@@ -98,6 +98,9 @@ TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
 SAMPLE_COUNT = _CFG.get("sample_count", 10)
 SEG_RETRY_MAX = _CFG.get("seg_retry_max", 20)
 SEG_RETRY_DELAY = _CFG.get("seg_retry_delay", 1)
+# 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
+# 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
+CONVERT_TIMEOUT = _CFG.get("convert_timeout", 1800)
 # playlist（master/media）解析阶段的请求重试：源站临时 5xx 抽风时，这一层
 # 若过早放弃会直接判整部影片失败。故给足重试次数与退避上限，扛过几十秒级故障。
 PLAYLIST_RETRY_MAX = _CFG.get("playlist_retry_max", 10)
@@ -193,6 +196,11 @@ HEADERS = {
 
 log_lock = threading.Lock()
 folder_lock = threading.Lock()
+# 目标目录填充游标（folder_lock 保护）：缓存"当前正在填的目录号"，避免每次移动
+# 都从 START_FOLDER_INDEX 起对每个已满目录 os.listdir 计数（大批量时 O(N²)）。
+# 单调递增：当前目录填满即前进、不回头扫。重启后重置为 START，首次移动一次性
+# 定位到第一个未满目录再缓存住（一次 O(N)，之后 O(1) 起步）。
+_current_folder_index = START_FOLDER_INDEX
 processing_lock = threading.Lock()
 processing_ids = set()
 _thread_local = threading.local()
@@ -640,7 +648,10 @@ def build_s3_key(local_path, year=None):
     上传日期取上传发生当天的本地系统日期。
     """
     filename = os.path.basename(local_path)
-    year_seg = str(year).strip() if year not in (None, "") else "unknown_year"
+    # year 段只保留数字：防脏数据（含 '/'、空格等）拼出畸形 key / 多层意外目录。
+    # 提取失败或缺失时兜底 unknown_year。
+    year_digits = re.sub(r"\D", "", str(year)) if year not in (None, "") else ""
+    year_seg = year_digits if year_digits else "unknown_year"
     date_seg = time.strftime("%Y%m%d")
     parts = [S3_PREFIX, year_seg, date_seg, filename] if S3_PREFIX \
         else [year_seg, date_seg, filename]
@@ -753,9 +764,13 @@ def move_to_target_folder(temp_mp4, tmdb_id):
     """
     在同一把锁内选择目录并移动文件，防止高并发时目录容量超限。
     shutil.move 同时支持跨文件系统移动。
+
+    用模块级游标 _current_folder_index 缓存"当前正在填的目录号"，从它起找而非
+    每次从 START 全量重扫已满目录，把大批量下的 O(N²) listdir 降为 ~O(N)。
     """
+    global _current_folder_index
     with folder_lock:
-        index = START_FOLDER_INDEX
+        index = _current_folder_index
         while True:
             folder_name = f"{FOLDER_PREFIX}{index:06d}"
             folder_path = os.path.join(BASE_DIR, folder_name)
@@ -768,6 +783,8 @@ def move_to_target_folder(temp_mp4, tmdb_id):
 
             # 同一个 tmdbId 覆盖旧文件不额外占用目录名额。
             if mp4_count < MAX_VIDEOS_PER_FOLDER or os.path.exists(final_path):
+                # 缓存住当前落点目录：下次从这里起找，跳过前面已满目录。
+                _current_folder_index = index
                 remove_file(final_path)
                 print(f"  [{tmdb_id}] 正在移动到: {final_path}", flush=True)
                 shutil.move(temp_mp4, final_path)
@@ -1189,10 +1206,16 @@ def convert_ts_to_mp4(ts_path, mp4_path):
             capture_output=True,
             text=True,
             errors="replace",
+            timeout=CONVERT_TIMEOUT,
         )
         if result.stderr.strip():
             print(f"  FFmpeg 警告:\n{result.stderr.strip()}")
         return True
+    except subprocess.TimeoutExpired:
+        # 坏 TS/fMP4 可能让 ffmpeg 无限阻塞；超时判失败(上层可重试)，
+        # 避免单片卡死占用转封装线程、拖垮整个转封装池。
+        print(f"  FFmpeg 转换超时（>{CONVERT_TIMEOUT}s），已放弃: {ts_path}")
+        return False
     except subprocess.CalledProcessError as exc:
         print(f"  FFmpeg 转换失败:\n{exc.stderr}")
         return False
@@ -1882,9 +1905,28 @@ def _run_pipeline():
                     "title": entry.get("title", ""),
                     "year": entry.get("year"),
                 })
-                conversion_future = conversion_executor.submit(
-                    finalize_one_entry, info, processed_ids
-                )
+                # submit 若抛异常（如线程池已 shutdown），finalize 永不执行 →
+                # processing_ids 锁与临时文件会永久泄漏。故兜底：失败即释放 ID 锁、
+                # 清理已交接的临时文件，并当作转封装失败记录（与 upload submit 对称）。
+                try:
+                    conversion_future = conversion_executor.submit(
+                        finalize_one_entry, info, processed_ids
+                    )
+                except Exception as exc:
+                    normalized_id = normalize_tmdb_id(tmdb_id)
+                    with processing_lock:
+                        processing_ids.discard(normalized_id)
+                    for path in info.get("cleanup_paths", []):
+                        remove_file(path)
+                    write_log(FAILED_LOG, {
+                        "tmdbId": tmdb_id,
+                        "title": entry.get("title", ""),
+                        "urls": entry.get("urls", []),
+                        "error": f"转封装提交失败: {exc}",
+                        "stage": "conversion",
+                    })
+                    print(f"转封装提交失败: {tmdb_id}: {exc}")
+                    return
                 conversion_future_to_entry[conversion_future] = entry
                 stage_of[conversion_future] = "conversion"
                 pending.add(conversion_future)
