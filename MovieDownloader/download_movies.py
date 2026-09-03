@@ -513,6 +513,36 @@ def _classify_failure(error_msg):
     return True
 
 
+# 被拒/失败原因归类规则：(类别名, 命中关键字元组)，按顺序首个命中者胜出。
+# 仅用于收尾聚合统计（观测性），量化各类误杀/失败占比，指导码率门槛校准。
+# 不参与任何判定逻辑，改动零风险。
+_REJECT_REASON_RULES = (
+    ("缺少字段/无媒体列表", ("缺少 tmdbId 或 urls", "没有找到媒体播放列表")),
+    # “没有可用的流”是汇总文案（含“低于红线/码率未达”等词），须先于单因规则匹配。
+    ("无可用流", ("没有可用的流",)),
+    ("分辨率低于红线", ("低于红线", "没有找到高度达标")),
+    ("码率未达门槛", ("未达到",)),
+    ("采样探测分辨率失败", ("采样探测分辨率失败",)),
+    ("采样数据异常", ("采样数据或采样时长",)),
+    ("正片缺片率过高", ("缺片率过高",)),
+    ("源返回非视频分片", ("服务器返回的不是视频分片",)),
+    ("源站5xx", ("HTTP Error 5", "500 Server Error", "502", "503", "504")),
+    ("超时", ("timed out", "timeout", "超时")),
+    ("SSL/连接错误", ("SSL", "Connection", "ConnectionError")),
+)
+
+
+def classify_reject_reason(error_msg):
+    """把失败 error 文案归入 _REJECT_REASON_RULES 的类别；无命中归“其他”。"""
+    if not error_msg:
+        return "其他"
+    for category, markers in _REJECT_REASON_RULES:
+        for marker in markers:
+            if marker in error_msg:
+                return category
+    return "其他"
+
+
 def update_success_log(tmdb_id, new_record):
     """按 tmdbId 去重地写 SUCCESS_LOG：同一 ID 覆盖旧记录，否则追加。
 
@@ -1008,6 +1038,7 @@ def download_segments(
     end_idx=None,
     concurrency=SEGMENT_CONCURRENCY,
     init_url=None,
+    force_init=False,
 ):
     """
     并发下载、按索引顺序写入分片。
@@ -1021,8 +1052,10 @@ def download_segments(
     单个分片耗尽重试次数后会记录并跳过，不中止整部影片。返回值为：
     (成功写入的字节数, 失败分片索引列表)。
 
-    init_url 用于 fMP4：该 init 段必须写在文件最前面，只在新建文件
-    （start_idx == 0）时写入一次。
+    init_url 用于 fMP4：该 init 段携带 moov（编解码参数），必须位于所有媒体
+    分片之前。默认只在新建文件（start_idx == 0，wb 模式）时写入一次。
+    force_init=True 时，即使 start_idx>0（如中间采样单独成文件）也强制写一次
+    init 段——否则 fMP4 中间采样片缺 moov，ffprobe 无法探测分辨率/编码。
     """
     if end_idx is None:
         end_idx = len(segment_urls)
@@ -1039,7 +1072,9 @@ def download_segments(
     # 只打开一次：这是修复 PPS/SPS 丢失问题的核心。
     with open(output_path, mode) as output_file:
         # fMP4 的 init 段携带 moov（编解码参数），必须位于所有媒体分片之前。
-        if init_url and mode == "wb":
+        # 正片拼接时只在 wb（start_idx==0）写一次；中间采样单独成文件时用
+        # force_init 强制补写，保证该采样文件自身可被 ffprobe 探测。
+        if init_url and (mode == "wb" or force_init):
             init_data = download_single_segment(
                 init_url, -1, SEG_RETRY_MAX, SEG_RETRY_DELAY
             )
@@ -1239,10 +1274,7 @@ def process_one_entry(entry, processed_ids):
         best_segment_urls = None
         best_durations = None
         best_init_url = None
-        best_sample_bytes = 0
-        best_sample_count = 0
-        best_sample_path = None
-        best_sample_failed_indices = []
+        best_selected = False
 
         for resolution, playlist_url, _declared_bandwidth, size in candidates:
             print(f"  检测流 {resolution}: {playlist_url}")
@@ -1259,18 +1291,30 @@ def process_one_entry(entry, processed_ids):
                     playlist_url
                 )
                 sample_count = min(SAMPLE_COUNT, len(segment_urls))
+                # 从影片“正中间”连续取 sample_count 段测码率：片头常是 logo/黑场/
+                # 字幕卡等低动态画面、码率系统性偏低，会误杀压线的合格片；中间为高动态
+                # 正片，采样码率更代表全片。采样片单独成文件、测完即删、不复用为正片。
+                sample_start = (len(segment_urls) - sample_count) // 2
+                sample_end = sample_start + sample_count
                 sample_bytes, sample_failed_indices = download_segments(
                     segment_urls,
                     sample_path,
-                    start_idx=0,
-                    end_idx=sample_count,
+                    start_idx=sample_start,
+                    end_idx=sample_end,
                     concurrency=min(4, SEGMENT_CONCURRENCY),
                     init_url=init_url,
+                    # 中间采样 start_idx>0 走 ab 模式不会自动写 init，强制补一次
+                    # moov，否则 fMP4 采样片缺编解码参数导致 ffprobe 探测失败。
+                    force_init=True,
                 )
                 sample_failed_set = set(sample_failed_indices)
+                # 时长求和用真实分片索引区间 [sample_start, sample_end)，与
+                # download_segments 返回的 sample_failed_indices 索引空间一致。
                 sample_duration = sum(
                     duration
-                    for index, duration in enumerate(durations[:sample_count])
+                    for index, duration in enumerate(
+                        durations[sample_start:sample_end], start=sample_start
+                    )
                     if index not in sample_failed_set
                 )
                 if sample_duration <= 0 or sample_bytes <= 0:
@@ -1320,25 +1364,21 @@ def process_one_entry(entry, processed_ids):
                     height == best_height and bitrate > best_bitrate
                 )
                 if better:
-                    if best_sample_path and best_sample_path != sample_path:
-                        remove_file(best_sample_path)
                     best_height = height
                     best_bitrate = bitrate
                     best_resolution = actual_resolution
                     best_segment_urls = segment_urls
                     best_durations = durations
                     best_init_url = init_url
-                    best_sample_bytes = sample_bytes
-                    best_sample_count = sample_count
-                    best_sample_path = sample_path
-                    best_sample_failed_indices = sample_failed_indices
-                else:
-                    remove_file(sample_path)
+                    best_selected = True
+                # 采样片仅用于测画质，不复用为正片（中间采样无法接成连续前缀）。
+                # 无论选中与否都立即删除，防止 temp 目录长期堆积采样文件。
+                remove_file(sample_path)
             except Exception as exc:
                 remove_file(sample_path)
                 print(f"  处理流 {resolution} 失败: {exc}")
 
-        if not best_sample_path:
+        if not best_selected:
             raise RuntimeError(
                 "没有可用的流：候选流全部低于红线、采样失败，"
                 "或码率未达到按高度缩放的门槛"
@@ -1349,32 +1389,22 @@ def process_one_entry(entry, processed_ids):
             f"采样码率 {best_bitrate:.0f} kbps"
         )
 
-        # sample 文件现在确实包含第 0～best_sample_count-1 段。
+        # 采样片已删、不复用；正片从第 0 段完整下载（含 fMP4 init 段）。
         remove_file(final_ts)
-        os.replace(best_sample_path, final_ts)
-
-        remaining_count = len(best_segment_urls) - best_sample_count
-        extra_bytes = 0
-        remaining_failed_indices = []
-        if remaining_count > 0:
-            print(
-                f"  并发下载剩余 {remaining_count} 个分片 "
-                f"(并发数 {SEGMENT_CONCURRENCY})..."
-            )
-            extra_bytes, remaining_failed_indices = download_segments(
-                best_segment_urls,
-                final_ts,
-                start_idx=best_sample_count,
-                end_idx=None,
-                concurrency=SEGMENT_CONCURRENCY,
-                init_url=best_init_url,
-            )
-
-        failed_segment_indices = sorted(
-            set(best_sample_failed_indices + remaining_failed_indices)
+        print(
+            f"  并发下载全部 {len(best_segment_urls)} 个分片 "
+            f"(并发数 {SEGMENT_CONCURRENCY})..."
         )
+        total_bytes, failed_segment_indices = download_segments(
+            best_segment_urls,
+            final_ts,
+            start_idx=0,
+            end_idx=None,
+            concurrency=SEGMENT_CONCURRENCY,
+            init_url=best_init_url,
+        )
+        failed_segment_indices = sorted(set(failed_segment_indices))
         failed_segment_set = set(failed_segment_indices)
-        total_bytes = best_sample_bytes + extra_bytes
         total_duration = sum(
             duration
             for index, duration in enumerate(best_durations)
@@ -1771,6 +1801,10 @@ def _run_pipeline():
     stage_of = {}  # future -> "download" | "conversion" | "upload"
     pending = set()
     stats = {"conversions": 0, "uploads": 0}
+    # 被拒原因聚合（观测性，仅统计下载阶段失败）：按类别计数，分确定性/可重试两组。
+    # 确定性失败每片计一次；可重试失败跨轮会重复计（同片多轮重投），打印时分块标注。
+    reject_permanent = {}
+    reject_retriable = {}
 
     def handle_done_future(future, round_failed_retriable):
         """处理一个已完成的 future，按其阶段推进流水线。
@@ -1811,6 +1845,10 @@ def _run_pipeline():
                 return
 
             retriable = bool(info.get("retriable", True))
+            # 被拒原因聚合统计（观测性，不影响任何判定）。
+            reason = classify_reject_reason(error_msg)
+            bucket = reject_retriable if retriable else reject_permanent
+            bucket[reason] = bucket.get(reason, 0) + 1
             write_log(FAILED_LOG, {
                 "tmdbId": tmdb_id,
                 "title": entry.get("title", ""),
@@ -1971,6 +2009,26 @@ def _run_pipeline():
             f"三级流水线全部完成：转封装 {stats['conversions']} 部，"
             f"上传 {stats['uploads']} 部。"
         )
+
+        # 被拒原因聚合统计（观测性）：量化各类失败占比，指导码率门槛校准。
+        def _print_reject_stats(title, counter, note):
+            total = sum(counter.values())
+            if total == 0:
+                return
+            print(f"\n{title}（共 {total} 次，{note}）:")
+            for reason, count in sorted(
+                counter.items(), key=lambda kv: kv[1], reverse=True
+            ):
+                print(f"  - {reason}: {count} 次（{count / total:.1%}）")
+
+        if reject_permanent or reject_retriable:
+            print("\n===== 下载失败原因聚合统计 =====")
+            _print_reject_stats(
+                "确定性失败（真淘汰，绝不重试）", reject_permanent, "每片计一次"
+            )
+            _print_reject_stats(
+                "可重试失败（瞬时错误）", reject_retriable, "跨轮重投会重复计数"
+            )
 
 
 def reupload_pending():
