@@ -95,7 +95,7 @@ CONVERT_WORKERS = _CFG.get("convert_workers", 16)
 # 单部影片同时下载的分片数。
 SEGMENT_CONCURRENCY = _CFG.get("segment_concurrency", 64)
 TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
-SAMPLE_COUNT = _CFG.get("sample_count", 30)
+SAMPLE_COUNT = _CFG.get("sample_count", 10)
 SEG_RETRY_MAX = _CFG.get("seg_retry_max", 20)
 SEG_RETRY_DELAY = _CFG.get("seg_retry_delay", 1)
 # playlist（master/media）解析阶段的请求重试：源站临时 5xx 抽风时，这一层
@@ -491,9 +491,10 @@ def truncate_log(log_file):
 _PERMANENT_FAILURE_MARKERS = (
     "缺少 tmdbId 或 urls",
     "没有找到媒体播放列表",       # master 解析出来是空
+    "不支持的播放列表结构",       # 加密/BYTERANGE/MAP 等手工分片器永久不支持的结构
     "没有找到高度达标",           # 声明分辨率全部低于红线（含容差）
     "低于红线",                   # 实测分辨率低于红线
-    "未达到",                     # 码率未达到按高度平方缩放的门槛
+    "码率未达到",                 # 采样码率未达到按高度平方缩放的门槛
     "服务器返回的不是视频分片",   # 源返回 HTML/m3u8，通常是无效源
 )
 
@@ -518,10 +519,11 @@ def _classify_failure(error_msg):
 # 不参与任何判定逻辑，改动零风险。
 _REJECT_REASON_RULES = (
     ("缺少字段/无媒体列表", ("缺少 tmdbId 或 urls", "没有找到媒体播放列表")),
-    # “没有可用的流”是汇总文案（含“低于红线/码率未达”等词），须先于单因规则匹配。
-    ("无可用流", ("没有可用的流",)),
+    # “候选流无一入选”是汇总文案（不含单因 marker），须先于单因规则匹配。
+    ("候选流无一入选", ("候选流无一入选",)),
+    ("不支持的播放列表结构", ("不支持的播放列表结构",)),
     ("分辨率低于红线", ("低于红线", "没有找到高度达标")),
-    ("码率未达门槛", ("未达到",)),
+    ("码率未达门槛", ("码率未达到",)),
     ("采样探测分辨率失败", ("采样探测分辨率失败",)),
     ("采样数据异常", ("采样数据或采样时长",)),
     ("正片缺片率过高", ("缺片率过高",)),
@@ -843,21 +845,23 @@ def parse_media_playlist(playlist_url):
         upper = line.upper()
         if upper.startswith("#EXT-X-KEY:") and "METHOD=NONE" not in upper:
             raise UnsupportedPlaylistError(
-                "播放列表含加密分片（#EXT-X-KEY）；请改用 FFmpeg 直接读取 m3u8"
+                "不支持的播放列表结构：含加密分片（#EXT-X-KEY）"
             )
         if upper.startswith("#EXT-X-BYTERANGE"):
             raise UnsupportedPlaylistError(
-                "播放列表使用 #EXT-X-BYTERANGE，不能按普通独立分片拼接"
+                "不支持的播放列表结构：使用 #EXT-X-BYTERANGE，不能按普通独立分片拼接"
             )
         if upper.startswith("#EXT-X-MAP"):
             # 形如：#EXT-X-MAP:URI="init.mp4"
             if "BYTERANGE" in upper:
                 raise UnsupportedPlaylistError(
-                    "#EXT-X-MAP 带 BYTERANGE，不能按独立分片拼接"
+                    "不支持的播放列表结构：#EXT-X-MAP 带 BYTERANGE，不能按独立分片拼接"
                 )
             uri_match = re.search(r'URI="([^"]+)"', line, re.IGNORECASE)
             if not uri_match:
-                raise UnsupportedPlaylistError("#EXT-X-MAP 缺少 URI 属性")
+                raise UnsupportedPlaylistError(
+                    "不支持的播放列表结构：#EXT-X-MAP 缺少 URI 属性"
+                )
             init_url = urljoin(playlist_url, uri_match.group(1))
 
     segment_urls = []
@@ -1354,8 +1358,8 @@ def process_one_entry(entry, processed_ids):
                 )
                 if bitrate < min_bitrate:
                     raise RuntimeError(
-                        f"分辨率 {actual_resolution} 流（{codec_label}）码率 "
-                        f"{bitrate:.0f} kbps 未达到 {min_bitrate:.0f} kbps"
+                        f"分辨率 {actual_resolution} 流（{codec_label}）"
+                        f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
                     )
 
                 # 择优：分辨率（实测高度）绝对优先，高度完全相同再比采样码率。
@@ -1374,14 +1378,23 @@ def process_one_entry(entry, processed_ids):
                 # 采样片仅用于测画质，不复用为正片（中间采样无法接成连续前缀）。
                 # 无论选中与否都立即删除，防止 temp 目录长期堆积采样文件。
                 remove_file(sample_path)
+            except UnsupportedPlaylistError:
+                # 加密/BYTERANGE/MAP 等结构是整片级属性（同一片各清晰度同构），
+                # 重下必然同样失败 → 直接向外抛（带确定性 marker），不再试其余流、
+                # 不落入下方"可重试"汇总，避免永久不支持的结构被白重试多轮。
+                remove_file(sample_path)
+                raise
             except Exception as exc:
                 remove_file(sample_path)
                 print(f"  处理流 {resolution} 失败: {exc}")
 
         if not best_selected:
+            # 此汇总文案不含任何确定性 marker（低于红线/码率未达到）——各流的真实
+            # 淘汰原因已在上方 except 逐条打印。全流本轮无一入选可能是"全部真不达标"
+            # 也可能是"瞬时采样抖动全挂"，无法在此区分；故落默认「可重试」，交由多轮
+            # 重采兜底，避免把可救回的片误判为确定性淘汰（契合"宁可多下不误杀"）。
             raise RuntimeError(
-                "没有可用的流：候选流全部低于红线、采样失败，"
-                "或码率未达到按高度缩放的门槛"
+                "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
             )
 
         print(
@@ -1639,7 +1652,10 @@ def preflight_check_s3():
         ) if not value
     ]
     if missing:
-        _fail(f"config.yaml 的 s3 段缺少必填字段：{', '.join(missing)}")
+        _fail(
+            f"缺少 R2 必填字段：{', '.join(missing)}"
+            f"（请在环境变量 R2_* 或 config.yaml 的 s3 段中配置）"
+        )
 
     try:
         client = get_s3_client()
