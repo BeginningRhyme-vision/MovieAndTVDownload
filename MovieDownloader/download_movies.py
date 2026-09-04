@@ -268,24 +268,31 @@ def disk_monitor_loop():
     """
     os.makedirs(BASE_DIR, exist_ok=True)
     while not disk_monitor_stop.is_set():
-        ratio = _disk_used_ratio(BASE_DIR)
-        if disk_gate.is_set():
-            if ratio >= DISK_HIGH_WATERMARK:
-                disk_gate.clear()
-                print(
-                    f"[磁盘水位] 占用 {ratio:.1%} 达到高水位 "
-                    f"{DISK_HIGH_WATERMARK:.0%}，暂停开启新片下载，"
-                    f"等待上传腾出空间...",
-                    flush=True,
-                )
-        else:
-            if ratio <= DISK_LOW_WATERMARK:
-                disk_gate.set()
-                print(
-                    f"[磁盘水位] 占用回落到 {ratio:.1%}（<= 低水位 "
-                    f"{DISK_LOW_WATERMARK:.0%}），恢复新片下载。",
-                    flush=True,
-                )
+        try:
+            ratio = _disk_used_ratio(BASE_DIR)
+            if disk_gate.is_set():
+                if ratio >= DISK_HIGH_WATERMARK:
+                    disk_gate.clear()
+                    print(
+                        f"[磁盘水位] 占用 {ratio:.1%} 达到高水位 "
+                        f"{DISK_HIGH_WATERMARK:.0%}，暂停开启新片下载，"
+                        f"等待上传腾出空间...",
+                        flush=True,
+                    )
+            else:
+                if ratio <= DISK_LOW_WATERMARK:
+                    disk_gate.set()
+                    print(
+                        f"[磁盘水位] 占用回落到 {ratio:.1%}（<= 低水位 "
+                        f"{DISK_LOW_WATERMARK:.0%}），恢复新片下载。",
+                        flush=True,
+                    )
+        except Exception as exc:
+            # 监控线程绝不能因意外异常静默死亡：否则 gate 一旦停在 clear 态，
+            # 所有等在 wait_for_disk_gate 上的 download worker 会永久阻塞。
+            # 兜底放行 gate（宁可暂时不熔断，也不卡死主流程），下轮继续尝试。
+            disk_gate.set()
+            print(f"[磁盘水位] 监控异常，已放行闸门以防卡死: {exc}", flush=True)
         disk_monitor_stop.wait(DISK_CHECK_INTERVAL)
 
 
@@ -482,16 +489,25 @@ def scan_downloaded_mp4_ids():
 
 
 def write_log(log_file, data):
-    with log_lock:
-        with open(log_file, "a", encoding="utf-8") as file:
-            file.write(json.dumps(data, ensure_ascii=False) + "\n")
+    # 日志写盘绝不能抛异常逃逸：磁盘满/inode 耗尽/权限变更时，
+    # 只打印告警并放弃这条记录，避免崩掉整条流水线（丢一条记录
+    # 好过丢整批在途任务）。
+    try:
+        with log_lock:
+            with open(log_file, "a", encoding="utf-8") as file:
+                file.write(json.dumps(data, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"⚠️ 写日志失败({log_file}): {exc}", flush=True)
 
 
 def truncate_log(log_file):
     """清空（重建）状态文件。用于每轮开头重置 download_fail 状态。"""
-    with log_lock:
-        with open(log_file, "w", encoding="utf-8") as file:
-            file.write("")
+    try:
+        with log_lock:
+            with open(log_file, "w", encoding="utf-8") as file:
+                file.write("")
+    except Exception as exc:
+        print(f"⚠️ 清空日志失败({log_file}): {exc}", flush=True)
 
 
 # 确定性失败关键字：命中即判为“重试也没用”，绝不进入下一轮下载。
@@ -787,7 +803,15 @@ def move_to_target_folder(temp_mp4, tmdb_id):
                 _current_folder_index = index
                 remove_file(final_path)
                 print(f"  [{tmdb_id}] 正在移动到: {final_path}", flush=True)
-                shutil.move(temp_mp4, final_path)
+                # 跨文件系统时 shutil.move 是 copy+del，若 copy 中途失败
+                # （目标盘写满/IO 错误）会在 final_path 留下半成品 mp4：它不在
+                # cleanup_paths、去重表也无登记，会成孤儿并白占目录名额。故失败
+                # 时先清掉半成品再抛出，交由上层按转封装失败处理。
+                try:
+                    shutil.move(temp_mp4, final_path)
+                except Exception:
+                    remove_file(final_path)
+                    raise
                 return final_path
             index += 1
 
@@ -2078,7 +2102,15 @@ def _run_pipeline():
                     pending.discard(future)
                     if future in remaining_downloads:
                         remaining_downloads.discard(future)
-                    handle_done_future(future, round_failed_retriable)
+                    # 单个 future 处理若抛异常（如日志写盘 OSError/磁盘满、
+                    # 状态字典错位 KeyError），只记录并跳过，绝不让异常逃逸出
+                    # 主循环——否则同批其余 future 全丢、整条流水线崩溃、在途
+                    # 信号量与 processing_ids 锁无从释放（铁律：宁可单片失败，
+                    # 绝不崩主流程）。
+                    try:
+                        handle_done_future(future, round_failed_retriable)
+                    except Exception as exc:
+                        print(f"⚠️ future 处理异常，已跳过该条: {exc}", flush=True)
 
             # 本轮下载全部有结论，决定是否再来一轮。
             if not round_failed_retriable:
@@ -2114,7 +2146,11 @@ def _run_pipeline():
             done, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in done:
                 pending.discard(future)
-                handle_done_future(future, None)
+                # 同上：排空阶段单条异常也不得逃逸，否则末轮转封装/上传记录全丢。
+                try:
+                    handle_done_future(future, None)
+                except Exception as exc:
+                    print(f"⚠️ future 处理异常，已跳过该条: {exc}", flush=True)
 
         # 至此所有下载/转封装/上传 future 均已完成，数据完整性得到保证。
         print(
