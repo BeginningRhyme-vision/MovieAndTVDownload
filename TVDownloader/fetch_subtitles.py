@@ -100,13 +100,13 @@ state_lock = threading.Lock()
 
 
 def parse_int(value):
-    if isinstance(value, bool):
+    """season/episode 字段解析：与 download_tv.parse_int 保持一致。"""
+    if value is None or isinstance(value, bool):
         return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
-        return int(value.strip())
-    return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def episode_key(tmdb_id, season, episode):
@@ -191,11 +191,22 @@ def search_subtitles(tmdb_id, season, episode):
     return data.get("subtitles") or []
 
 
+def _episode_range(item):
+    """返回条目覆盖的 (episode_from, episode_end)；不是多集包时返回 None。"""
+    ep_from = parse_int(item.get("episode_from"))
+    ep_end = parse_int(item.get("episode_end"))
+    if ep_from is None or ep_end is None or ep_from == ep_end:
+        return None
+    return (min(ep_from, ep_end), max(ep_from, ep_end))
+
+
 def pick_best(subtitles, language, season, episode):
     """
     同一语言可能有多个版本，挑第一个季/集匹配、非整季包的普通字幕。
     SubDL 的结果本身按相关度排序，第一个通常就是下载量最高的。
     条目自带 season/episode 时校验必须一致，缺失则信任服务端按参数过滤的结果。
+    多集包（episode_from != episode_end）的 episode 字段只是起始集，改按范围判断
+    本集是否被覆盖；具体文件由 extract_srt 按文件名里的集标记挑选。
     """
     for item in subtitles:
         if (item.get("language") or "").upper() != language:
@@ -203,18 +214,36 @@ def pick_best(subtitles, language, season, episode):
         if item.get("full_season"):
             continue
         item_season = parse_int(item.get("season"))
-        item_episode = parse_int(item.get("episode"))
         if item_season is not None and item_season != season:
             continue
-        if item_episode is not None and item_episode != episode:
-            continue
+        ep_range = _episode_range(item)
+        if ep_range is not None:
+            if not (ep_range[0] <= episode <= ep_range[1]):
+                continue
+        else:
+            item_episode = parse_int(item.get("episode"))
+            if item_episode is not None and item_episode != episode:
+                continue
         if item.get("url"):
             return item
     return None
 
 
-def extract_srt(zip_bytes):
-    """SubDL 下载回来的是 zip，从里面取出体积最大的字幕文件。"""
+def _episode_name_pattern(season, episode):
+    """匹配文件名里的 S01E03 / 1x03 / S1E3 等常见集标记。"""
+    return re.compile(
+        rf"(?<![0-9])(?:s0*{season}\s*[._ -]?\s*e0*{episode}|0*{season}x0*{episode})(?![0-9])",
+        re.IGNORECASE,
+    )
+
+
+def extract_srt(zip_bytes, season=None, episode=None, require_match=False):
+    """SubDL 下载回来的是 zip，从里面取出本集的字幕文件。
+
+    给定 season/episode 时优先选文件名带对应集标记的文件；没有命中时，
+    require_match=True（多集包）返回 (None, None) 以免存成别的集，
+    否则回退到体积最大的文件（单集包常见的通用文件名）。
+    """
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
         candidates = [
             info
@@ -224,6 +253,16 @@ def extract_srt(zip_bytes):
         ]
         if not candidates:
             return None, None
+        if season is not None and episode is not None:
+            pattern = _episode_name_pattern(season, episode)
+            matched = [
+                info for info in candidates
+                if pattern.search(os.path.basename(info.filename))
+            ]
+            if matched:
+                candidates = matched
+            elif require_match:
+                return None, None
         # 体积最大的通常是完整正片字幕，而不是片头片尾之类的碎片
         best = max(candidates, key=lambda info: info.file_size)
         suffix = os.path.splitext(best.filename)[1].lower()
@@ -281,7 +320,10 @@ def download_one(entry):
                 "GET", DOWNLOAD_BASE + picked["url"],
                 params={"api_key": SUBDL_API_KEY},
             )
-            content, extension = extract_srt(response.content)
+            content, extension = extract_srt(
+                response.content, season, episode,
+                require_match=_episode_range(picked) is not None,
+            )
             if content is None:
                 result["missing"].append(language)
                 continue
