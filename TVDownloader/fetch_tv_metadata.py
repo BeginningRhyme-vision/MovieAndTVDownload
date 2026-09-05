@@ -97,6 +97,15 @@ _SESSION.mount("https://", requests.adapters.HTTPAdapter(
     pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS * 2,
 ))
 tmdb.REQUESTS_SESSION = _SESSION
+# tmdbsimple 默认 REQUESTS_TIMEOUT=None（无超时）：一个卡住的连接会永久占死一个 worker，
+# 全部 worker 卡死后进程假活。显式设置 (连接超时, 读超时)，超时会以 requests 异常抛出，
+# 由 get_tmdb_id 的重试逻辑接管。
+tmdb.REQUESTS_TIMEOUT = (10, 30)
+
+# IMDB 数据集是纯 TSV：不做引号转义，字段内可能出现以 " 开头的值（如 "Weird Al" Yankovic）。
+# csv/pandas 默认 QUOTE_MINIMAL 会把它当引号模式，引号不成对时会把后续多行吞进同一字段，静默丢行。
+# 所有 IMDB 文件读取统一使用 QUOTE_NONE。
+_IMDB_QUOTING = csv.QUOTE_NONE
 
 BASE_URL = "https://datasets.imdbws.com/"
 DATASETS = {
@@ -153,20 +162,33 @@ def write_jsonl(record: dict):
 
 # ========== 下载（已存在则跳过）==========
 def ensure_dataset(key: str) -> Path:
+    """下载并解压 IMDB 数据集。
+    半成品保护：下载/解压都先写到 .part 临时文件，完成后原子 rename 到最终名。
+    这样中途被杀（Ctrl-C/OOM）只会留下 .part，不会留下被截断却被 exists() 误判为完整的 .tsv。"""
     filename = DATASETS[key]
     tsv_path = DATA_DIR / filename.replace(".gz", "")
     if tsv_path.exists():
         log.info(f"已存在跳过: {tsv_path.name}")
         return tsv_path
     gz_path = DATA_DIR / filename
-    log.info(f"下载 {filename} ...")
-    with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(gz_path, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
-    log.info(f"解压 {filename} ...")
-    with gzip.open(gz_path, "rb") as gz, open(tsv_path, "wb") as out:
-        shutil.copyfileobj(gz, out)
+    gz_part = gz_path.with_name(gz_path.name + ".part")
+    tsv_part = tsv_path.with_name(tsv_path.name + ".part")
+    try:
+        if not gz_path.exists():
+            log.info(f"下载 {filename} ...")
+            with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(gz_part, "wb") as f:
+                    shutil.copyfileobj(r.raw, f)
+            gz_part.replace(gz_path)
+        log.info(f"解压 {filename} ...")
+        with gzip.open(gz_path, "rb") as gz, open(tsv_part, "wb") as out:
+            shutil.copyfileobj(gz, out)
+        tsv_part.replace(tsv_path)
+    finally:
+        # 无论成功失败都清掉临时文件；成功时它们已被 rename 走，unlink 为 no-op
+        gz_part.unlink(missing_ok=True)
+        tsv_part.unlink(missing_ok=True)
     gz_path.unlink()
     return tsv_path
 
@@ -188,8 +210,7 @@ def build_index():
             return False
         return cur.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
 
-    def build_table(name, create_sql, index_sql, insert_sql, dataset_key,
-                    row_to_tuple, reader_kwargs=None):
+    def build_table(name, create_sql, index_sql, insert_sql, dataset_key, row_to_tuple):
         # 全有或全无：清掉可能的半成品表 -> 建表建索引 -> 批量插入 -> 提交；
         # 中途任何异常（含 KeyboardInterrupt/SystemExit）回滚并删表，保证不留半成品
         if _index_ready(name):
@@ -204,7 +225,7 @@ def build_index():
                 cur.execute(index_sql)
             path = ensure_dataset(dataset_key)
             with open(path, encoding="utf-8", errors="replace") as f:
-                reader = csv.DictReader(f, delimiter="\t", **(reader_kwargs or {}))
+                reader = csv.DictReader(f, delimiter="\t", quoting=_IMDB_QUOTING)
                 batch = []
                 for row in reader:
                     rec = row_to_tuple(row)
@@ -261,7 +282,6 @@ def build_index():
         "INSERT INTO principals VALUES (?,?,?,?,?,?)",
         "principals",
         lambda row: tuple(row.get(c, "") for c in _principals_cols),
-        reader_kwargs={"quoting": csv.QUOTE_NONE},
     )
 
     # --- episode（电视剧专属：按 parentTconst 点查某剧的全部分集）---
@@ -380,7 +400,7 @@ def query_episodes(imdb_id: str, ratings) -> dict:
 # ========== 加载小文件（全量，内存够用）==========
 def load_basics() -> pd.DataFrame:
     path = ensure_dataset("basics")
-    df = pd.read_csv(path, sep="\t", na_values="\\N", low_memory=False)
+    df = pd.read_csv(path, sep="\t", na_values="\\N", low_memory=False, quoting=_IMDB_QUOTING)
     df = df[df["titleType"].isin(KEEP_TYPES)].copy()
     df["startYear"] = pd.to_numeric(df["startYear"], errors="coerce")
     df["endYear"] = pd.to_numeric(df["endYear"], errors="coerce")
@@ -401,7 +421,7 @@ def load_basics() -> pd.DataFrame:
 
 def load_ratings() -> pd.DataFrame:
     path = ensure_dataset("ratings")
-    df = pd.read_csv(path, sep="\t", na_values="\\N")
+    df = pd.read_csv(path, sep="\t", na_values="\\N", quoting=_IMDB_QUOTING)
     df["averageRating"] = pd.to_numeric(df["averageRating"], errors="coerce")
     df["numVotes"] = pd.to_numeric(df["numVotes"], errors="coerce")
     df = df.set_index("tconst")
@@ -415,7 +435,7 @@ def load_ratings() -> pd.DataFrame:
 
 def load_crew() -> pd.DataFrame:
     path = ensure_dataset("crew")
-    df = pd.read_csv(path, sep="\t", na_values="\\N")
+    df = pd.read_csv(path, sep="\t", na_values="\\N", quoting=_IMDB_QUOTING)
     df["directors"] = df["directors"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df["writers"] = df["writers"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df = df.set_index("tconst")
@@ -436,20 +456,37 @@ def load_names_dict() -> dict:
 
 
 # ========== TMDB ID（查 tv_results）==========
+class TMDBLookupError(RuntimeError):
+    """TMDB 请求在重试耗尽后仍失败（网络/限速/服务端错误）。
+    与"TMDB 里确实查不到"（返回 None）严格区分：前者不能 mark_done，必须留待下次重跑。"""
+
+
 def get_tmdb_id(imdb_id: str, retry: int = 3):
-    for attempt in range(retry):
+    """返回 TMDB tv id；TMDB 中无此剧返回 None；请求持续失败抛 TMDBLookupError。
+    429 限速不消耗重试次数（限速是外部节奏问题，不是本条目的问题），
+    但设有上限防止 TMDB 长时间限速时线程无限空转。"""
+    last_err = None
+    rate_limit_hits = 0
+    attempt = 0
+    while attempt < retry:
         try:
             result = tmdb.Find(imdb_id).info(external_source="imdb_id")
             tv = result.get("tv_results", [])  # 电视剧用 tv_results
             return tv[0]["id"] if tv else None
         except Exception as e:
+            last_err = e
             if "429" in str(e):
+                rate_limit_hits += 1
+                if rate_limit_hits > 6:  # 最多等 60s
+                    break
                 log.warning("限速，等待 10s")
                 time.sleep(10)
-            else:
-                log.warning(f"{imdb_id} 第{attempt + 1}次失败: {e}")
+                continue
+            attempt += 1
+            log.warning(f"{imdb_id} 第{attempt}次失败: {e}")
+            if attempt < retry:
                 time.sleep(2 ** attempt)
-    return None
+    raise TMDBLookupError(f"TMDB 查询失败（已重试）: {last_err}")
 
 
 # ========== 处理单条 ==========

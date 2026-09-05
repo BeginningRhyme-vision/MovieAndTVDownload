@@ -23,7 +23,21 @@ fetch_tv_metadata:
   tmdb_api_key: ""
 
   # 只保留哪些 IMDB 条目类型（title.basics 的 titleType 列）。
-  # 电视剧相关：tvSeries / tvMiniSeries / tvSpecial / tvShort（tvEpisode 是分集本身，不要）
+  # 【注意】titleType 是精确枚举字符串，代码用 isin() 精确匹配，不存在 "tv" 这种
+  #   父类/通配值，写 "tv" 会匹配 0 行；必须逐个列出完整的值。
+  # IMDB 官方文档只举例不枚举；据公开数据统计，titleType 实际共 11 种：
+  #   非 TV（4 种）：movie / short / video / videoGame
+  #   TV 前缀（7 种）：tvSeries / tvMiniSeries / tvSpecial / tvShort
+  #                    / tvEpisode / tvMovie / tvPilot
+  # 本段只收前 4 种，另外 3 种 TV 类型有意排除，理由：
+  #   - tvEpisode：分集本身，占 title.basics 总行数 80%+；分集信息由 title.episode
+  #                表展开（见 query_episodes），若收进来每部剧会重复出现几百条。
+  #   - tvMovie  ：电视电影，单文件、无季集结构；TMDB Find 接口把它归到
+  #                movie_results 而非 tv_results（代码只取 tv_results，收了也是空），
+  #                且下游 S01/E01 下载路径不适用。应由电影版 pipeline 处理。
+  #   - tvPilot  ：未成剧的试播集，数量极少且大多无资源，忽略。
+  # 首次跑完后可用下面命令实际核对本地数据集中的取值分布：
+  #   gzip -dc imdb_data/title.basics.tsv.gz | cut -f2 | sort | uniq -c
   keep_types:
     - tvSeries
     - tvMiniSeries
