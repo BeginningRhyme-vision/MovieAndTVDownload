@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import importlib
 import os
 import math
 import random
@@ -14,7 +15,6 @@ import time
 from concurrent.futures import (
     FIRST_COMPLETED,
     ThreadPoolExecutor,
-    as_completed,
     wait,
 )
 from pathlib import Path
@@ -903,15 +903,17 @@ def parse_master_playlist(master_url, retries=None):
         if not line.startswith("#EXT-X-STREAM-INF"):
             continue
 
+        # Attributes follow "#EXT-X-STREAM-INF:" so the first one is preceded
+        # by ":" rather than "," -- accept both delimiters.
         resolution_match = re.search(
-            r"(?:^|,)RESOLUTION=(\d+x\d+)(?:,|$)", line, re.IGNORECASE
+            r"(?:^|[:,])RESOLUTION=(\d+x\d+)(?:,|$)", line, re.IGNORECASE
         )
         resolution = resolution_match.group(1) if resolution_match else "unknown"
 
         # BANDWIDTH 是 master 里声明的码率（bps），用于同分辨率下的初步排序，
         # 可以少下载几个采样片段。缺失时记为 0，后续仍以实测采样为准。
         bandwidth_match = re.search(
-            r"(?:^|,)BANDWIDTH=(\d+)(?:,|$)", line, re.IGNORECASE
+            r"(?:^|[:,])BANDWIDTH=(\d+)(?:,|$)", line, re.IGNORECASE
         )
         bandwidth_kbps = (
             int(bandwidth_match.group(1)) / 1000 if bandwidth_match else 0.0
@@ -1807,8 +1809,8 @@ def preflight_check_s3():
         sys.exit(1)
 
     try:
-        import boto3  # noqa: F401
-        from botocore.exceptions import ClientError, BotoCoreError  # noqa: F401
+        importlib.import_module("boto3")
+        from botocore.exceptions import ClientError, BotoCoreError
     except ImportError as exc:
         _fail(f"未安装 boto3/botocore，无法上传 R2：{exc}。请先在虚拟环境中安装依赖。")
 
@@ -2348,6 +2350,7 @@ def reupload_pending():
                 "season": parse_int(record.get("season")),
                 "episode": parse_int(record.get("episode")),
                 "title": record.get("title", ""),
+                "year": record.get("year"),
                 "final_path": local_path,
                 "s3_key": s3_key,
                 "uploaded": True,
