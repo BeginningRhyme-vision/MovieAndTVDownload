@@ -3,6 +3,8 @@
 !.gitattributes
 !MovieDownloader/
 !MovieDownloader/**
+!TVDownloader/
+!TVDownloader/**
 
 # 放行子目录后，重新忽略 Python 缓存
 MovieDownloader/__pycache__/
