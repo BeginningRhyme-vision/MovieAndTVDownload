@@ -615,12 +615,17 @@ def process(imdb_id: str, basics, ratings, crew, names_dict) -> str:
     rating = None if rat is None or pd.isna(rat["averageRating"]) else float(rat["averageRating"])
     votes = None if rat is None or pd.isna(rat["numVotes"]) else int(rat["numVotes"])
 
+    # 标题列为 \N 时 pandas 读成 NaN（float），不守卫会写出非法 JSON 的 NaN 字面量，
+    # 且下游 filter_to_ids 的 `title or ""` 对 NaN 取真值后 .lower() 会直接抛错。
+    def _text(v):
+        return None if v is None or (isinstance(v, float) and pd.isna(v)) else str(v)
+
     record = {
         "imdb_id": imdb_id,
         "tmdb_id": tmdb_id,
         "title_type": row.get("titleType"),
-        "primary_title": row.get("primaryTitle"),
-        "original_title": row.get("originalTitle"),
+        "primary_title": _text(row.get("primaryTitle")),
+        "original_title": _text(row.get("originalTitle")),
         "is_adult": row.get("isAdult"),
         "start_year": None if pd.isna(row.get("startYear")) else int(row["startYear"]),
         "end_year": None if pd.isna(row.get("endYear")) else int(row["endYear"]),

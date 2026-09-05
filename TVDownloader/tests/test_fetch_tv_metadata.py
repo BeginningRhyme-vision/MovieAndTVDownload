@@ -381,6 +381,33 @@ def test_process_rating_nan_becomes_none(monkeypatch):
     assert written[0]["rating"] is None and written[0]["votes"] is None
 
 
+def test_process_nan_title_becomes_none_and_json_is_valid(monkeypatch, tmp_path):
+    # basics reads "\N" as NaN (numpy float). Without a guard json.dumps emits a bare `NaN`
+    # literal, and filter_to_ids' `title or ""` would pass NaN to .lower().
+    import json
+    out, prog = tmp_path / "out.jsonl", tmp_path / "progress.txt"
+    monkeypatch.setattr(m, "OUTPUT", out)
+    monkeypatch.setattr(m, "PROGRESS", prog)
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (10, None, None))
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    monkeypatch.setattr(m, "query_name", lambda n, d: n)
+    monkeypatch.setattr(m, "query_principals", lambda iid, d: [])
+    monkeypatch.setattr(m, "query_akas", lambda iid: [])
+    monkeypatch.setattr(m, "query_episodes", lambda iid, r: {"total_seasons": None, "total_episodes": 0, "episodes": []})
+    basics = pd.DataFrame({"titleType": ["tvSeries"], "primaryTitle": [float("nan")], "originalTitle": ["Orig"],
+                           "isAdult": [False], "startYear": [2000], "endYear": [None],
+                           "runtimeMinutes": [None], "genres": [[]]},
+                          index=pd.Index(["tt1"], name="tconst"))
+    basics["primaryTitle"] = basics["primaryTitle"].astype(float)
+    ratings = _make_ratings([])
+    crew = pd.DataFrame({"directors": [[]], "writers": [[]]}, index=pd.Index(["ttX"], name="tconst"))
+    assert m.process("tt1", basics, ratings, crew, {}) == "ok"
+    line = out.read_text(encoding="utf-8").strip()
+    assert "NaN" not in line
+    rec = json.loads(line)
+    assert rec["primary_title"] is None and rec["original_title"] == "Orig"
+
+
 # ---------------------------------------------------------------- commit_as_movie (tsv + progress in one lock)
 def test_commit_as_movie_writes_tsv_and_progress(monkeypatch, tmp_path):
     side, prog = tmp_path / "tv_as_movie.tsv", tmp_path / "progress.txt"
