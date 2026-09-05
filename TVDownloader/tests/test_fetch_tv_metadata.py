@@ -132,6 +132,25 @@ def test_load_basics_filters_by_keep_types(monkeypatch, tmp_path):
     assert pd.isna(df.loc["tt3", "startYear"]) and int(df.loc["tt3", "endYear"]) == 2010
 
 
+# ---------------------------------------------------------------- load_crew (pruned to basics)
+def test_load_crew_prunes_to_keep_ids(monkeypatch, tmp_path):
+    tsv = tmp_path / "title.crew.tsv"
+    tsv.write_text(
+        "tconst\tdirectors\twriters\n"
+        "tt1\tnm1,nm2\tnm3\n"
+        "tt2\tnm9\t\\N\n"        # an episode row: not in basics, must be dropped
+        "tt3\t\\N\t\\N\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(m, "ensure_dataset", lambda key: tsv)
+    df = m.load_crew(pd.Index(["tt1", "tt3"]))
+    assert list(df.index) == ["tt1", "tt3"]
+    assert df.loc["tt1", "directors"] == ["nm1", "nm2"] and df.loc["tt1", "writers"] == ["nm3"]
+    assert df.loc["tt3", "directors"] == [] and df.loc["tt3", "writers"] == []
+    # default (no keep_ids) still loads everything
+    assert list(m.load_crew().index) == ["tt1", "tt2", "tt3"]
+
+
 # ---------------------------------------------------------------- paths
 def test_paths_resolved_relative_to_script_dir():
     assert m.DATA_DIR.is_absolute()
@@ -171,25 +190,43 @@ def fake_find(monkeypatch):
     return _FakeFind
 
 
+def _http_err(status, headers=None, url="https://api.themoviedb.org/3/find/tt1?api_key=SECRET123&external_source=imdb_id"):
+    """Mimic what tmdbsimple raises: requests.HTTPError whose message embeds the full URL."""
+    import requests
+    resp = requests.Response()
+    resp.status_code = status
+    resp.url = url
+    if headers:
+        resp.headers.update(headers)
+    return requests.HTTPError(f"{status} Client Error for url: {url}", response=resp)
+
+
 def test_get_tmdb_id_found(fake_find):
     fake_find.script = [{"tv_results": [{"id": 1399}], "movie_results": []}]
-    assert m.get_tmdb_id("tt0944947") == (1399, None)
+    assert m.get_tmdb_id("tt0944947") == (1399, None, None)
 
 
 def test_get_tmdb_id_movie_only_returns_movie_bucket(fake_find):
     # tvSpecial landing in movie_results: tv None, movie id carried back for the side output.
     fake_find.script = [{"tv_results": [], "movie_results": [{"id": 1}]}]
-    assert m.get_tmdb_id("tt1") == (None, 1)
+    assert m.get_tmdb_id("tt1") == (None, 1, None)
+
+
+def test_get_tmdb_id_episode_bucket_returns_show_id(fake_find):
+    # A special filed under some show's "Specials" season: only tv_episode_results is populated.
+    fake_find.script = [{"tv_results": [], "movie_results": [],
+                         "tv_episode_results": [{"id": 55, "show_id": 1399, "season_number": 0}]}]
+    assert m.get_tmdb_id("tt1") == (None, None, 1399)
 
 
 def test_get_tmdb_id_nothing_found(fake_find):
     fake_find.script = [{"tv_results": [], "movie_results": []}]
-    assert m.get_tmdb_id("tt1") == (None, None)
+    assert m.get_tmdb_id("tt1") == (None, None, None)
 
 
 def test_get_tmdb_id_transient_error_then_success(fake_find):
     fake_find.script = [RuntimeError("boom"), {"tv_results": [{"id": 7}]}]
-    assert m.get_tmdb_id("tt1") == (7, None)
+    assert m.get_tmdb_id("tt1") == (7, None, None)
     assert fake_find.calls == 2
 
 
@@ -202,16 +239,61 @@ def test_get_tmdb_id_persistent_failure_raises_not_none(fake_find):
 
 
 def test_get_tmdb_id_429_does_not_consume_retries(fake_find):
-    fake_find.script = [RuntimeError("429 Too Many Requests")] * 4 + [{"tv_results": [{"id": 9}]}]
-    assert m.get_tmdb_id("tt1", retry=3) == (9, None)
+    fake_find.script = [_http_err(429)] * 4 + [{"tv_results": [{"id": 9}]}]
+    assert m.get_tmdb_id("tt1", retry=3) == (9, None, None)
     assert fake_find.calls == 5
 
 
 def test_get_tmdb_id_429_forever_eventually_raises(fake_find):
-    fake_find.script = [RuntimeError("429")] * 20
+    fake_find.script = [_http_err(429)] * 20
     with pytest.raises(m.TMDBLookupError):
         m.get_tmdb_id("tt1")
     assert fake_find.calls < 20  # bounded, not infinite
+
+
+def test_get_tmdb_id_429_is_judged_by_status_not_by_message(fake_find):
+    # imdb id containing "429" (tt0429493) must not be mistaken for rate limiting:
+    # a plain error carrying that id consumes a retry like any other error.
+    fake_find.script = [RuntimeError("tt0429493 boom")] * 3
+    with pytest.raises(m.TMDBLookupError):
+        m.get_tmdb_id("tt0429493", retry=3)
+    assert fake_find.calls == 3
+
+
+def test_get_tmdb_id_429_honours_retry_after(fake_find, monkeypatch):
+    slept = []
+    monkeypatch.setattr(m.time, "sleep", lambda s: slept.append(s))
+    fake_find.script = [_http_err(429, {"Retry-After": "3"}), {"tv_results": [{"id": 9}]}]
+    assert m.get_tmdb_id("tt1") == (9, None, None)
+    assert slept == [3]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_get_tmdb_id_auth_error_fails_fast(fake_find, status):
+    fake_find.script = [_http_err(status)] * 3
+    with pytest.raises(m.TMDBAuthError) as ei:
+        m.get_tmdb_id("tt1", retry=3)
+    assert fake_find.calls == 1               # no retry: the key is broken, not the request
+    assert "SECRET123" not in str(ei.value)   # message must not carry the URL/key
+    assert isinstance(ei.value, m.TMDBLookupError)
+
+
+def test_get_tmdb_id_never_logs_api_key(fake_find, monkeypatch):
+    warns = []
+    monkeypatch.setattr(m.log, "warning", lambda msg, *a, **k: warns.append(str(msg)))
+    fake_find.script = [_http_err(500)] * 3
+    with pytest.raises(m.TMDBLookupError) as ei:
+        m.get_tmdb_id("tt1", retry=3)
+    assert warns and all("SECRET123" not in w for w in warns)
+    assert "api_key=***" in warns[0]
+    assert "SECRET123" not in str(ei.value)
+
+
+def test_redact_keeps_exception_type_and_strips_key():
+    out = m._redact(_http_err(500))
+    assert out.startswith("HTTPError:")
+    assert "SECRET123" not in out and "api_key=***" in out
+    assert "api_key" not in m._redact(RuntimeError("plain")) and "RuntimeError: plain" == m._redact(RuntimeError("plain"))
 
 
 # ---------------------------------------------------------------- process: failure must not mark done
@@ -229,7 +311,7 @@ def test_process_none_marks_done_and_skips(monkeypatch):
     marked, written = [], []
     monkeypatch.setattr(m, "mark_done", lambda iid: marked.append(iid))
     monkeypatch.setattr(m, "commit_record", lambda rec, iid: written.append((rec, iid)))
-    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (None, None))
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (None, None, None))
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
     assert m.process("tt1", None, None, None, {}) == "skip"
     assert marked == ["tt1"] and written == []
@@ -240,12 +322,63 @@ def test_process_movie_only_goes_to_side_output_not_mark_done(monkeypatch):
     monkeypatch.setattr(m, "mark_done", lambda iid: marked.append(iid))
     monkeypatch.setattr(m, "commit_record", lambda rec, iid: written.append((rec, iid)))
     monkeypatch.setattr(m, "commit_as_movie", lambda iid, mid, tt: side.append((iid, mid, tt)))
-    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (None, 123))
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (None, 123, None))
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
     basics = pd.DataFrame({"titleType": ["tvSpecial"]}, index=pd.Index(["tt1"], name="tconst"))
     assert m.process("tt1", basics, None, None, {}) == "as_movie"
     assert side == [("tt1", 123, "tvSpecial")]
     assert marked == [] and written == []  # commit_as_movie owns the progress write
+
+
+def test_process_episode_of_show_marks_done_without_writing(monkeypatch):
+    marked, written, side = [], [], []
+    monkeypatch.setattr(m, "mark_done", lambda iid: marked.append(iid))
+    monkeypatch.setattr(m, "commit_record", lambda rec, iid: written.append((rec, iid)))
+    monkeypatch.setattr(m, "commit_as_movie", lambda iid, mid, tt: side.append((iid, mid, tt)))
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (None, None, 1399))
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    assert m.process("tt1", None, None, None, {}) == "episode_of_show"
+    assert marked == ["tt1"] and written == [] and side == []
+
+
+def test_process_tv_wins_over_movie_and_episode(monkeypatch):
+    written = []
+    monkeypatch.setattr(m, "commit_record", lambda rec, iid: written.append(rec))
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (10, 20, 30))
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    monkeypatch.setattr(m, "query_name", lambda n, d: n)
+    monkeypatch.setattr(m, "query_principals", lambda iid, d: [])
+    monkeypatch.setattr(m, "query_akas", lambda iid: [])
+    monkeypatch.setattr(m, "query_episodes", lambda iid, r: {"total_seasons": 0, "total_episodes": 0, "episodes": []})
+    basics = pd.DataFrame({"titleType": ["tvSeries"], "primaryTitle": ["A"], "originalTitle": ["A"],
+                           "isAdult": [False], "startYear": [2000], "endYear": [None],
+                           "runtimeMinutes": [None], "genres": [["Drama"]]},
+                          index=pd.Index(["tt1"], name="tconst"))
+    ratings = _make_ratings([])
+    crew = pd.DataFrame({"directors": [[]], "writers": [[]]}, index=pd.Index(["ttX"], name="tconst"))
+    assert m.process("tt1", basics, ratings, crew, {}) == "ok"
+    assert written[0]["tmdb_id"] == 10
+
+
+def test_process_rating_nan_becomes_none(monkeypatch):
+    # ratings are to_numeric(errors="coerce"): a dirty row yields NaN; int(NaN) would raise,
+    # float(NaN) would emit invalid JSON. Both must become None.
+    written = []
+    monkeypatch.setattr(m, "commit_record", lambda rec, iid: written.append(rec))
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (10, None, None))
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    monkeypatch.setattr(m, "query_name", lambda n, d: n)
+    monkeypatch.setattr(m, "query_principals", lambda iid, d: [])
+    monkeypatch.setattr(m, "query_akas", lambda iid: [])
+    monkeypatch.setattr(m, "query_episodes", lambda iid, r: {"total_seasons": 0, "total_episodes": 0, "episodes": []})
+    basics = pd.DataFrame({"titleType": ["tvSeries"], "primaryTitle": ["A"], "originalTitle": ["A"],
+                           "isAdult": [False], "startYear": [2000], "endYear": [None],
+                           "runtimeMinutes": [None], "genres": [[]]},
+                          index=pd.Index(["tt1"], name="tconst"))
+    ratings = _make_ratings([("tt1", float("nan"), float("nan"))])
+    crew = pd.DataFrame({"directors": [[]], "writers": [[]]}, index=pd.Index(["ttX"], name="tconst"))
+    assert m.process("tt1", basics, ratings, crew, {}) == "ok"
+    assert written[0]["rating"] is None and written[0]["votes"] is None
 
 
 # ---------------------------------------------------------------- commit_as_movie (tsv + progress in one lock)
@@ -262,13 +395,13 @@ def test_commit_as_movie_writes_tsv_and_progress(monkeypatch, tmp_path):
 # ---------------------------------------------------------------- run_pool (bounded window + clean Ctrl+C)
 def test_run_pool_counts_all_statuses(monkeypatch):
     monkeypatch.setattr(m.log, "info", lambda *a, **k: None)
-    outcomes = {"a": "ok", "b": "as_movie", "c": "skip", "d": "error", "e": "ok", "f": "weird"}
+    outcomes = {"a": "ok", "b": "as_movie", "c": "skip", "d": "error", "e": "ok", "f": "weird", "g": "episode_of_show"}
     stats = m.run_pool(list(outcomes), lambda i: outcomes[i], max_workers=2, window=2)
-    assert stats == {"ok": 2, "as_movie": 1, "skip": 1, "error": 2}  # unknown status -> error
+    assert stats == {"ok": 2, "as_movie": 1, "episode_of_show": 1, "skip": 1, "error": 2}  # unknown status -> error
 
 
 def test_run_pool_empty_pending():
-    assert m.run_pool([], lambda i: "ok", max_workers=2) == {"ok": 0, "as_movie": 0, "skip": 0, "error": 0}
+    assert m.run_pool([], lambda i: "ok", max_workers=2) == {k: 0 for k in m.STATUS_KEYS}
 
 
 def test_run_pool_window_bounds_in_flight(monkeypatch):
@@ -322,7 +455,66 @@ def test_run_pool_keyboard_interrupt_cancels_pending_and_reraises(monkeypatch):
     # Only the window's worth of tasks (plus refills before the interrupt) ever started; the
     # remaining ~90 were never submitted, so Ctrl+C returned promptly instead of draining 100.
     assert len(started) < 100
-    assert any("中断退出" in w for w in warns)
+    assert any("提前退出" in w for w in warns)
+
+
+def test_run_pool_interrupt_mid_accounting_does_not_lose_counts(monkeypatch):
+    # Ctrl+C landing while the done_set is being accounted: every finished Future must still be
+    # counted (the old code only re-scanned in_flight, dropping the rest of done_set).
+    warns = []
+    monkeypatch.setattr(m.log, "info", lambda *a, **k: None)
+    monkeypatch.setattr(m.log, "warning", lambda msg, *a, **k: warns.append(msg))
+    real_wait = m.wait
+
+    def wait_all_done(*a, **k):
+        # Return the whole window as done in one go so accounting has several futures to walk.
+        from concurrent.futures import ALL_COMPLETED
+        k["return_when"] = ALL_COMPLETED
+        return real_wait(*a, **k)
+    monkeypatch.setattr(m, "wait", wait_all_done)
+
+    n = 6
+
+    def job(i):
+        return "ok"
+
+    # Interrupt from inside accounting: patch Future.result of the 2nd accounted future.
+    from concurrent import futures as cf
+    real_result = cf.Future.result
+    hit = [0]
+
+    def result_then_interrupt(self, *a, **k):
+        hit[0] += 1
+        if hit[0] == 2:
+            raise KeyboardInterrupt
+        return real_result(self, *a, **k)
+    monkeypatch.setattr(cf.Future, "result", result_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        m.run_pool(list(range(n)), job, max_workers=n, window=n)
+    # 1 accounted before the interrupt + the remaining 5 recovered in the except branch.
+    done_line = [w for w in warns if "提前退出" in w][0]
+    assert f"已完成 {n:,}/{n:,}" in done_line
+    assert "写入:6" in done_line
+
+
+def test_run_pool_fatal_job_exception_aborts_and_reraises(monkeypatch):
+    # A TMDBAuthError raised by job must escape run_pool (not be counted as 'error' and swallowed).
+    warns = []
+    monkeypatch.setattr(m.log, "info", lambda *a, **k: None)
+    monkeypatch.setattr(m.log, "warning", lambda msg, *a, **k: warns.append(msg))
+    started = []
+
+    def job(i):
+        started.append(i)
+        if i == 0:
+            raise m.TMDBAuthError("bad key")
+        return "ok"
+
+    with pytest.raises(m.TMDBAuthError):
+        m.run_pool(list(range(100)), job, max_workers=1, window=1)
+    assert len(started) < 100
+    assert any("TMDBAuthError" in w for w in warns)
 
 
 # ---------------------------------------------------------------- commit_record (jsonl + progress in one lock)

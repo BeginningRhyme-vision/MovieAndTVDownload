@@ -11,6 +11,8 @@ import csv
 import gzip
 import json
 import os
+import re
+import sys
 import time
 import logging
 import requests
@@ -225,7 +227,6 @@ def ensure_dataset(key: str) -> Path:
 # ========== 建 SQLite 索引（只建一次）==========
 def build_index():
     """把 akas / principals / names / episode 导入 SQLite，后续按 imdb_id 点查，无需全量加载"""
-    import sys
     csv.field_size_limit(min(sys.maxsize, 10_000_000))  # 解除字段长度限制
     conn = sqlite3.connect(INDEX_DB)
     cur = conn.cursor()
@@ -470,9 +471,13 @@ def load_ratings() -> pd.DataFrame:
     return df
 
 
-def load_crew() -> pd.DataFrame:
+def load_crew(keep_ids=None) -> pd.DataFrame:
+    """title.crew 约 1100 万行（含全部 tvEpisode），而 process() 只按剧集 tconst 点查。
+    传入 basics.index 后先裁剪再做 split，避免对 1000 万行做 Python 级 apply 和常驻内存。"""
     path = ensure_dataset("crew")
     df = pd.read_csv(path, sep="\t", na_values="\\N", quoting=_IMDB_QUOTING)
+    if keep_ids is not None:
+        df = df[df["tconst"].isin(keep_ids)].copy()  # copy：后续列赋值不触发 SettingWithCopyWarning
     df["directors"] = df["directors"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df["writers"] = df["writers"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df = df.set_index("tconst")
@@ -505,10 +510,43 @@ class TMDBLookupError(RuntimeError):
     与"TMDB 里确实查不到"（返回 None）严格区分：前者不能 mark_done，必须留待下次重跑。"""
 
 
+class TMDBAuthError(TMDBLookupError):
+    """TMDB 返回 401/403：API Key 无效或被封。这是全局性错误，重试和继续跑都没有意义，
+    job 层不吞掉它，run_pool 会把它抛回主线程让整个任务立即终止。"""
+
+
+_API_KEY_RE = re.compile(r"api_key=[^&\s]+")
+
+
+def _redact(e: BaseException) -> str:
+    """tmdbsimple 抛出的 requests.HTTPError 消息里带完整 URL（含 api_key= 查询参数），
+    原样写进 fetch.log 就等于把密钥落盘。日志/异常消息一律经此脱敏。"""
+    return _API_KEY_RE.sub("api_key=***", f"{type(e).__name__}: {e}")
+
+
+def _http_status(e: BaseException):
+    """从 requests.HTTPError 取状态码；非 HTTP 错误（超时、连接失败）返回 None。"""
+    return getattr(getattr(e, "response", None), "status_code", None)
+
+
+def _retry_after(e: BaseException, default: int = 10, cap: int = 60) -> int:
+    """429 时优先尊重服务端 Retry-After（秒），解析失败或缺失用 default，并设上限。"""
+    headers = getattr(getattr(e, "response", None), "headers", None) or {}
+    try:
+        return max(1, min(int(headers.get("Retry-After", default)), cap))
+    except (TypeError, ValueError):
+        return default
+
+
 def get_tmdb_id(imdb_id: str, retry: int = 3):
-    """返回 (tv_id, movie_id)，各自在 TMDB 无对应结果时为 None；请求持续失败抛 TMDBLookupError。
-    TMDB Find 按媒体类型分桶：IMDB 标为 tvSpecial/tvShort 的条目常落在 movie_results，
-    这里把 movie 桶一并带回，由 process 决定走主输出还是旁路，不多耗一次 API。
+    """返回 (tv_id, movie_id, episode_show_id)，各自在 TMDB 无对应结果时为 None；
+    请求持续失败抛 TMDBLookupError，401/403 抛 TMDBAuthError（不重试）。
+    TMDB Find 按媒体类型分桶：
+    - tv_results：正常剧集，主输出；
+    - movie_results：IMDB 标为 tvSpecial/tvShort 的条目常落在这里，走旁路；
+    - tv_episode_results：特辑被 TMDB 挂在某部剧的 Specials 季下，只是一集，
+      不能当作独立剧集下载，带回母剧 show_id 供统计/排查。
+    这里把三个桶一并带回，由 process 决定去向，不多耗一次 API。
     429 限速不消耗重试次数（限速是外部节奏问题，不是本条目的问题），
     但设有上限防止 TMDB 长时间限速时线程无限空转。"""
     last_err = None
@@ -519,33 +557,47 @@ def get_tmdb_id(imdb_id: str, retry: int = 3):
             result = tmdb.Find(imdb_id).info(external_source="imdb_id")
             tv = result.get("tv_results") or []
             movie = result.get("movie_results") or []
-            return (tv[0]["id"] if tv else None, movie[0]["id"] if movie else None)
+            ep = result.get("tv_episode_results") or []
+            return (tv[0]["id"] if tv else None,
+                    movie[0]["id"] if movie else None,
+                    ep[0].get("show_id") if ep else None)
         except Exception as e:
             last_err = e
-            if "429" in str(e):
+            status = _http_status(e)
+            if status in (401, 403):
+                raise TMDBAuthError(f"TMDB 拒绝访问（HTTP {status}），请检查 TMDB_API_KEY") from None
+            if status == 429:
                 rate_limit_hits += 1
-                if rate_limit_hits > 6:  # 最多等 60s
+                if rate_limit_hits > 6:
                     break
-                log.warning("限速，等待 10s")
-                time.sleep(10)
+                delay = _retry_after(e)
+                log.warning(f"限速，等待 {delay}s")
+                time.sleep(delay)
                 continue
             attempt += 1
-            log.warning(f"{imdb_id} 第{attempt}次失败: {e}")
+            log.warning(f"{imdb_id} 第{attempt}次失败: {_redact(e)}")
             if attempt < retry:
                 time.sleep(2 ** attempt)
-    raise TMDBLookupError(f"TMDB 查询失败（已重试）: {last_err}")
+    raise TMDBLookupError(f"TMDB 查询失败（已重试）: {_redact(last_err)}")
 
 
 # ========== 处理单条 ==========
 def process(imdb_id: str, basics, ratings, crew, names_dict) -> str:
-    """返回状态字符串：ok（写入主输出）/ as_movie（写入旁路）/ skip（TMDB 查无）。
+    """返回状态字符串：ok（写入主输出）/ as_movie（写入旁路）/
+    episode_of_show（TMDB 视为某剧的一集，标记完成不写文件）/ skip（TMDB 查无）。
     TMDB 请求持续失败时抛 TMDBLookupError，由调用方决定不标记完成。"""
-    tmdb_id, movie_id = get_tmdb_id(imdb_id)
+    tmdb_id, movie_id, show_id = get_tmdb_id(imdb_id)
     time.sleep(SLEEP)
     if tmdb_id is None:
         if movie_id is not None:
             commit_as_movie(imdb_id, movie_id, basics.loc[imdb_id].get("titleType"))
             return "as_movie"
+        if show_id is not None:
+            # 该条目在 TMDB 只是母剧（show_id）Specials 季下的一集，母剧本身会由它自己的
+            # IMDB id 走主流程；这里不能按独立剧集下载，也没必要留待重跑。
+            log.info(f"{imdb_id} 在 TMDB 为剧集 {show_id} 的单集，跳过")
+            mark_done(imdb_id)
+            return "episode_of_show"
         mark_done(imdb_id)
         return "skip"
 
@@ -558,6 +610,11 @@ def process(imdb_id: str, basics, ratings, crew, names_dict) -> str:
 
     ep_info = query_episodes(imdb_id, ratings)
 
+    # ratings 经 to_numeric(errors="coerce")，脏值会变 NaN；float(NaN) 会写出非法 JSON，
+    # int(NaN) 直接抛 ValueError，与 query_episodes 一样做守卫。
+    rating = None if rat is None or pd.isna(rat["averageRating"]) else float(rat["averageRating"])
+    votes = None if rat is None or pd.isna(rat["numVotes"]) else int(rat["numVotes"])
+
     record = {
         "imdb_id": imdb_id,
         "tmdb_id": tmdb_id,
@@ -569,8 +626,8 @@ def process(imdb_id: str, basics, ratings, crew, names_dict) -> str:
         "end_year": None if pd.isna(row.get("endYear")) else int(row["endYear"]),
         "runtime_minutes": None if pd.isna(row.get("runtimeMinutes")) else int(row["runtimeMinutes"]),
         "genres": row.get("genres", []),
-        "rating": None if rat is None else float(rat["averageRating"]),
-        "votes": None if rat is None else int(rat["numVotes"]),
+        "rating": rating,
+        "votes": votes,
         "directors": directors,
         "writers": writers,
         "cast_crew": query_principals(imdb_id, names_dict),
@@ -586,8 +643,11 @@ def process(imdb_id: str, basics, ratings, crew, names_dict) -> str:
 
 
 # ========== 主流程 ==========
+STATUS_KEYS = ("ok", "as_movie", "episode_of_show", "skip", "error")
+
+
 def _fmt_stats(stats: dict) -> str:
-    return (f"写入:{stats['ok']} 转电影:{stats['as_movie']} "
+    return (f"写入:{stats['ok']} 转电影:{stats['as_movie']} 属某剧单集:{stats['episode_of_show']} "
             f"无TMDB:{stats['skip']} 失败:{stats['error']}")
 
 
@@ -598,51 +658,62 @@ def run_pool(pending, job, max_workers: int, window: int = None, log_every: int 
     - 首跑 pending 有数十万条，一次性提交会常驻几十万个 Future 对象；
     - `with ThreadPoolExecutor` 退出时 shutdown(wait=True) 会把队列里剩余任务全部跑完，
       Ctrl+C 实际停不下来，只能 kill -9。
-    改为窗口内最多 window 个在飞，完成一个补一个；收到 KeyboardInterrupt 时停止补货并
-    cancel_futures 取消未开始的任务，只等在飞的那几个收尾，几秒内干净退出。
-    job 自身已吞掉所有 Exception 并返回 'error'，这里对 result() 不再兜底。"""
+    改为窗口内最多 window 个在飞，完成一个补一个；收到 KeyboardInterrupt（或 job 抛出的
+    TMDBAuthError 等致命异常）时停止补货并 cancel_futures 取消未开始的任务，只等在飞的那几个
+    收尾，几秒内干净退出，并把已完成但尚未记账的 Future 补记后再向上抛。
+    job 已吞掉普通 Exception 并返回 'error'，只放行 TMDBAuthError；这里 result() 不再兜底。"""
     window = window or max_workers * 4
-    stats = {"ok": 0, "as_movie": 0, "skip": 0, "error": 0}
+    stats = {k: 0 for k in STATUS_KEYS}
     total = len(pending)
     it = iter(pending)
     in_flight = set()
+    to_account = set()   # 已完成、尚未记账的 Future；与 in_flight 分开放，中断时不会漏
     finished = 0
-    interrupted = False
+    aborted = False
 
     def _account(fut):
         nonlocal finished
+        s = fut.result()   # job 放行的 TMDBAuthError 在这里于主线程重新抛出
         finished += 1
-        s = fut.result()
         stats[s if s in stats else "error"] += 1
         if log_every and finished % log_every == 0:
             log.info(f"进度 {finished:,}/{total:,} | {_fmt_stats(stats)}")
 
-    executor = ThreadPoolExecutor(max_workers=max_workers)
-    try:
+    def _refill():
         for iid in it:
             in_flight.add(executor.submit(job, iid))
             if len(in_flight) >= window:
                 break
+
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        _refill()
         while in_flight:
             done_set, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
-            for fut in done_set:
-                _account(fut)
-            for iid in it:
-                in_flight.add(executor.submit(job, iid))
-                if len(in_flight) >= window:
-                    break
-    except KeyboardInterrupt:
-        interrupted = True
-        log.warning("收到中断，停止提交新任务，等待在飞任务收尾...")
+            to_account |= done_set
+            while to_account:
+                fut = next(iter(to_account))
+                _account(fut)             # 先记账再移除：中断落在记账中途时该 Future 仍可在 except 里补记
+                to_account.discard(fut)
+            _refill()
+    except BaseException as e:
+        aborted = True
+        reason = "收到中断" if isinstance(e, KeyboardInterrupt) else f"致命错误（{type(e).__name__}）"
+        log.warning(f"{reason}，停止提交新任务，等待在飞任务收尾...")
         executor.shutdown(wait=True, cancel_futures=True)
-        for fut in in_flight:
+        for fut in to_account | in_flight:
             if fut.done() and not fut.cancelled():
-                _account(fut)
+                try:
+                    _account(fut)
+                except Exception:
+                    # 多个工作线程同时抛 TMDBAuthError 时，后续的只计数不再重复抛
+                    finished += 1
+                    stats["error"] += 1
         raise
     finally:
         executor.shutdown(wait=True)
-        if interrupted:
-            log.warning(f"中断退出：已完成 {finished:,}/{total:,} | {_fmt_stats(stats)}（未完成的下次运行自动续跑）")
+        if aborted:
+            log.warning(f"提前退出：已完成 {finished:,}/{total:,} | {_fmt_stats(stats)}（未完成的下次运行自动续跑）")
     return stats
 
 
@@ -660,7 +731,7 @@ def main():
     log.info("=== 加载小文件 ===")
     basics = load_basics()
     ratings = load_ratings()
-    crew = load_crew()
+    crew = load_crew(basics.index)
     names_dict = load_names_dict()
 
     # 4. 开始处理
@@ -671,14 +742,24 @@ def main():
     def job(imdb_id):
         try:
             return process(imdb_id, basics, ratings, crew, names_dict)
+        except TMDBAuthError:
+            # 密钥失效是全局问题，继续跑只会让几十万条全部空转成 error；放行让 run_pool 终止。
+            raise
         except Exception as e:
             # 注意：这里不能 mark_done。异常代表本条“未成功处理”，
             # 若标记为已完成，重跑时会跳过它，造成静默丢数据。
             # 不标记则下次运行会自动重试该 imdb_id。
-            log.error(f"{imdb_id} 异常（将于下次运行重试）: {e}")
+            log.error(f"{imdb_id} 异常（将于下次运行重试）: {_redact(e)}")
             return "error"
 
-    stats = run_pool(pending, job, MAX_WORKERS)
+    try:
+        stats = run_pool(pending, job, MAX_WORKERS)
+    except KeyboardInterrupt:
+        log.warning("已中断，直接重新运行即可续跑")
+        sys.exit(130)
+    except TMDBAuthError as e:
+        log.error(str(e))
+        sys.exit(2)
 
     log.info(f"全部完成！{_fmt_stats(stats)}")
     log.info(f"输出: {OUTPUT.resolve()}")
