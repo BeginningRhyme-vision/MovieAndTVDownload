@@ -17,6 +17,7 @@ import requests
 import shutil
 import sqlite3
 import threading
+import numpy as np
 import pandas as pd
 import tmdbsimple as tmdb
 import yaml
@@ -119,7 +120,14 @@ DATASETS = {
 }
 
 # ========== 日志 ==========
-DATA_DIR.mkdir(exist_ok=True)
+def _ensure_dirs():
+    """data_dir / output / progress / log_path 都允许配成多层相对路径，统一预建父目录。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for p in (OUTPUT, PROGRESS, LOG_PATH):
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+
+_ensure_dirs()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -147,17 +155,24 @@ def mark_done(imdb_id: str):
 
 class _Encoder(json.JSONEncoder):
     def default(self, obj):
-        import numpy as np
         if isinstance(obj, (np.bool_,)):   return bool(obj)
         if isinstance(obj, (np.integer,)): return int(obj)
         if isinstance(obj, (np.floating,)): return float(obj)
         return super().default(obj)
 
 
-def write_jsonl(record: dict):
+def commit_record(record: dict, imdb_id: str):
+    """一次加锁内先写 jsonl 再写 progress：
+    - 先序列化再打开文件，序列化失败不会留下半行；
+    - 两个文件各自 flush 后才释放锁，其他线程不会交错写入；
+    - 若在写完 jsonl、写 progress 之前崩溃，下次重跑会重复写同一行（下游按 tmdb_id dict 覆盖，无害），
+      但绝不会出现"progress 已标记而 jsonl 没数据"的丢数据情况。"""
+    line = json.dumps(record, ensure_ascii=False, cls=_Encoder) + "\n"
     with _lock:
         with open(OUTPUT, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, cls=_Encoder) + "\n")
+            f.write(line)
+        with open(PROGRESS, "a", encoding="utf-8") as f:
+            f.write(imdb_id + "\n")
 
 
 # ========== 下载（已存在则跳过）==========
@@ -405,7 +420,12 @@ def load_basics() -> pd.DataFrame:
     df["startYear"] = pd.to_numeric(df["startYear"], errors="coerce")
     df["endYear"] = pd.to_numeric(df["endYear"], errors="coerce")
     df["runtimeMinutes"] = pd.to_numeric(df["runtimeMinutes"], errors="coerce")
-    df["isAdult"] = df["isAdult"].map({"0": False, "1": True, 0: False, 1: True})
+    # isAdult 官方只有 0/1；脏值（\N、空、其他字符串）一律视为 False，
+    # 避免 map 产出 NaN → JSON 输出非法的 NaN 字面量，且下游 filter_to_ids 按布尔判断。
+    df["isAdult"] = (
+        df["isAdult"].map({"0": False, "1": True, 0: False, 1: True})
+        .fillna(False).astype(bool)
+    )
     df["genres"] = df["genres"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df = df.set_index("tconst")
     # tconst 理论上唯一，但对索引去重可防御脏数据：
@@ -529,8 +549,7 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
         "episodes": ep_info["episodes"],
     }
 
-    write_jsonl(record)
-    mark_done(imdb_id)
+    commit_record(record, imdb_id)
     return imdb_id
 
 

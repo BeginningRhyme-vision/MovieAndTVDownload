@@ -210,11 +210,105 @@ def test_process_lookup_error_propagates_without_mark_done(monkeypatch):
 def test_process_none_marks_done_and_skips(monkeypatch):
     marked, written = [], []
     monkeypatch.setattr(m, "mark_done", lambda iid: marked.append(iid))
-    monkeypatch.setattr(m, "write_jsonl", lambda rec: written.append(rec))
+    monkeypatch.setattr(m, "commit_record", lambda rec, iid: written.append((rec, iid)))
     monkeypatch.setattr(m, "get_tmdb_id", lambda iid: None)
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
     assert m.process("tt1", None, None, None, {}) is None
     assert marked == ["tt1"] and written == []
+
+
+# ---------------------------------------------------------------- commit_record (jsonl + progress in one lock)
+def test_commit_record_writes_both_files(monkeypatch, tmp_path):
+    import json
+    out, prog = tmp_path / "out.jsonl", tmp_path / "progress.txt"
+    monkeypatch.setattr(m, "OUTPUT", out)
+    monkeypatch.setattr(m, "PROGRESS", prog)
+    import numpy as np
+    m.commit_record({"imdb_id": "tt1", "n": np.int64(3), "f": np.float64(1.5), "b": np.bool_(True)}, "tt1")
+    m.commit_record({"imdb_id": "tt2"}, "tt2")
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(l)["imdb_id"] for l in lines] == ["tt1", "tt2"]
+    assert json.loads(lines[0]) == {"imdb_id": "tt1", "n": 3, "f": 1.5, "b": True}
+    assert prog.read_text(encoding="utf-8").splitlines() == ["tt1", "tt2"]
+    assert m.load_done() == {"tt1", "tt2"}
+
+
+def test_commit_record_serialization_failure_writes_nothing(monkeypatch, tmp_path):
+    out, prog = tmp_path / "out.jsonl", tmp_path / "progress.txt"
+    monkeypatch.setattr(m, "OUTPUT", out)
+    monkeypatch.setattr(m, "PROGRESS", prog)
+    with pytest.raises(TypeError):
+        m.commit_record({"bad": object()}, "tt1")
+    assert not out.exists() and not prog.exists()
+
+
+def test_commit_record_is_thread_safe(monkeypatch, tmp_path):
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    out, prog = tmp_path / "out.jsonl", tmp_path / "progress.txt"
+    monkeypatch.setattr(m, "OUTPUT", out)
+    monkeypatch.setattr(m, "PROGRESS", prog)
+    ids = [f"tt{i:05d}" for i in range(400)]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(lambda i: m.commit_record({"imdb_id": i, "pad": "x" * 500}, i), ids))
+    out_ids = [json.loads(l)["imdb_id"] for l in out.read_text(encoding="utf-8").splitlines()]
+    prog_ids = prog.read_text(encoding="utf-8").splitlines()
+    # no interleaved/corrupted lines, same order in both files
+    assert sorted(out_ids) == sorted(ids)
+    assert out_ids == prog_ids
+
+
+# ---------------------------------------------------------------- _ensure_dirs (nested paths)
+def test_ensure_dirs_creates_nested_parents(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path / "a" / "b" / "imdb_data")
+    monkeypatch.setattr(m, "OUTPUT", tmp_path / "out" / "x" / "tv.jsonl")
+    monkeypatch.setattr(m, "PROGRESS", tmp_path / "state" / "progress.txt")
+    monkeypatch.setattr(m, "LOG_PATH", tmp_path / "logs" / "y" / "fetch.log")
+    m._ensure_dirs()
+    assert (tmp_path / "a" / "b" / "imdb_data").is_dir()
+    assert (tmp_path / "out" / "x").is_dir()
+    assert (tmp_path / "state").is_dir()
+    assert (tmp_path / "logs" / "y").is_dir()
+    m._ensure_dirs()  # idempotent
+
+
+# ---------------------------------------------------------------- isAdult dirty values
+def test_load_basics_is_adult_dirty_values_never_nan(monkeypatch, tmp_path):
+    import json
+    tsv = tmp_path / "title.basics.tsv"
+    tsv.write_text(
+        "tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear\tendYear\truntimeMinutes\tgenres\n"
+        "tt1\ttvSeries\tA\tA\t0\t2001\t\\N\t45\tDrama\n"
+        "tt2\ttvSeries\tB\tB\t1\t2001\t\\N\t45\tDrama\n"
+        "tt3\ttvSeries\tC\tC\t\\N\t2001\t\\N\t45\tDrama\n"   # missing
+        "tt4\ttvSeries\tD\tD\tfoo\t2001\t\\N\t45\tDrama\n"   # garbage
+        "tt5\ttvSeries\tE\tE\t\t2001\t\\N\t45\tDrama\n",     # empty
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(m, "ensure_dataset", lambda key: tsv)
+    monkeypatch.setattr(m, "KEEP_TYPES", {"tvSeries"})
+    df = m.load_basics()
+    assert df["isAdult"].dtype == bool
+    assert df["isAdult"].tolist() == [False, True, False, False, False]
+    # every value must be JSON-encodable to a real boolean (no NaN literal)
+    for iid in df.index:
+        s = json.dumps({"is_adult": df.loc[iid].get("isAdult")}, cls=m._Encoder)
+        assert s in ('{"is_adult": true}', '{"is_adult": false}')
+
+
+def test_load_basics_is_adult_float_column_after_na(monkeypatch, tmp_path):
+    # When \N is present pandas reads the column as float (0.0/1.0); 1.0 must still map to True.
+    tsv = tmp_path / "title.basics.tsv"
+    tsv.write_text(
+        "tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear\tendYear\truntimeMinutes\tgenres\n"
+        "tt1\ttvSeries\tA\tA\t1\t2001\t\\N\t45\tDrama\n"
+        "tt2\ttvSeries\tB\tB\t\\N\t2001\t\\N\t45\tDrama\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(m, "ensure_dataset", lambda key: tsv)
+    monkeypatch.setattr(m, "KEEP_TYPES", {"tvSeries"})
+    df = m.load_basics()
+    assert df["isAdult"].tolist() == [True, False]
 
 
 # ---------------------------------------------------------------- ensure_dataset: partial-file protection
