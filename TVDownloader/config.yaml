@@ -1,0 +1,219 @@
+# ============================================================================
+# TVDownloader 项目统一配置文件
+# ----------------------------------------------------------------------------
+# 【设计约定】
+#   - 本文件按“代码文件”分段：每个顶层键对应一个 .py 脚本，段名与脚本文件名
+#     （去掉 .py）一致。
+#   - 每个脚本运行时只读取自己对应的那一段，互不干扰。
+#   - 想改某个脚本的参数，只需改它所属段落，无需改动任何代码。
+#
+# 【与 MovieDownloader 的差异】
+#   - 元数据/取流/下载的处理单位从“一部电影”变为“一集”：tmdb_id + season + episode。
+#   - 季集结构以 TMDB 为准（取流阶段调 /tv/{id} 展开），IMDB episode 表仅作参考与筛选。
+#   - R2 对象键：{year}/{tmdbId}/S{season:02d}/{YYYYMMDD}/E{episode:02d}.mp4
+# ============================================================================
+
+
+# ----------------------------------------------------------------------------
+# fetch_tv_metadata.py —— 抓取 IMDB 全量电视剧元数据并转换 TMDB ID
+# ----------------------------------------------------------------------------
+fetch_tv_metadata:
+  # TMDB API Key：敏感项，请配置到同目录 .env 的 TMDB_API_KEY（见 .env.example）。
+  # 环境变量优先；此处留空，仅作本地调试回退。生产环境务必留空。
+  tmdb_api_key: ""
+
+  # 只保留哪些 IMDB 条目类型（title.basics 的 titleType 列）。
+  # 电视剧相关：tvSeries / tvMiniSeries / tvSpecial / tvShort（tvEpisode 是分集本身，不要）
+  keep_types:
+    - tvSeries
+    - tvMiniSeries
+    - tvSpecial
+    - tvShort
+
+  # 调用 TMDB API 的并发线程数。TMDB 软上限约 50 req/s，配合 sleep 控制整体 QPS
+  max_workers: 16
+
+  # 每次调用 TMDB API 后的固定间隔（秒），用于降低触发限速的概率
+  # 16 并发 + 0.1s 约对应 100 QPS；若日志出现 429 可调大到 0.2
+  sleep: 0.1
+
+  # ---- 以下为文件路径，一般无需修改 ----
+  # IMDB 数据集与 SQLite 索引库所在目录（TVDownloader 独立一份，不与电影共用）
+  data_dir: "imdb_data"
+  # 最终输出的电视剧元数据文件（下游 filter_to_ids.py 的输入）
+  output: "tv_series.jsonl"
+  # 断点续跑的进度记录文件（记录已处理的 imdb_id）
+  progress: "progress.txt"
+  # 运行日志文件
+  log_path: "fetch.log"
+
+
+# ----------------------------------------------------------------------------
+# tv_ids_to_links.py —— 由 tmdb_id 展开季集结构，并逐集解析出可播放的 m3u8 地址
+# ----------------------------------------------------------------------------
+tv_ids_to_links:
+  # 输入：待解析的剧集 tmdb_id 列表（filter_to_ids.py 的产物，一行一个剧 ID）
+  input: "ids.txt"
+  # 剧集静态元数据源（fetch_tv_metadata.py 的产物）。取流成功时按 tmdb_id 查表，
+  # 把 year/original_title/genres/title_type/imdb_id 合并进 output，
+  # 供下游 download_tv 拼 R2 路径 {year}/... 及后续用途。缺失则各字段留空。
+  metadata: "tv_series.jsonl"
+  # 输出：解析成功的结果，一行一集（含 season/episode 与 m3u8 地址）
+  output: "results.jsonl"
+  # 解析失败记录（一行一集：tmdb_id\tseason\tepisode）
+  fail_file: "fail.txt"
+  # 季集结构缓存：TMDB /tv/{id} 展开结果，避免多轮/续跑时重复调 API
+  seasons_cache: "seasons_cache.jsonl"
+
+  # TMDB API Key：用于调 /tv/{id} 拿季集结构。敏感项，走 .env 的 TMDB_API_KEY，
+  # 环境变量优先；此处留空，仅作本地调试回退。
+  tmdb_api_key: ""
+  # 是否包含 season 0（TMDB 里的 Specials/特辑）
+  include_specials: true
+  # TMDB 展开阶段的并发数 / 每次请求后的间隔（秒）/ 超时 / 重试次数
+  # 每部剧约 1 + ceil(季数/20) 次请求，8 并发 + 0.1s 远低于 TMDB 限速
+  tmdb_workers: 8
+  tmdb_sleep: 0.1
+  tmdb_timeout: 15
+  tmdb_retries: 3
+
+  # 解密服务 API 根地址（负责 enc-vidup / dec-vidup 加解密）
+  api: "https://enc-dec.app/api"
+  # 并发线程数：同时解析多少集。配合住宅代理分散 IP。
+  # 无源404不重试，任务为纯IO等待，可拉高并发；电影版 50 实测稳定。
+  max_workers: 50
+  # 单集的最大重试次数与每次重试间隔（秒）
+  # 只有瞬时错误(SSL/超时/5xx)才重试，真无源404直接跳过不sleep
+  max_retries: 3
+  retry_delay: 1
+  # ---- 多轮捞回：整批跑完后对“瞬时耗尽”的集自动重跑，直到清零或达上限 ----
+  #   - 单集在 process_episode 内换 IP 重试 max_retries 次仍失败(瞬时耗尽) → 下一轮重跑；
+  #   - 真无源404 → 永久排除，绝不再抓（注意：是“这一集”无源，不影响同剧其它集）；
+  #   - output 直接就是全部轮次成功结果的合并。
+  max_rounds: 8
+  # 单个 HTTP 请求超时（秒）
+  timeout: 12
+  # 代理配置：vidup.to 有 Cloudflare 机房 IP 拦截，直连会 403，需走住宅代理。
+  # 敏感项 user/password 请配置到同目录 .env 的 PROXY_USER / PROXY_PASSWORD（见 .env.example）。
+  # 环境变量优先；此处 user/password 留空，仅作本地调试回退。生产环境务必留空。
+  proxy:
+    # true=启用下方代理，false=直连
+    enabled: true
+    host: "unmetered.residential.proxyrack.net"
+    user: ""
+    password: ""
+    # 端口范围 [起, 止]，每次请求随机取一个端口以更换出口 IP
+    port_range: [9000, 9050]
+
+
+# ----------------------------------------------------------------------------
+# download_tv.py —— 下载 m3u8 并转封装为 mp4（按集）
+# ----------------------------------------------------------------------------
+download_tv:
+  # 输入与日志
+  # 全量下载直接消费取流产物 results.jsonl（一行一集，自带 year/season/episode 等）
+  input: "results.jsonl"
+  success_log: "success.jsonl"
+  failed_log: "failed.jsonl"
+  # ---- 多轮下载：对因瞬时错误(5xx/超时/SSL/缺片等)下载失败且可重试的集自动重跑 ----
+  # 确定性失败（404/无源、画质不达标、缺 tmdbId/season/episode/url）绝不进入下一轮。
+  multi_round:
+    enabled: true           # false=只跑一轮
+    max_rounds: 3           # 最大下载轮次（含第一轮）
+    cooldown_seconds: 300   # 轮次之间的冷却等待（秒）
+  # 两个独立于 success.jsonl/failed.jsonl 的下载态状态文件，全程可查当前下载进度：
+  #   download_ok_log   —— 累计追加，每集“下载”成功一条（不含转封装/上传）
+  #   download_fail_log —— 每轮开头清空重写，只记本轮“下载”失败的集
+  download_ok_log: "download_ok.jsonl"
+  download_fail_log: "download_fail.jsonl"
+  # 视频落盘根目录与临时工作目录。
+  #   1) 相对路径（如 downloads）—— 以脚本所在目录 TVDownloader/ 为根；
+  #   2) 绝对路径（如 /mnt/data/downloads）—— 直接使用该路径；
+  #   3) 两者建议放在同一磁盘，成品从 temp_dir 移到 base_dir 才是瞬时操作。
+  base_dir: "downloads"
+  temp_dir: "temp"
+  folder_prefix: "tv_"
+  max_videos_per_folder: 1000
+  start_folder_index: 1
+  # 并发控制
+  max_workers: 32          # 同时下载的集数
+  convert_workers: 16      # 独立的 FFmpeg 转封装线程数（与 upload_workers 对齐）
+  segment_concurrency: 64  # 单集同时下载的分片数
+  # 画质探测与分片重试
+  # 采样前 sample_count 段测码率并复用为正片开头（避免重复下载）。
+  sample_count: 10
+  seg_retry_max: 20
+  seg_retry_delay: 1
+  # 转封装(ffmpeg -c copy)单片超时(秒)：单集通常 20~60 分钟，比电影短，1800 足够冗余
+  convert_timeout: 1800
+  # ---- playlist(master/media)解析阶段的请求重试 ----
+  playlist_retry_max: 10          # 单节点 playlist 解析最大重试次数
+  playlist_retry_backoff: 1.0     # 退避基础间隔（秒，指数退避）
+  playlist_retry_backoff_max: 60.0  # 退避间隔上限（秒）
+  # 多节点 fallback：非末节点用更小的重试次数快速判定坏节点并换下一个备用节点
+  playlist_retry_fallback: 3
+  # ==== 画质筛选（单一码率曲线，与 MovieDownloader 完全一致）====
+  # 【第 1 关 · 分辨率红线】 h ≥ min_resolution_height × leniency
+  # 【第 2 关 · 码率门槛】   br ≥ bitrate_<codec> × (h / 1080)² × leniency
+  # 【择优】实测高度更高的绝对优先；高度相同才比采样码率。
+  # 详细说明见 MovieDownloader/config.yaml 同名段落。
+  min_resolution_height: 1080   # 分辨率红线高度（想下 720p 就改成 720，一处联动全部）
+  # leniency 是“乘在门槛上的系数”：越大越严格，越小越宽松。
+  leniency: 0.8
+  # 各视频编码在“1080p 基准”下的最低码率门槛（kbps），实际按 (h/1080)² 随流高度缩放。
+  bitrate_h264: 1850   # H.264/AVC 基准
+  bitrate_hevc: 1100   # HEVC/H.265
+  bitrate_av1:  925    # AV1
+  bitrate_vp9:  1400   # VP9
+  # 缺片保护：缺片率超过阈值则判失败（写 failed 可重下）
+  max_missing_ratio: 0.02
+  # 小样本豁免：总片数很少时允许至少丢这么多片而不触发阈值判定
+  min_missing_allowance: 1
+  # 上传失败待补传清单，供 `python download_tv.py reupload` 手动补传时精确定位。
+  upload_pending_log: "upload_pending.jsonl"
+  # ---- S3 兼容对象存储（Cloudflare R2）上传配置 ----
+  # 对象键格式：{prefix}/{year}/{tmdbId}/S{season:02d}/{YYYYMMDD}/E{episode:02d}.mp4
+  # 与电影版的差别：上传日期放在“季”之下、“集”之前，同一季不同日期上传的集自然分组。
+  s3:
+    enabled: true
+    # 敏感字段（endpoint_url/bucket/access_key/secret_key）优先从环境变量 / 同目录 .env 读取
+    endpoint_url: ""         # 环境变量 R2_ENDPOINT_URL
+    region: "auto"           # R2 固定用 auto
+    bucket: ""               # 环境变量 R2_BUCKET
+    prefix: ""               # 桶内根前缀（留空）：对象键直接从「发布年份/tmdbId/...」开始
+    access_key: ""           # 环境变量 R2_ACCESS_KEY
+    secret_key: ""           # 环境变量 R2_SECRET_KEY
+    upload_workers: 16       # 上传并发数
+    max_pending_uploads: 64  # 反压阈值：在途+排队上传数达到此值就阻塞下载，防磁盘撑爆
+    upload_retry_max: 5      # 单文件上传最大重试次数
+    upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避）
+    delete_local_after_upload: true   # 上传成功后删除本地 mp4（全量必开）
+  # ---- 磁盘水位监控（兜底）----
+  disk_guard:
+    enabled: true
+    high_watermark: 0.85     # 磁盘占用达到 85% 闸住新下载
+    low_watermark: 0.75      # 回落到 75% 以下恢复新下载
+    check_interval: 5        # 监控线程检查间隔（秒）
+
+
+# ----------------------------------------------------------------------------
+# fetch_subtitles.py —— 按 tmdb_id + season + episode 抓取外挂字幕
+# ----------------------------------------------------------------------------
+fetch_subtitles:
+  # SubDL API Key：敏感项，请配置到同目录 .env 的 SUBDL_API_KEY（见 .env.example）。
+  subdl_api_key: ""
+  # 输入：download_tv.py 的成功日志（一行一集）
+  success_log: "success.jsonl"
+  # 字幕输出根目录
+  subtitle_dir: "/mnt/MovieAndTVDownload/tv_subtitles"
+  # 已处理状态记录（断点续跑）
+  state_log: "subtitles.jsonl"
+  # 要抓取的语言：SubDL 语言代码 -> 输出文件后缀
+  languages:
+    EN: en
+    ZH: zh
+  # 并发与重试
+  max_workers: 4
+  request_timeout: 30
+  retry_max: 3
+  retry_delay: 3

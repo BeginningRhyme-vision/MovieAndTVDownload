@@ -1,39 +1,92 @@
 """
 IMDB 全量电视剧 + TMDB ID 转换 → JSONL
-titleType 覆盖：tvSeries, tvMiniSeries, tvSpecial, tvShort
-新增字段：total_seasons, total_episodes, episodes(分集列表)
+架构：预建 SQLite 索引（一次性），主流程流式处理，彻底避免大文件全量加载进内存
+titleType 覆盖：tvSeries, tvMiniSeries, tvSpecial, tvShort（可在 config.yaml 调整）
+相比电影版新增字段：total_seasons, total_episodes, episodes(分集列表，来自 IMDB title.episode)
+注意：IMDB 的季/集编号与 TMDB/vidup 可能不一致，此处的 episodes 仅作参考与筛选依据，
+取流阶段以 TMDB 的季集结构为准（见 tv_ids_to_links.py）。
 """
 
 import csv
 import gzip
 import json
+import os
 import time
 import logging
 import requests
 import shutil
 import sqlite3
 import threading
-import sys
 import pandas as pd
 import tmdbsimple as tmdb
+import yaml
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ========== 配置 ==========
-TMDB_API_KEY = "83ee7d0b61b4623ae794e741a5883d34"
+# ========== 配置（从 config.yaml 的 fetch_tv_metadata 段读取）==========
+CONFIG_PATH = Path(__file__).with_name("config.yaml")
+
+
+def _load_dotenv(path):
+    """轻量解析同目录 .env（KEY=VALUE，支持 # 注释与引号），不覆盖已存在的环境变量。
+    不引入 python-dotenv 依赖，保持最小改动。"""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+
+_load_dotenv(str(Path(__file__).with_name(".env")))
+
+
+def load_config() -> dict:
+    """读取项目统一配置文件中本脚本对应的段落。"""
+    if not CONFIG_PATH.exists():
+        raise SystemExit(f"找不到配置文件: {CONFIG_PATH}")
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        full = yaml.safe_load(f) or {}
+    cfg = full.get("fetch_tv_metadata")
+    if not isinstance(cfg, dict):
+        raise SystemExit("config.yaml 缺少 fetch_tv_metadata 配置段")
+    return cfg
+
+
+_CFG = load_config()
+
+# TMDB API Key：敏感项，优先取环境变量 TMDB_API_KEY（同目录 .env），
+# 缺省时才回退 config.yaml（便于本地调试）。
+TMDB_API_KEY = (os.environ.get("TMDB_API_KEY", "").strip()
+                or (_CFG.get("tmdb_api_key") or "").strip())
+if not TMDB_API_KEY:
+    raise SystemExit("请在 .env 配置 TMDB_API_KEY（或 config.yaml 的 fetch_tv_metadata.tmdb_api_key）")
 tmdb.API_KEY = TMDB_API_KEY
 
-DATA_DIR = Path("../movie/imdb_data")  # 与电影脚本共用同一份数据集
-INDEX_DB = DATA_DIR / "index.db"  # 共用同一份 SQLite 索引
-OUTPUT = Path("tv_series.jsonl")
-PROGRESS = Path("tv_progress.txt")  # 独立进度文件，不与电影混用
-LOG_PATH = Path("tv_fetch.log")
+DATA_DIR = Path(_CFG.get("data_dir", "imdb_data"))
+INDEX_DB = DATA_DIR / "index.db"  # 辅助索引库（akas/principals/names/episode）
+OUTPUT = Path(_CFG.get("output", "tv_series.jsonl"))
+PROGRESS = Path(_CFG.get("progress", "progress.txt"))
+LOG_PATH = Path(_CFG.get("log_path", "fetch.log"))
 
-# 电视剧相关的 titleType
-KEEP_TYPES = {"tvSeries", "tvMiniSeries", "tvSpecial", "tvShort"}
+KEEP_TYPES = set(_CFG.get("keep_types", ["tvSeries", "tvMiniSeries", "tvSpecial", "tvShort"]))
+MAX_WORKERS = int(_CFG.get("max_workers", 8))
+SLEEP = float(_CFG.get("sleep", 0.25))
 
-MAX_WORKERS = 15
-SLEEP = 0.1
+# 复用同一个 requests.Session：并发访问 TMDB 时共享 TCP 连接池，
+# 避免每次请求重复 DNS 解析 / TLS 握手，降低连接开销与偶发的连接重置。
+_SESSION = requests.Session()
+_SESSION.mount("https://", requests.adapters.HTTPAdapter(
+    pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS * 2,
+))
+tmdb.REQUESTS_SESSION = _SESSION
 
 BASE_URL = "https://datasets.imdbws.com/"
 DATASETS = {
@@ -76,9 +129,9 @@ def mark_done(imdb_id: str):
 class _Encoder(json.JSONEncoder):
     def default(self, obj):
         import numpy as np
-        if isinstance(obj, np.bool_):    return bool(obj)
-        if isinstance(obj, np.integer):  return int(obj)
-        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, (np.bool_,)):   return bool(obj)
+        if isinstance(obj, (np.integer,)): return int(obj)
+        if isinstance(obj, (np.floating,)): return float(obj)
         return super().default(obj)
 
 
@@ -108,124 +161,119 @@ def ensure_dataset(key: str) -> Path:
     return tsv_path
 
 
-# ========== 建 / 复用 SQLite 索引 ==========
+# ========== 建 SQLite 索引（只建一次）==========
 def build_index():
-    csv.field_size_limit(min(sys.maxsize, 10_000_000))
+    """把 akas / principals / names / episode 导入 SQLite，后续按 imdb_id 点查，无需全量加载"""
+    import sys
+    csv.field_size_limit(min(sys.maxsize, 10_000_000))  # 解除字段长度限制
     conn = sqlite3.connect(INDEX_DB)
     cur = conn.cursor()
-    tables = {r[0] for r in cur.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()}
 
-    # --- names（与电影共用，已存在跳过）---
-    if "names" not in tables:
-        log.info("建索引: names ...")
-        cur.execute("CREATE TABLE names (nconst TEXT PRIMARY KEY, primaryName TEXT)")
-        path = ensure_dataset("names")
-        with open(path, encoding="utf-8", errors="replace") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            batch = []
-            for row in reader:
-                batch.append((row["nconst"], row.get("primaryName", "")))
-                if len(batch) >= 50000:
-                    cur.executemany("INSERT OR IGNORE INTO names VALUES (?,?)", batch)
-                    batch = []
-            if batch:
-                cur.executemany("INSERT OR IGNORE INTO names VALUES (?,?)", batch)
+    def _index_ready(table: str) -> bool:
+        # 仅当"表存在且至少有一行数据"才算建好，避免上次插入途中崩溃留下的半成品空表被误判为完成
+        row = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone()
+        if not row:
+            return False
+        return cur.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
+
+    def build_table(name, create_sql, index_sql, insert_sql, dataset_key,
+                    row_to_tuple, reader_kwargs=None):
+        # 全有或全无：清掉可能的半成品表 -> 建表建索引 -> 批量插入 -> 提交；
+        # 中途任何异常（含 KeyboardInterrupt/SystemExit）回滚并删表，保证不留半成品
+        if _index_ready(name):
+            log.info(f"索引已存在跳过: {name}")
+            return
+        cur.execute(f"DROP TABLE IF EXISTS {name}")
         conn.commit()
-        log.info("建索引: names 完成")
-    else:
-        log.info("索引已存在跳过: names")
+        log.info(f"建索引: {name} ...")
+        try:
+            cur.execute(create_sql)
+            if index_sql:
+                cur.execute(index_sql)
+            path = ensure_dataset(dataset_key)
+            with open(path, encoding="utf-8", errors="replace") as f:
+                reader = csv.DictReader(f, delimiter="\t", **(reader_kwargs or {}))
+                batch = []
+                for row in reader:
+                    rec = row_to_tuple(row)
+                    if rec is None:
+                        continue
+                    batch.append(rec)
+                    if len(batch) >= 50000:
+                        cur.executemany(insert_sql, batch)
+                        batch = []
+                if batch:
+                    cur.executemany(insert_sql, batch)
+            conn.commit()
+            log.info(f"建索引: {name} 完成")
+        except BaseException:
+            conn.rollback()
+            cur.execute(f"DROP TABLE IF EXISTS {name}")
+            conn.commit()
+            log.error(f"建索引: {name} 失败，已回滚并清除半成品表")
+            raise
 
-    # --- akas（与电影共用）---
-    if "akas" not in tables:
-        log.info("建索引: akas ...")
-        cur.execute("""CREATE TABLE akas (
+    # --- names ---
+    build_table(
+        "names",
+        "CREATE TABLE names (nconst TEXT PRIMARY KEY, primaryName TEXT)",
+        None,
+        "INSERT OR IGNORE INTO names VALUES (?,?)",
+        "names",
+        lambda row: (row["nconst"], row.get("primaryName", "")),
+    )
+
+    # --- akas ---
+    _akas_cols = ["titleId", "ordering", "title", "region", "language", "types", "attributes", "isOriginalTitle"]
+    build_table(
+        "akas",
+        """CREATE TABLE akas (
             titleId TEXT, ordering TEXT, title TEXT, region TEXT,
             language TEXT, types TEXT, attributes TEXT, isOriginalTitle TEXT
-        )""")
-        cur.execute("CREATE INDEX idx_akas_titleId ON akas(titleId)")
-        path = ensure_dataset("akas")
-        with open(path, encoding="utf-8", errors="replace") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            batch = []
-            cols = ["titleId", "ordering", "title", "region", "language", "types", "attributes", "isOriginalTitle"]
-            for row in reader:
-                batch.append(tuple(row.get(c, "") for c in cols))
-                if len(batch) >= 50000:
-                    cur.executemany("INSERT INTO akas VALUES (?,?,?,?,?,?,?,?)", batch)
-                    batch = []
-            if batch:
-                cur.executemany("INSERT INTO akas VALUES (?,?,?,?,?,?,?,?)", batch)
-        conn.commit()
-        log.info("建索引: akas 完成")
-    else:
-        log.info("索引已存在跳过: akas")
+        )""",
+        "CREATE INDEX idx_akas_titleId ON akas(titleId)",
+        "INSERT INTO akas VALUES (?,?,?,?,?,?,?,?)",
+        "akas",
+        lambda row: tuple(row.get(c, "") for c in _akas_cols),
+    )
 
-    # --- principals（与电影共用）---
-    if "principals" not in tables:
-        log.info("建索引: principals ...")
-        cur.execute("""CREATE TABLE principals (
+    # --- principals ---
+    _principals_cols = ["tconst", "ordering", "nconst", "category", "job", "characters"]
+    build_table(
+        "principals",
+        """CREATE TABLE principals (
             tconst TEXT, ordering TEXT, nconst TEXT,
             category TEXT, job TEXT, characters TEXT
-        )""")
-        cur.execute("CREATE INDEX idx_principals_tconst ON principals(tconst)")
-        path = ensure_dataset("principals")
-        with open(path, encoding="utf-8", errors="replace") as f:
-            reader = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
-            batch = []
-            cols = ["tconst", "ordering", "nconst", "category", "job", "characters"]
-            for row in reader:
-                try:
-                    batch.append(tuple(row.get(c, "") for c in cols))
-                except Exception:
-                    continue
-                if len(batch) >= 50000:
-                    cur.executemany("INSERT INTO principals VALUES (?,?,?,?,?,?)", batch)
-                    batch = []
-            if batch:
-                cur.executemany("INSERT INTO principals VALUES (?,?,?,?,?,?)", batch)
-        conn.commit()
-        log.info("建索引: principals 完成")
-    else:
-        log.info("索引已存在跳过: principals")
+        )""",
+        "CREATE INDEX idx_principals_tconst ON principals(tconst)",
+        "INSERT INTO principals VALUES (?,?,?,?,?,?)",
+        "principals",
+        lambda row: tuple(row.get(c, "") for c in _principals_cols),
+        reader_kwargs={"quoting": csv.QUOTE_NONE},
+    )
 
-    # --- episode（电视剧专属）---
-    if "episode" not in tables:
-        log.info("建索引: episode ...")
-        cur.execute("""CREATE TABLE episode (
-            tconst TEXT PRIMARY KEY,
-            parentTconst TEXT,
-            seasonNumber TEXT,
-            episodeNumber TEXT
-        )""")
-        cur.execute("CREATE INDEX idx_episode_parent ON episode(parentTconst)")
-        path = ensure_dataset("episode")
-        with open(path, encoding="utf-8", errors="replace") as f:
-            reader = csv.DictReader(f, delimiter="\t")
-            batch = []
-            for row in reader:
-                batch.append((
-                    row.get("tconst", ""),
-                    row.get("parentTconst", ""),
-                    row.get("seasonNumber", ""),
-                    row.get("episodeNumber", ""),
-                ))
-                if len(batch) >= 50000:
-                    cur.executemany("INSERT OR IGNORE INTO episode VALUES (?,?,?,?)", batch)
-                    batch = []
-            if batch:
-                cur.executemany("INSERT OR IGNORE INTO episode VALUES (?,?,?,?)", batch)
-        conn.commit()
-        log.info("建索引: episode 完成")
-    else:
-        log.info("索引已存在跳过: episode")
+    # --- episode（电视剧专属：按 parentTconst 点查某剧的全部分集）---
+    _episode_cols = ["tconst", "parentTconst", "seasonNumber", "episodeNumber"]
+    build_table(
+        "episode",
+        """CREATE TABLE episode (
+            tconst TEXT PRIMARY KEY, parentTconst TEXT,
+            seasonNumber TEXT, episodeNumber TEXT
+        )""",
+        "CREATE INDEX idx_episode_parent ON episode(parentTconst)",
+        "INSERT OR IGNORE INTO episode VALUES (?,?,?,?)",
+        "episode",
+        lambda row: tuple(row.get(c, "") for c in _episode_cols),
+    )
 
     conn.close()
     log.info("SQLite 索引全部就绪")
 
 
-# ========== 线程本地 SQLite 连接 ==========
+# ========== 按需查询索引 ==========
+# 每个线程独立连接
 _local = threading.local()
 
 
@@ -262,15 +310,27 @@ def query_principals(imdb_id: str, names_dict: dict) -> list:
     return result
 
 
-def query_name(nconst: str) -> str:
-    r = get_conn().execute("SELECT primaryName FROM names WHERE nconst=?", (nconst,)).fetchone()
-    return r[0] if r else nconst
+def query_name(nconst: str, names_dict: dict) -> str:
+    # 统一从内存字典取名，与 cast_crew(query_principals) 共用同一数据来源，
+    # 避免同一份 names 表既走内存又走 SQLite 造成的重复存储与潜在不一致。
+    # 保留原语义：查不到时回退为 nconst 本身。
+    return names_dict.get(nconst, nconst)
+
+
+def _to_int_or_none(v):
+    if v is None or v in ("", "\\N"):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def query_episodes(imdb_id: str, ratings) -> dict:
-    """返回 {total_seasons, total_episodes, episodes: [...]}"""
+    """返回 {total_seasons, total_episodes, episodes: [...]}
+    season/episode 为 IMDB 编号（可能为 None，IMDB 中存在未归季的集）。"""
     rows = get_conn().execute(
-        "SELECT tconst,seasonNumber,episodeNumber FROM episode WHERE parentTconst=? ORDER BY seasonNumber+0, episodeNumber+0",
+        "SELECT tconst,seasonNumber,episodeNumber FROM episode WHERE parentTconst=?",
         (imdb_id,)
     ).fetchall()
     if not rows:
@@ -279,17 +339,22 @@ def query_episodes(imdb_id: str, ratings) -> dict:
     episodes = []
     seasons = set()
     for tconst, season, ep_num in rows:
+        s = _to_int_or_none(season)
+        e = _to_int_or_none(ep_num)
         rat = ratings.loc[tconst] if tconst in ratings.index else None
         episodes.append({
             "episode_imdb_id": tconst,
-            "season": None if season in ("", "\\N") else int(season) if season.isdigit() else season,
-            "episode": None if ep_num in ("", "\\N") else int(ep_num) if ep_num.isdigit() else ep_num,
+            "season": s,
+            "episode": e,
             "rating": None if rat is None else float(rat["averageRating"]),
             "votes": None if rat is None else int(rat["numVotes"]),
         })
-        if season and season not in ("", "\\N"):
-            seasons.add(season)
+        if s is not None:
+            seasons.add(s)
 
+    # 在 Python 侧排序，None 排最后，避免 SQL 中 "seasonNumber+0" 对 \N 的隐式转换
+    episodes.sort(key=lambda x: (x["season"] is None, x["season"] or 0,
+                                 x["episode"] is None, x["episode"] or 0))
     return {
         "total_seasons": len(seasons) if seasons else None,
         "total_episodes": len(episodes),
@@ -297,7 +362,7 @@ def query_episodes(imdb_id: str, ratings) -> dict:
     }
 
 
-# ========== 加载小文件 ==========
+# ========== 加载小文件（全量，内存够用）==========
 def load_basics() -> pd.DataFrame:
     path = ensure_dataset("basics")
     df = pd.read_csv(path, sep="\t", na_values="\\N", low_memory=False)
@@ -307,8 +372,16 @@ def load_basics() -> pd.DataFrame:
     df["runtimeMinutes"] = pd.to_numeric(df["runtimeMinutes"], errors="coerce")
     df["isAdult"] = df["isAdult"].map({"0": False, "1": True, 0: False, 1: True})
     df["genres"] = df["genres"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
+    df = df.set_index("tconst")
+    # tconst 理论上唯一，但对索引去重可防御脏数据：
+    # 若存在重复 tconst，basics.loc[imdb_id] 会返回多行 DataFrame 而非单行 Series，
+    # 导致后续 row.get(...) 取值异常。保留首次出现的记录。
+    dup = df.index.duplicated(keep="first")
+    if dup.any():
+        log.warning(f"basics: 发现 {int(dup.sum()):,} 个重复 tconst，已保留首次出现的记录")
+        df = df[~dup]
     log.info(f"basics (TV): {len(df):,} 条")
-    return df.set_index("tconst")
+    return df
 
 
 def load_ratings() -> pd.DataFrame:
@@ -316,8 +389,13 @@ def load_ratings() -> pd.DataFrame:
     df = pd.read_csv(path, sep="\t", na_values="\\N")
     df["averageRating"] = pd.to_numeric(df["averageRating"], errors="coerce")
     df["numVotes"] = pd.to_numeric(df["numVotes"], errors="coerce")
+    df = df.set_index("tconst")
+    dup = df.index.duplicated(keep="first")
+    if dup.any():
+        log.warning(f"ratings: 发现 {int(dup.sum()):,} 个重复 tconst，已保留首次出现的记录")
+        df = df[~dup]
     log.info(f"ratings: {len(df):,} 条")
-    return df.set_index("tconst")
+    return df
 
 
 def load_crew() -> pd.DataFrame:
@@ -325,11 +403,17 @@ def load_crew() -> pd.DataFrame:
     df = pd.read_csv(path, sep="\t", na_values="\\N")
     df["directors"] = df["directors"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df["writers"] = df["writers"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
+    df = df.set_index("tconst")
+    dup = df.index.duplicated(keep="first")
+    if dup.any():
+        log.warning(f"crew: 发现 {int(dup.sum()):,} 个重复 tconst，已保留首次出现的记录")
+        df = df[~dup]
     log.info(f"crew: {len(df):,} 条")
-    return df.set_index("tconst")
+    return df
 
 
 def load_names_dict() -> dict:
+    """从 SQLite 读全量 names 到内存（约 100MB，可接受）"""
     conn = sqlite3.connect(INDEX_DB)
     rows = conn.execute("SELECT nconst, primaryName FROM names").fetchall()
     conn.close()
@@ -341,7 +425,7 @@ def get_tmdb_id(imdb_id: str, retry: int = 3):
     for attempt in range(retry):
         try:
             result = tmdb.Find(imdb_id).info(external_source="imdb_id")
-            tv = result.get("tv_results", [])  # ← 电视剧用 tv_results
+            tv = result.get("tv_results", [])  # 电视剧用 tv_results
             return tv[0]["id"] if tv else None
         except Exception as e:
             if "429" in str(e):
@@ -365,8 +449,8 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
     rat = ratings.loc[imdb_id] if imdb_id in ratings.index else None
     cr = crew.loc[imdb_id] if imdb_id in crew.index else None
 
-    directors = [query_name(n) for n in (cr["directors"] if cr is not None else [])]
-    writers = [query_name(n) for n in (cr["writers"] if cr is not None else [])]
+    directors = [query_name(n, names_dict) for n in (cr["directors"] if cr is not None else [])]
+    writers = [query_name(n, names_dict) for n in (cr["writers"] if cr is not None else [])]
 
     ep_info = query_episodes(imdb_id, ratings)
 
@@ -387,7 +471,7 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
         "writers": writers,
         "cast_crew": query_principals(imdb_id, names_dict),
         "akas": query_akas(imdb_id),
-        # 电视剧专属
+        # 电视剧专属（IMDB 视角）
         "total_seasons": ep_info["total_seasons"],
         "total_episodes": ep_info["total_episodes"],
         "episodes": ep_info["episodes"],
@@ -400,19 +484,23 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
 
 # ========== 主流程 ==========
 def main():
+    # 1. 确保所有数据集已下载
     log.info("=== 检查数据集 ===")
     for key in DATASETS:
         ensure_dataset(key)
 
+    # 2. 建 SQLite 索引（已建则秒过）
     log.info("=== 建立索引 ===")
     build_index()
 
+    # 3. 加载小文件
     log.info("=== 加载小文件 ===")
     basics = load_basics()
     ratings = load_ratings()
     crew = load_crew()
     names_dict = load_names_dict()
 
+    # 4. 开始处理
     done = load_done()
     pending = [iid for iid in basics.index if iid not in done]
     total = len(pending)
@@ -425,8 +513,10 @@ def main():
             result = process(imdb_id, basics, ratings, crew, names_dict)
             return "ok" if result else "skip"
         except Exception as e:
-            log.error(f"{imdb_id} 异常: {e}")
-            mark_done(imdb_id)
+            # 注意：这里不能 mark_done。异常代表本条“未成功处理”，
+            # 若标记为已完成，重跑时会跳过它，造成静默丢数据。
+            # 不标记则下次运行会自动重试该 imdb_id。
+            log.error(f"{imdb_id} 异常（将于下次运行重试）: {e}")
             return "error"
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:

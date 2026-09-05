@@ -1,0 +1,19 @@
+# TVDownloader 流水线依赖（第三方，标准库不列）
+# 服务器部署：python -m venv .venv && .venv/bin/pip install -r requirements.txt
+# 不锁版本，按最新兼容版安装。
+
+# 通用 HTTP / 配置
+requests
+urllib3
+pyyaml
+
+# 抓取链接与探针（浏览器指纹伪装的 HTTP 客户端）
+curl_cffi
+
+# R2 / S3 兼容对象存储上传（download_tv.py）
+boto3
+botocore
+
+# 元数据抓取阶段（fetch_tv_metadata.py / tv_ids_to_links.py 季集展开）
+pandas
+tmdbsimple
