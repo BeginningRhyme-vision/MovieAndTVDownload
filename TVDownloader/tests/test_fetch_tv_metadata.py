@@ -67,8 +67,8 @@ def test_query_episodes_sorting_and_none_last(episode_db):
     out = m.query_episodes("ttP", ratings)
 
     assert out["total_episodes"] == 6
-    # seasons counted only for numbered seasons: {0, 1, 2}
-    assert out["total_seasons"] == 3
+    # seasons counted only for numbered, non-special seasons: {1, 2}; S0 excluded
+    assert out["total_seasons"] == 2
 
     order = [(e["season"], e["episode"]) for e in out["episodes"]]
     assert order == [(0, 1), (1, 1), (1, 2), (1, None), (2, 1), (None, None)]
@@ -91,6 +91,19 @@ def test_query_episodes_only_unnumbered(episode_db):
     assert out["total_seasons"] is None
     assert out["total_episodes"] == 1
     assert out["episodes"][0]["season"] is None
+
+
+def test_query_episodes_only_specials_has_no_seasons(episode_db):
+    # A show whose IMDB episodes are all in season 0 has 0 "real" seasons -> None,
+    # but the specials still count toward total_episodes (they are downloadable).
+    episode_db.executemany(
+        "INSERT INTO episode VALUES (?,?,?,?)",
+        [("tt1", "ttP", "0", "1"), ("tt2", "ttP", "0", "2")],
+    )
+    out = m.query_episodes("ttP", _make_ratings([]))
+    assert out["total_seasons"] is None
+    assert out["total_episodes"] == 2
+    assert [e["season"] for e in out["episodes"]] == [0, 0]
 
 
 # ---------------------------------------------------------------- load_basics
@@ -160,18 +173,23 @@ def fake_find(monkeypatch):
 
 def test_get_tmdb_id_found(fake_find):
     fake_find.script = [{"tv_results": [{"id": 1399}], "movie_results": []}]
-    assert m.get_tmdb_id("tt0944947") == 1399
+    assert m.get_tmdb_id("tt0944947") == (1399, None)
 
 
-def test_get_tmdb_id_not_in_tmdb_returns_none(fake_find):
-    # Genuine "not found" (e.g. tvSpecial landing in movie_results) -> None, caller marks done.
+def test_get_tmdb_id_movie_only_returns_movie_bucket(fake_find):
+    # tvSpecial landing in movie_results: tv None, movie id carried back for the side output.
     fake_find.script = [{"tv_results": [], "movie_results": [{"id": 1}]}]
-    assert m.get_tmdb_id("tt1") is None
+    assert m.get_tmdb_id("tt1") == (None, 1)
+
+
+def test_get_tmdb_id_nothing_found(fake_find):
+    fake_find.script = [{"tv_results": [], "movie_results": []}]
+    assert m.get_tmdb_id("tt1") == (None, None)
 
 
 def test_get_tmdb_id_transient_error_then_success(fake_find):
     fake_find.script = [RuntimeError("boom"), {"tv_results": [{"id": 7}]}]
-    assert m.get_tmdb_id("tt1") == 7
+    assert m.get_tmdb_id("tt1") == (7, None)
     assert fake_find.calls == 2
 
 
@@ -185,7 +203,7 @@ def test_get_tmdb_id_persistent_failure_raises_not_none(fake_find):
 
 def test_get_tmdb_id_429_does_not_consume_retries(fake_find):
     fake_find.script = [RuntimeError("429 Too Many Requests")] * 4 + [{"tv_results": [{"id": 9}]}]
-    assert m.get_tmdb_id("tt1", retry=3) == 9
+    assert m.get_tmdb_id("tt1", retry=3) == (9, None)
     assert fake_find.calls == 5
 
 
@@ -211,10 +229,100 @@ def test_process_none_marks_done_and_skips(monkeypatch):
     marked, written = [], []
     monkeypatch.setattr(m, "mark_done", lambda iid: marked.append(iid))
     monkeypatch.setattr(m, "commit_record", lambda rec, iid: written.append((rec, iid)))
-    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: None)
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (None, None))
     monkeypatch.setattr(m.time, "sleep", lambda s: None)
-    assert m.process("tt1", None, None, None, {}) is None
+    assert m.process("tt1", None, None, None, {}) == "skip"
     assert marked == ["tt1"] and written == []
+
+
+def test_process_movie_only_goes_to_side_output_not_mark_done(monkeypatch):
+    marked, written, side = [], [], []
+    monkeypatch.setattr(m, "mark_done", lambda iid: marked.append(iid))
+    monkeypatch.setattr(m, "commit_record", lambda rec, iid: written.append((rec, iid)))
+    monkeypatch.setattr(m, "commit_as_movie", lambda iid, mid, tt: side.append((iid, mid, tt)))
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (None, 123))
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    basics = pd.DataFrame({"titleType": ["tvSpecial"]}, index=pd.Index(["tt1"], name="tconst"))
+    assert m.process("tt1", basics, None, None, {}) == "as_movie"
+    assert side == [("tt1", 123, "tvSpecial")]
+    assert marked == [] and written == []  # commit_as_movie owns the progress write
+
+
+# ---------------------------------------------------------------- commit_as_movie (tsv + progress in one lock)
+def test_commit_as_movie_writes_tsv_and_progress(monkeypatch, tmp_path):
+    side, prog = tmp_path / "tv_as_movie.tsv", tmp_path / "progress.txt"
+    monkeypatch.setattr(m, "AS_MOVIE_OUTPUT", side)
+    monkeypatch.setattr(m, "PROGRESS", prog)
+    m.commit_as_movie("tt1", 123, "tvSpecial")
+    m.commit_as_movie("tt2", 456, None)
+    assert side.read_text(encoding="utf-8") == "tt1\t123\ttvSpecial\ntt2\t456\t\n"
+    assert prog.read_text(encoding="utf-8").split() == ["tt1", "tt2"]
+
+
+# ---------------------------------------------------------------- run_pool (bounded window + clean Ctrl+C)
+def test_run_pool_counts_all_statuses(monkeypatch):
+    monkeypatch.setattr(m.log, "info", lambda *a, **k: None)
+    outcomes = {"a": "ok", "b": "as_movie", "c": "skip", "d": "error", "e": "ok", "f": "weird"}
+    stats = m.run_pool(list(outcomes), lambda i: outcomes[i], max_workers=2, window=2)
+    assert stats == {"ok": 2, "as_movie": 1, "skip": 1, "error": 2}  # unknown status -> error
+
+
+def test_run_pool_empty_pending():
+    assert m.run_pool([], lambda i: "ok", max_workers=2) == {"ok": 0, "as_movie": 0, "skip": 0, "error": 0}
+
+
+def test_run_pool_window_bounds_in_flight(monkeypatch):
+    import threading
+    monkeypatch.setattr(m.log, "info", lambda *a, **k: None)
+    lock = threading.Lock()
+    active, peak = [0], [0]
+
+    def job(i):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        import time as _t
+        _t.sleep(0.005)
+        with lock:
+            active[0] -= 1
+        return "ok"
+
+    stats = m.run_pool(list(range(40)), job, max_workers=8, window=3)
+    assert stats["ok"] == 40
+    assert peak[0] <= 3  # never more than `window` tasks running, even with 8 workers
+
+
+def test_run_pool_keyboard_interrupt_cancels_pending_and_reraises(monkeypatch):
+    import threading
+    infos, warns = [], []
+    monkeypatch.setattr(m.log, "info", lambda msg, *a, **k: infos.append(msg))
+    monkeypatch.setattr(m.log, "warning", lambda msg, *a, **k: warns.append(msg))
+    started = []
+    gate = threading.Event()
+
+    def job(i):
+        started.append(i)
+        gate.wait(1)
+        return "ok"
+
+    real_wait = m.wait
+    calls = [0]
+
+    def wait_then_interrupt(*a, **k):
+        # First poll returns normally; second poll simulates Ctrl+C arriving in the main thread.
+        calls[0] += 1
+        if calls[0] == 1:
+            gate.set()
+            return real_wait(*a, **k)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(m, "wait", wait_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        m.run_pool(list(range(100)), job, max_workers=2, window=2)
+    # Only the window's worth of tasks (plus refills before the interrupt) ever started; the
+    # remaining ~90 were never submitted, so Ctrl+C returned promptly instead of draining 100.
+    assert len(started) < 100
+    assert any("中断退出" in w for w in warns)
 
 
 # ---------------------------------------------------------------- commit_record (jsonl + progress in one lock)

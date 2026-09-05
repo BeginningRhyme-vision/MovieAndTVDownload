@@ -33,9 +33,12 @@ fetch_tv_metadata:
   #   - tvEpisode：分集本身，占 title.basics 总行数 80%+；分集信息由 title.episode
   #                表展开（见 query_episodes），若收进来每部剧会重复出现几百条。
   #   - tvMovie  ：电视电影，单文件、无季集结构；TMDB Find 接口把它归到
-  #                movie_results 而非 tv_results（代码只取 tv_results，收了也是空），
-  #                且下游 S01/E01 下载路径不适用。应由电影版 pipeline 处理。
+  #                movie_results 而非 tv_results，且下游 S01/E01 下载路径不适用。
+  #                应由电影版 pipeline 处理。若收进本列表，会被写入 as_movie_output
+  #                旁路文件而非 output（见下方说明）。
   #   - tvPilot  ：未成剧的试播集，数量极少且大多无资源，忽略。
+  # 注意：tvSpecial / tvShort 在 TMDB 里也常被建模为 movie，同样走旁路文件；
+  # 保留在列表里是因为仍有相当一部分特辑在 TMDB 里挂在剧集的 Specials 季下。
   # 首次跑完后可用下面命令实际核对本地数据集中的取值分布：
   #   gzip -dc imdb_data/title.basics.tsv.gz | cut -f2 | sort | uniq -c
   keep_types:
@@ -56,6 +59,10 @@ fetch_tv_metadata:
   data_dir: "imdb_data"
   # 最终输出的电视剧元数据文件（下游 filter_to_ids.py 的输入）
   output: "tv_series.jsonl"
+  # 旁路输出：IMDB 标为 TV 类型但 TMDB 只在 movie_results 里有记录的条目
+  # （多为 tvSpecial / tvShort）。TV pipeline 无法处理，留档给电影版 pipeline 接手。
+  # 无表头 TSV，三列：imdb_id \t tmdb_movie_id \t imdb_titleType
+  as_movie_output: "tv_as_movie.tsv"
   # 断点续跑的进度记录文件（记录已处理的 imdb_id）
   progress: "progress.txt"
   # 运行日志文件

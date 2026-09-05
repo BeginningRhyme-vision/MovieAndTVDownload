@@ -22,7 +22,7 @@ import pandas as pd
 import tmdbsimple as tmdb
 import yaml
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 # ========== 配置（从 config.yaml 的 fetch_tv_metadata 段读取）==========
 CONFIG_PATH = Path(__file__).with_name("config.yaml")
@@ -86,6 +86,9 @@ INDEX_DB = DATA_DIR / "index.db"  # 辅助索引库（akas/principals/names/epis
 OUTPUT = _resolve(_CFG.get("output"), "tv_series.jsonl")
 PROGRESS = _resolve(_CFG.get("progress"), "progress.txt")
 LOG_PATH = _resolve(_CFG.get("log_path"), "fetch.log")
+# 旁路输出：IMDB 标为 TV 类型（多为 tvSpecial/tvShort），但 TMDB 把它建模成 movie 的条目。
+# TV pipeline 的 /tv/{id}/{s}/{e} 路径对它们不适用，留档供电影版 pipeline 接手。
+AS_MOVIE_OUTPUT = _resolve(_CFG.get("as_movie_output"), "tv_as_movie.tsv")
 
 KEEP_TYPES = set(_CFG.get("keep_types", ["tvSeries", "tvMiniSeries", "tvSpecial", "tvShort"]))
 MAX_WORKERS = int(_CFG.get("max_workers", 8))
@@ -123,7 +126,7 @@ DATASETS = {
 def _ensure_dirs():
     """data_dir / output / progress / log_path 都允许配成多层相对路径，统一预建父目录。"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    for p in (OUTPUT, PROGRESS, LOG_PATH):
+    for p in (OUTPUT, PROGRESS, LOG_PATH, AS_MOVIE_OUTPUT):
         p.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -149,6 +152,17 @@ def load_done() -> set:
 
 def mark_done(imdb_id: str):
     with _lock:
+        with open(PROGRESS, "a", encoding="utf-8") as f:
+            f.write(imdb_id + "\n")
+
+
+def commit_as_movie(imdb_id: str, tmdb_movie_id, title_type):
+    """TMDB 把该条目建模为 movie：写旁路 TSV（imdb_id\\ttmdb_movie_id\\ttitle_type）并标记完成。
+    与 commit_record 同理，两次写入在同一把锁内，顺序为先旁路后 progress。"""
+    line = f"{imdb_id}\t{tmdb_movie_id}\t{title_type or ''}\n"
+    with _lock:
+        with open(AS_MOVIE_OUTPUT, "a", encoding="utf-8") as f:
+            f.write(line)
         with open(PROGRESS, "a", encoding="utf-8") as f:
             f.write(imdb_id + "\n")
 
@@ -373,7 +387,10 @@ def _to_int_or_none(v):
 
 def query_episodes(imdb_id: str, ratings) -> dict:
     """返回 {total_seasons, total_episodes, episodes: [...]}
-    season/episode 为 IMDB 编号（可能为 None，IMDB 中存在未归季的集）。"""
+    season/episode 为 IMDB 编号（可能为 None，IMDB 中存在未归季的集）。
+    total_seasons 不计 season 0（特辑），与 TMDB number_of_seasons 及日常语义一致；
+    episodes / total_episodes 仍包含 S0，因为下游 include_specials=true 时特辑会实际下载，
+    总集数需要如实反映下载量。"""
     rows = get_conn().execute(
         "SELECT tconst,seasonNumber,episodeNumber FROM episode WHERE parentTconst=?",
         (imdb_id,)
@@ -399,7 +416,7 @@ def query_episodes(imdb_id: str, ratings) -> dict:
             "rating": None if pd.isna(rating) else float(rating),
             "votes": None if pd.isna(votes) else int(votes),
         })
-        if s is not None:
+        if s is not None and s != 0:
             seasons.add(s)
 
     # 在 Python 侧排序，None 排最后，避免 SQL 中 "seasonNumber+0" 对 \N 的隐式转换
@@ -468,7 +485,14 @@ def load_crew() -> pd.DataFrame:
 
 
 def load_names_dict() -> dict:
-    """从 SQLite 读全量 names 到内存（约 100MB，可接受）"""
+    """从 SQLite 读全量 names 到内存。
+
+    name.basics 约 1400 万条，Python dict + 两份 str 对象的开销实际约 2-3GB
+    （不是"约 100MB"）。保留全量字典的原因：process() 每条剧集要按 nconst 查
+    多个导演/编剧名，走 SQLite 点查会把热路径拖慢一个数量级；只装载被引用的
+    nconst 又需要先扫一遍 crew 表做集合运算，复杂度不划算。
+    要求运行机器有 >= 4GB 可用内存（与 keep_types 无关，names 表始终全量装载）。
+    """
     conn = sqlite3.connect(INDEX_DB)
     rows = conn.execute("SELECT nconst, primaryName FROM names").fetchall()
     conn.close()
@@ -482,7 +506,9 @@ class TMDBLookupError(RuntimeError):
 
 
 def get_tmdb_id(imdb_id: str, retry: int = 3):
-    """返回 TMDB tv id；TMDB 中无此剧返回 None；请求持续失败抛 TMDBLookupError。
+    """返回 (tv_id, movie_id)，各自在 TMDB 无对应结果时为 None；请求持续失败抛 TMDBLookupError。
+    TMDB Find 按媒体类型分桶：IMDB 标为 tvSpecial/tvShort 的条目常落在 movie_results，
+    这里把 movie 桶一并带回，由 process 决定走主输出还是旁路，不多耗一次 API。
     429 限速不消耗重试次数（限速是外部节奏问题，不是本条目的问题），
     但设有上限防止 TMDB 长时间限速时线程无限空转。"""
     last_err = None
@@ -491,8 +517,9 @@ def get_tmdb_id(imdb_id: str, retry: int = 3):
     while attempt < retry:
         try:
             result = tmdb.Find(imdb_id).info(external_source="imdb_id")
-            tv = result.get("tv_results", [])  # 电视剧用 tv_results
-            return tv[0]["id"] if tv else None
+            tv = result.get("tv_results") or []
+            movie = result.get("movie_results") or []
+            return (tv[0]["id"] if tv else None, movie[0]["id"] if movie else None)
         except Exception as e:
             last_err = e
             if "429" in str(e):
@@ -510,12 +537,17 @@ def get_tmdb_id(imdb_id: str, retry: int = 3):
 
 
 # ========== 处理单条 ==========
-def process(imdb_id: str, basics, ratings, crew, names_dict):
-    tmdb_id = get_tmdb_id(imdb_id)
+def process(imdb_id: str, basics, ratings, crew, names_dict) -> str:
+    """返回状态字符串：ok（写入主输出）/ as_movie（写入旁路）/ skip（TMDB 查无）。
+    TMDB 请求持续失败时抛 TMDBLookupError，由调用方决定不标记完成。"""
+    tmdb_id, movie_id = get_tmdb_id(imdb_id)
     time.sleep(SLEEP)
     if tmdb_id is None:
+        if movie_id is not None:
+            commit_as_movie(imdb_id, movie_id, basics.loc[imdb_id].get("titleType"))
+            return "as_movie"
         mark_done(imdb_id)
-        return None
+        return "skip"
 
     row = basics.loc[imdb_id]
     rat = ratings.loc[imdb_id] if imdb_id in ratings.index else None
@@ -550,10 +582,70 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
     }
 
     commit_record(record, imdb_id)
-    return imdb_id
+    return "ok"
 
 
 # ========== 主流程 ==========
+def _fmt_stats(stats: dict) -> str:
+    return (f"写入:{stats['ok']} 转电影:{stats['as_movie']} "
+            f"无TMDB:{stats['skip']} 失败:{stats['error']}")
+
+
+def run_pool(pending, job, max_workers: int, window: int = None, log_every: int = 200) -> dict:
+    """有界提交窗口地跑完 pending，返回各状态计数。
+
+    为什么不用一次性 submit 全部：
+    - 首跑 pending 有数十万条，一次性提交会常驻几十万个 Future 对象；
+    - `with ThreadPoolExecutor` 退出时 shutdown(wait=True) 会把队列里剩余任务全部跑完，
+      Ctrl+C 实际停不下来，只能 kill -9。
+    改为窗口内最多 window 个在飞，完成一个补一个；收到 KeyboardInterrupt 时停止补货并
+    cancel_futures 取消未开始的任务，只等在飞的那几个收尾，几秒内干净退出。
+    job 自身已吞掉所有 Exception 并返回 'error'，这里对 result() 不再兜底。"""
+    window = window or max_workers * 4
+    stats = {"ok": 0, "as_movie": 0, "skip": 0, "error": 0}
+    total = len(pending)
+    it = iter(pending)
+    in_flight = set()
+    finished = 0
+    interrupted = False
+
+    def _account(fut):
+        nonlocal finished
+        finished += 1
+        s = fut.result()
+        stats[s if s in stats else "error"] += 1
+        if log_every and finished % log_every == 0:
+            log.info(f"进度 {finished:,}/{total:,} | {_fmt_stats(stats)}")
+
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        for iid in it:
+            in_flight.add(executor.submit(job, iid))
+            if len(in_flight) >= window:
+                break
+        while in_flight:
+            done_set, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done_set:
+                _account(fut)
+            for iid in it:
+                in_flight.add(executor.submit(job, iid))
+                if len(in_flight) >= window:
+                    break
+    except KeyboardInterrupt:
+        interrupted = True
+        log.warning("收到中断，停止提交新任务，等待在飞任务收尾...")
+        executor.shutdown(wait=True, cancel_futures=True)
+        for fut in in_flight:
+            if fut.done() and not fut.cancelled():
+                _account(fut)
+        raise
+    finally:
+        executor.shutdown(wait=True)
+        if interrupted:
+            log.warning(f"中断退出：已完成 {finished:,}/{total:,} | {_fmt_stats(stats)}（未完成的下次运行自动续跑）")
+    return stats
+
+
 def main():
     # 1. 确保所有数据集已下载
     log.info("=== 检查数据集 ===")
@@ -574,15 +666,11 @@ def main():
     # 4. 开始处理
     done = load_done()
     pending = [iid for iid in basics.index if iid not in done]
-    total = len(pending)
-    log.info(f"已处理: {len(done):,}  待处理: {total:,}")
-
-    success = skipped = error = 0
+    log.info(f"已处理: {len(done):,}  待处理: {len(pending):,}")
 
     def job(imdb_id):
         try:
-            result = process(imdb_id, basics, ratings, crew, names_dict)
-            return "ok" if result else "skip"
+            return process(imdb_id, basics, ratings, crew, names_dict)
         except Exception as e:
             # 注意：这里不能 mark_done。异常代表本条“未成功处理”，
             # 若标记为已完成，重跑时会跳过它，造成静默丢数据。
@@ -590,21 +678,12 @@ def main():
             log.error(f"{imdb_id} 异常（将于下次运行重试）: {e}")
             return "error"
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(job, iid): iid for iid in pending}
-        for i, fut in enumerate(as_completed(futures), 1):
-            s = fut.result()
-            if s == "ok":
-                success += 1
-            elif s == "skip":
-                skipped += 1
-            else:
-                error += 1
-            if i % 200 == 0:
-                log.info(f"进度 {i:,}/{total:,} | 写入:{success} 无TMDB:{skipped} 失败:{error}")
+    stats = run_pool(pending, job, MAX_WORKERS)
 
-    log.info(f"全部完成！写入:{success} 无TMDB:{skipped} 失败:{error}")
+    log.info(f"全部完成！{_fmt_stats(stats)}")
     log.info(f"输出: {OUTPUT.resolve()}")
+    if stats["as_movie"]:
+        log.info(f"TMDB 建模为电影的条目已写入: {AS_MOVIE_OUTPUT.resolve()}（供电影版 pipeline 接手）")
 
 
 if __name__ == "__main__":
