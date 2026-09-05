@@ -94,6 +94,7 @@ TMDB_TIMEOUT = int(_CFG.get("tmdb_timeout", 15))
 TMDB_RETRIES = int(_CFG.get("tmdb_retries", 3))
 # TMDB append_to_response 单次最多附带 20 个子请求
 _TMDB_APPEND_LIMIT = 20
+_TMDB_MAX_429 = 5  # 单次请求最多容忍的 429 限流次数
 
 if not TMDB_API_KEY:
     raise SystemExit(
@@ -188,12 +189,19 @@ def _tmdb_get(path, params=None):
     if params:
         q.update(params)
     last = None
-    for attempt in range(1, TMDB_RETRIES + 1):
+    attempt = 0
+    throttled = 0
+    # 429 限流不计入 attempt（按 Retry-After 等待后原样重试），但设上限防止无限等待
+    while attempt < TMDB_RETRIES:
         try:
             resp = _tmdb_session.get(f"{TMDB_BASE}{path}", params=q, timeout=TMDB_TIMEOUT)
             if resp.status_code == 404:
                 raise TmdbNotFound(path)
             if resp.status_code == 429:
+                throttled += 1
+                last = Exception(f"HTTP 429 rate limited ({throttled}x)")
+                if throttled > _TMDB_MAX_429:
+                    break
                 wait = float(resp.headers.get("Retry-After", 2) or 2)
                 time.sleep(wait)
                 continue
@@ -205,6 +213,7 @@ def _tmdb_get(path, params=None):
             raise
         except Exception as e:
             last = e
+            attempt += 1
             if attempt < TMDB_RETRIES:
                 time.sleep(1.5 * attempt)
     raise Exception(f"TMDB request failed for {path}: {last}")
@@ -372,7 +381,6 @@ def process_episode(tid, season, episode):
       - "retry" 瞬时错误换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
     """
     label = _ep_label(tid, season, episode)
-    last_exception = None
     for attempt in range(1, MAX_RETRIES + 1):
         # 每集、每次重试用一个独立 Session：复用连接、绑定本次随机出口 IP
         with requests.Session(impersonate="chrome") as session:
@@ -475,7 +483,6 @@ def process_episode(tid, season, episode):
                 raise Exception(f"All servers failed for {label}. Last error: {last_server_error}")
 
             except Exception as e:
-                last_exception = e
                 if not _is_retriable(e):
                     print(f"  [无源 404] {label}: {e}")
                     return "dead", None
