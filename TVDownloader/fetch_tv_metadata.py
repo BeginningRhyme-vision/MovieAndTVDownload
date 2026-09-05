@@ -70,11 +70,21 @@ if not TMDB_API_KEY:
     raise SystemExit("请在 .env 配置 TMDB_API_KEY（或 config.yaml 的 fetch_tv_metadata.tmdb_api_key）")
 tmdb.API_KEY = TMDB_API_KEY
 
-DATA_DIR = Path(_CFG.get("data_dir", "imdb_data"))
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _resolve(value, default_name) -> Path:
+    """Resolve config paths relative to the script directory (not CWD), consistent
+    with the other TVDownloader scripts, so `imdb_data/` stays isolated from MovieDownloader."""
+    raw = (value or "").strip() or default_name
+    return (_SCRIPT_DIR / raw).resolve()
+
+
+DATA_DIR = _resolve(_CFG.get("data_dir"), "imdb_data")
 INDEX_DB = DATA_DIR / "index.db"  # 辅助索引库（akas/principals/names/episode）
-OUTPUT = Path(_CFG.get("output", "tv_series.jsonl"))
-PROGRESS = Path(_CFG.get("progress", "progress.txt"))
-LOG_PATH = Path(_CFG.get("log_path", "fetch.log"))
+OUTPUT = _resolve(_CFG.get("output"), "tv_series.jsonl")
+PROGRESS = _resolve(_CFG.get("progress"), "progress.txt")
+LOG_PATH = _resolve(_CFG.get("log_path"), "fetch.log")
 
 KEEP_TYPES = set(_CFG.get("keep_types", ["tvSeries", "tvMiniSeries", "tvSpecial", "tvShort"]))
 MAX_WORKERS = int(_CFG.get("max_workers", 8))
@@ -336,18 +346,23 @@ def query_episodes(imdb_id: str, ratings) -> dict:
     if not rows:
         return {"total_seasons": None, "total_episodes": 0, "episodes": []}
 
+    # Batch-fetch ratings with a single reindex: long-running shows (daily soaps)
+    # can have 10k+ episodes, and per-episode `.loc` is ~100x slower than one reindex.
+    sub = ratings.reindex([r[0] for r in rows])
+    rating_vals = sub["averageRating"].tolist()
+    votes_vals = sub["numVotes"].tolist()
+
     episodes = []
     seasons = set()
-    for tconst, season, ep_num in rows:
+    for (tconst, season, ep_num), rating, votes in zip(rows, rating_vals, votes_vals):
         s = _to_int_or_none(season)
         e = _to_int_or_none(ep_num)
-        rat = ratings.loc[tconst] if tconst in ratings.index else None
         episodes.append({
             "episode_imdb_id": tconst,
             "season": s,
             "episode": e,
-            "rating": None if rat is None else float(rat["averageRating"]),
-            "votes": None if rat is None else int(rat["numVotes"]),
+            "rating": None if pd.isna(rating) else float(rating),
+            "votes": None if pd.isna(votes) else int(votes),
         })
         if s is not None:
             seasons.add(s)
