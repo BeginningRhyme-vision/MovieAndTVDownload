@@ -25,11 +25,12 @@ from typing import Optional
 
 import yaml
 
-# ========== 路径配置 ==========
-SERIES = Path("tv_series.jsonl")
-CONFIG = Path("filter_config.yaml")
-OUTPUT_IDS = Path("ids.txt")
-OUTPUT_DETAIL = Path("filtered.jsonl")
+# ========== 路径配置（相对脚本目录，与其余 TVDownloader 脚本一致）==========
+_SCRIPT_DIR = Path(__file__).resolve().parent
+SERIES = _SCRIPT_DIR / "tv_series.jsonl"
+CONFIG = _SCRIPT_DIR / "filter_config.yaml"
+OUTPUT_IDS = _SCRIPT_DIR / "ids.txt"
+OUTPUT_DETAIL = _SCRIPT_DIR / "filtered.jsonl"
 
 
 # ========== 配置加载 ==========
@@ -268,7 +269,11 @@ def main():
             seen.add(tid)
 
             fids.write(tid + "\n")
-            fdetail.write(json.dumps(show, ensure_ascii=False) + "\n")
+            # Drop the per-episode list from the review file: long-running shows carry
+            # thousands of episodes per row and would bloat filtered.jsonl for no gain.
+            # Season/episode totals are kept; the full list stays in tv_series.jsonl.
+            detail = {k: v for k, v in show.items() if k != "episodes"}
+            fdetail.write(json.dumps(detail, ensure_ascii=False) + "\n")
             kept += 1
 
     print(
