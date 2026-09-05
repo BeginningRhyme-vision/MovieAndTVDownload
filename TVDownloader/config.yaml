@@ -71,6 +71,20 @@ fetch_tv_metadata:
 
 
 # ----------------------------------------------------------------------------
+# filter_to_ids.py —— 按 filter_config.yaml 从 tv_series.jsonl 中筛出要下载的剧
+# ----------------------------------------------------------------------------
+filter_to_ids:
+  # 输入：fetch_tv_metadata.py 的产物（应与上面 fetch_tv_metadata.output 一致）
+  input: "tv_series.jsonl"
+  # 筛选规则文件（各筛选项的开关与阈值都在这里，本段只管路径）
+  filter_config: "filter_config.yaml"
+  # 输出：通过筛选的剧 tmdb_id 列表，一行一个（应与下面 tv_ids_to_links.input 一致）
+  output_ids: "ids.txt"
+  # 输出：通过筛选的剧明细（不含 episodes 列表），仅供人工复核
+  output_detail: "filtered.jsonl"
+
+
+# ----------------------------------------------------------------------------
 # tv_ids_to_links.py —— 由 tmdb_id 展开季集结构，并逐集解析出可播放的 m3u8 地址
 # ----------------------------------------------------------------------------
 tv_ids_to_links:

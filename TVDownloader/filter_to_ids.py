@@ -19,18 +19,38 @@
 """
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Optional
 
 import yaml
 
-# ========== 路径配置（相对脚本目录，与其余 TVDownloader 脚本一致）==========
+# ========== 路径配置（来自 config.yaml 的 filter_to_ids 段；相对脚本目录，与其余脚本一致）==========
 _SCRIPT_DIR = Path(__file__).resolve().parent
-SERIES = _SCRIPT_DIR / "tv_series.jsonl"
-CONFIG = _SCRIPT_DIR / "filter_config.yaml"
-OUTPUT_IDS = _SCRIPT_DIR / "ids.txt"
-OUTPUT_DETAIL = _SCRIPT_DIR / "filtered.jsonl"
+CONFIG_PATH = _SCRIPT_DIR / "config.yaml"
+
+
+def _load_paths_config() -> dict:
+    """读取 config.yaml 的 filter_to_ids 段；文件或段落缺失时返回空字典（全部走默认文件名）。"""
+    if not CONFIG_PATH.exists():
+        return {}
+    with open(CONFIG_PATH, encoding="utf-8") as f:
+        full = yaml.safe_load(f) or {}
+    cfg = full.get("filter_to_ids")
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _resolve(value, default_name: str) -> Path:
+    raw = (value or "").strip() if isinstance(value, str) else ""
+    return (_SCRIPT_DIR / (raw or default_name)).resolve()
+
+
+_CFG = _load_paths_config()
+SERIES = _resolve(_CFG.get("input"), "tv_series.jsonl")
+CONFIG = _resolve(_CFG.get("filter_config"), "filter_config.yaml")
+OUTPUT_IDS = _resolve(_CFG.get("output_ids"), "ids.txt")
+OUTPUT_DETAIL = _resolve(_CFG.get("output_detail"), "filtered.jsonl")
 
 
 # ========== 配置加载 ==========
@@ -40,7 +60,30 @@ def load_config(path: Path) -> dict:
         print(f"警告: 未找到配置文件 {path}，将不做任何筛选")
         return {}
     with open(path, encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        data = yaml.safe_load(f) or {}
+    # 顶层写成列表/标量（如漏了键名只写值）会让后续 config.get / config[key] 直接 traceback，
+    # 这里提前拦下并给出可读提示，按“不筛选”处理。
+    if not isinstance(data, dict):
+        print(f"警告: {path.name} 顶层应为键值映射，实际为 {type(data).__name__}，将不做任何筛选")
+        return {}
+    return data
+
+
+def warn_unknown_rules(config: dict) -> list:
+    """检查配置里的可疑写法并打印警告，返回问题描述列表。
+    - 顶层键不在 CHECKS 中（多为拼写错误，如 vote），会被 rule_enabled 静默当作“未启用”；
+    - 筛选项缺少 enabled 键（如写成 enable），同样静默按未启用处理。
+    若不提示，用户会误以为筛选已生效。"""
+    problems = []
+    # YAML 允许非字符串顶层键（如 2000:），混合类型直接 sorted 会 TypeError，按 str 排序
+    for key in sorted(config, key=str):
+        if key not in CHECKS:
+            problems.append(f"未知筛选项 {key!r}（将被忽略）")
+        elif isinstance(config[key], dict) and "enabled" not in config[key]:
+            problems.append(f"筛选项 {key!r} 缺少 enabled 键（按未启用处理）")
+    for msg in problems:
+        print(f"警告: {msg}，请检查 filter_config.yaml 拼写")
+    return problems
 
 
 def rule_enabled(config: dict, name: str) -> Optional[dict]:
@@ -230,56 +273,71 @@ def main():
         raise SystemExit(f"错误: 找不到 {SERIES}")
 
     config = load_config(CONFIG)
+    warn_unknown_rules(config)
     active = [name for name in CHECKS if rule_enabled(config, name) is not None]
     if active:
         print(f"已启用的筛选项: {', '.join(active)}")
     else:
         print("未启用任何筛选项：将选中全部带 tmdb_id 的电视剧")
 
-    total = kept = no_id = duplicate = 0
+    total = kept = no_id = duplicate = bad_json = 0
     seen = set()
 
-    with open(SERIES, encoding="utf-8") as fin, \
-            open(OUTPUT_IDS, "w", encoding="utf-8") as fids, \
-            open(OUTPUT_DETAIL, "w", encoding="utf-8") as fdetail:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                show = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    # 先写临时文件，全部成功后再原子替换，避免中途异常留下截断的 ids.txt 被下游误用
+    tmp_ids = OUTPUT_IDS.with_name(OUTPUT_IDS.name + ".part")
+    tmp_detail = OUTPUT_DETAIL.with_name(OUTPUT_DETAIL.name + ".part")
+    try:
+        with open(SERIES, encoding="utf-8") as fin, \
+                open(tmp_ids, "w", encoding="utf-8") as fids, \
+                open(tmp_detail, "w", encoding="utf-8") as fdetail:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    show = json.loads(line)
+                except json.JSONDecodeError:
+                    bad_json += 1
+                    continue
 
-            total += 1
+                total += 1
 
-            # 没有 tmdb_id 的无法下载，直接跳过
-            tmdb_id = show.get("tmdb_id")
-            if not tmdb_id:
-                no_id += 1
-                continue
+                # 没有 tmdb_id 的无法下载，直接跳过
+                tmdb_id = show.get("tmdb_id")
+                if not tmdb_id:
+                    no_id += 1
+                    continue
 
-            if not passes_all(show, config):
-                continue
+                if not passes_all(show, config):
+                    continue
 
-            tid = str(tmdb_id)
-            if tid in seen:  # 去重
-                duplicate += 1
-                continue
-            seen.add(tid)
+                tid = str(tmdb_id)
+                if tid in seen:  # 去重
+                    duplicate += 1
+                    continue
+                seen.add(tid)
 
-            fids.write(tid + "\n")
-            # Drop the per-episode list from the review file: long-running shows carry
-            # thousands of episodes per row and would bloat filtered.jsonl for no gain.
-            # Season/episode totals are kept; the full list stays in tv_series.jsonl.
-            detail = {k: v for k, v in show.items() if k != "episodes"}
-            fdetail.write(json.dumps(detail, ensure_ascii=False) + "\n")
-            kept += 1
+                fids.write(tid + "\n")
+                # Drop the per-episode list from the review file: long-running shows carry
+                # thousands of episodes per row and would bloat filtered.jsonl for no gain.
+                # Season/episode totals are kept; the full list stays in tv_series.jsonl.
+                detail = {k: v for k, v in show.items() if k != "episodes"}
+                fdetail.write(json.dumps(detail, ensure_ascii=False) + "\n")
+                kept += 1
+        os.replace(tmp_ids, OUTPUT_IDS)
+        os.replace(tmp_detail, OUTPUT_DETAIL)
+    except BaseException:
+        for p in (tmp_ids, tmp_detail):
+            if p.exists():
+                p.unlink()
+        raise
 
     print(
         f"读取 {total} 条 | 无 tmdb_id 跳过 {no_id} | 重复跳过 {duplicate} | "
         f"最终选中 {kept}"
     )
+    if bad_json:
+        print(f"警告: 有 {bad_json} 行无法解析为 JSON 已跳过，请检查 {SERIES.name} 是否有截断/损坏行")
     print(f"已写入 {OUTPUT_IDS}（{kept} 个 id）和 {OUTPUT_DETAIL}（明细）")
 
 

@@ -148,11 +148,162 @@ def test_main_end_to_end(tmp_path, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "读取 6 条" in out and "无 tmdb_id 跳过 1" in out and "重复跳过 1" in out and "最终选中 2" in out
+    # P2-A: the malformed line must be surfaced, not silently dropped
+    assert "有 1 行无法解析为 JSON" in out
+    # P3-D: no leftover temp files after a successful run
+    assert not (tmp_path / "ids.txt.part").exists()
+    assert not (tmp_path / "filtered.jsonl.part").exists()
 
 
+def test_main_no_bad_json_no_warning(tmp_path, monkeypatch, capsys):
+    series = tmp_path / "tv_series.jsonl"
+    series.write_text(json.dumps(_show()) + "\n", encoding="utf-8")
+    monkeypatch.setattr(f, "SERIES", series)
+    monkeypatch.setattr(f, "CONFIG", tmp_path / "missing.yaml")
+    monkeypatch.setattr(f, "OUTPUT_IDS", tmp_path / "ids.txt")
+    monkeypatch.setattr(f, "OUTPUT_DETAIL", tmp_path / "filtered.jsonl")
+    f.main()
+    out = capsys.readouterr().out
+    assert "无法解析为 JSON" not in out
+    assert (tmp_path / "ids.txt").read_text().split() == ["100"]
+
+
+def test_main_atomic_write_keeps_old_output_on_failure(tmp_path, monkeypatch):
+    """P3-D: if processing blows up midway, the previous ids.txt must survive intact
+    and no .part files may be left behind."""
+    series = tmp_path / "tv_series.jsonl"
+    with open(series, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(_show(tmdb_id=1)) + "\n")
+        fh.write(json.dumps(_show(tmdb_id=2)) + "\n")
+    ids_out = tmp_path / "ids.txt"
+    detail_out = tmp_path / "filtered.jsonl"
+    ids_out.write_text("999\n", encoding="utf-8")
+    detail_out.write_text("old\n", encoding="utf-8")
+
+    monkeypatch.setattr(f, "SERIES", series)
+    monkeypatch.setattr(f, "CONFIG", tmp_path / "missing.yaml")
+    monkeypatch.setattr(f, "OUTPUT_IDS", ids_out)
+    monkeypatch.setattr(f, "OUTPUT_DETAIL", detail_out)
+
+    calls = {"n": 0}
+
+    def boom(show, config):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("simulated failure")
+        return True
+
+    monkeypatch.setattr(f, "passes_all", boom)
+
+    with pytest.raises(RuntimeError):
+        f.main()
+
+    assert ids_out.read_text() == "999\n"
+    assert detail_out.read_text() == "old\n"
+    assert not (tmp_path / "ids.txt.part").exists()
+    assert not (tmp_path / "filtered.jsonl.part").exists()
+
+
+# ---------------------------------------------------------------- P2-B: config typo warning
+def test_warn_unknown_rules(capsys):
+    cfg = {
+        "rating": {"enabled": True, "min": 7},       # fine
+        "vote": {"enabled": True, "min": 100},       # typo -> unknown key
+        "votes": {"enable": True, "min": 100},       # typo -> missing 'enabled'
+        "genres": "junk",                            # non-dict, not flagged for enabled
+    }
+    problems = f.warn_unknown_rules(cfg)
+    assert len(problems) == 2
+    out = capsys.readouterr().out
+    assert "'vote'" in out and "未知筛选项" in out
+    assert "'votes'" in out and "缺少 enabled" in out
+    assert "'rating'" not in out
+    # clean config -> silent
+    assert f.warn_unknown_rules({"rating": {"enabled": False}}) == []
+    assert capsys.readouterr().out == ""
+
+
+def test_warn_unknown_rules_tolerates_non_string_keys(capsys):
+    # YAML `2000:` yields an int key; mixed int/str keys must not TypeError in sorted()
+    problems = f.warn_unknown_rules({2000: {"enabled": True}, "rating": {"enabled": True}})
+    assert problems == ["未知筛选项 2000（将被忽略）"]
+    assert "2000" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("body, kind", [
+    ("- rating\n- votes\n", "list"),
+    ("just a string\n", "str"),
+    ("42\n", "int"),
+])
+def test_load_config_rejects_non_mapping_top_level(tmp_path, capsys, body, kind):
+    cfg = tmp_path / "filter_config.yaml"
+    cfg.write_text(body, encoding="utf-8")
+    assert f.load_config(cfg) == {}
+    out = capsys.readouterr().out
+    assert "顶层应为键值映射" in out and kind in out and "将不做任何筛选" in out
+
+
+def test_main_survives_non_mapping_filter_config(tmp_path, monkeypatch, capsys):
+    series = tmp_path / "tv_series.jsonl"
+    series.write_text(json.dumps(_show()) + "\n", encoding="utf-8")
+    cfg = tmp_path / "filter_config.yaml"
+    cfg.write_text("- rating\n", encoding="utf-8")
+    monkeypatch.setattr(f, "SERIES", series)
+    monkeypatch.setattr(f, "CONFIG", cfg)
+    monkeypatch.setattr(f, "OUTPUT_IDS", tmp_path / "ids.txt")
+    monkeypatch.setattr(f, "OUTPUT_DETAIL", tmp_path / "filtered.jsonl")
+    f.main()  # must not raise
+    out = capsys.readouterr().out
+    assert "顶层应为键值映射" in out and "未启用任何筛选项" in out
+    assert (tmp_path / "ids.txt").read_text().split() == ["100"]
+
+
+def test_main_warns_on_typo_in_config(tmp_path, monkeypatch, capsys):
+    series = tmp_path / "tv_series.jsonl"
+    series.write_text(json.dumps(_show()) + "\n", encoding="utf-8")
+    cfg = tmp_path / "filter_config.yaml"
+    cfg.write_text(yaml.safe_dump({"ratting": {"enabled": True, "min": 9.9}}), encoding="utf-8")
+    monkeypatch.setattr(f, "SERIES", series)
+    monkeypatch.setattr(f, "CONFIG", cfg)
+    monkeypatch.setattr(f, "OUTPUT_IDS", tmp_path / "ids.txt")
+    monkeypatch.setattr(f, "OUTPUT_DETAIL", tmp_path / "filtered.jsonl")
+    f.main()
+    out = capsys.readouterr().out
+    assert "未知筛选项 'ratting'" in out
+    assert "未启用任何筛选项" in out          # the typo'd rule did not take effect
+    assert (tmp_path / "ids.txt").read_text().split() == ["100"]
+
+
+# ---------------------------------------------------------------- P3-C: paths from config.yaml
 def test_paths_resolved_relative_to_script_dir():
     assert f.SERIES.is_absolute() and f.SERIES.parent == f._SCRIPT_DIR
     assert f.CONFIG.parent == f._SCRIPT_DIR
+    assert f.OUTPUT_IDS.parent == f._SCRIPT_DIR
+    assert f.OUTPUT_DETAIL.parent == f._SCRIPT_DIR
+
+
+def test_resolve_falls_back_to_default_on_blank():
+    assert f._resolve(None, "a.txt") == (f._SCRIPT_DIR / "a.txt").resolve()
+    assert f._resolve("", "a.txt") == (f._SCRIPT_DIR / "a.txt").resolve()
+    assert f._resolve("  ", "a.txt") == (f._SCRIPT_DIR / "a.txt").resolve()
+    assert f._resolve(123, "a.txt") == (f._SCRIPT_DIR / "a.txt").resolve()
+    assert f._resolve("sub/b.txt", "a.txt") == (f._SCRIPT_DIR / "sub" / "b.txt").resolve()
+
+
+def test_shipped_config_yaml_has_filter_to_ids_section_matching_neighbors():
+    """config.yaml's filter_to_ids section must exist and stay consistent with the
+    upstream (fetch_tv_metadata.output) and downstream (tv_ids_to_links.input) names."""
+    full = yaml.safe_load(open(f.CONFIG_PATH, encoding="utf-8"))
+    sec = full["filter_to_ids"]
+    assert set(sec) == {"input", "filter_config", "output_ids", "output_detail"}
+    assert sec["input"] == full["fetch_tv_metadata"]["output"]
+    assert sec["output_ids"] == full["tv_ids_to_links"]["input"]
+    assert sec["input"] == full["tv_ids_to_links"]["metadata"]
+    # module-level paths were actually derived from that section
+    assert f.SERIES.name == sec["input"]
+    assert f.CONFIG.name == sec["filter_config"]
+    assert f.OUTPUT_IDS.name == sec["output_ids"]
+    assert f.OUTPUT_DETAIL.name == sec["output_detail"]
 
 
 def test_shipped_filter_config_is_consistent_with_checks():
@@ -160,3 +311,4 @@ def test_shipped_filter_config_is_consistent_with_checks():
     cfg = yaml.safe_load(open(f.CONFIG, encoding="utf-8"))
     assert set(cfg) == set(f.CHECKS)
     assert all(rule.get("enabled") is False for rule in cfg.values())
+    assert f.warn_unknown_rules(cfg) == []
