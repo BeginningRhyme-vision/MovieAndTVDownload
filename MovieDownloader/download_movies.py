@@ -836,15 +836,17 @@ def parse_master_playlist(master_url, retries=None):
         if not line.startswith("#EXT-X-STREAM-INF"):
             continue
 
+        # 属性紧跟在 "#EXT-X-STREAM-INF:" 之后，排在首位的属性前导是 ":" 而非 ","，
+        # 两种分隔符都要接受，否则首位属性会漏解析。
         resolution_match = re.search(
-            r"(?:^|,)RESOLUTION=(\d+x\d+)(?:,|$)", line, re.IGNORECASE
+            r"(?:^|[:,])RESOLUTION=(\d+x\d+)(?:,|$)", line, re.IGNORECASE
         )
         resolution = resolution_match.group(1) if resolution_match else "unknown"
 
         # BANDWIDTH 是 master 里声明的码率（bps），用于同分辨率下的初步排序，
         # 可以少下载几个采样片段。缺失时记为 0，后续仍以实测采样为准。
         bandwidth_match = re.search(
-            r"(?:^|,)BANDWIDTH=(\d+)(?:,|$)", line, re.IGNORECASE
+            r"(?:^|[:,])BANDWIDTH=(\d+)(?:,|$)", line, re.IGNORECASE
         )
         bandwidth_kbps = (
             int(bandwidth_match.group(1)) / 1000 if bandwidth_match else 0.0
