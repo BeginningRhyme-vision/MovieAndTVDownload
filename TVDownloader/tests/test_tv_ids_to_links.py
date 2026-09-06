@@ -686,6 +686,97 @@ def test_run_batch_routes_three_states(tmp_path, monkeypatch):
     assert fail.read_text(encoding="utf-8") == "dead\t1\t2\n"
 
 
+# ---------- 批量误杀熔断 ----------
+def _dead_items(n, tid="d"):
+    return [(tid, 1, i) for i in range(1, n + 1)]
+
+
+def test_breaker_trips_rolls_back_and_raises(tmp_path, monkeypatch):
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    fail.write_text("old\t1\t1\n", encoding="utf-8")
+    results.write_text(json.dumps({"tmdbId": "c", "season": 1, "episode": 1}) + "\n", encoding="utf-8")
+
+    probed = []
+
+    def fake(tid, s, e):
+        if tid == "c":
+            probed.append((tid, s, e))
+        return "dead", None   # 全员判死，金丝雀也死 → 上游坏了
+
+    monkeypatch.setattr(m, "process_episode", fake)
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 3)
+    with pytest.raises(m.DeadStreakBreaker):
+        m.run_batch(_dead_items(10), results, fail, max_workers=1)
+    assert probed == [("c", 1, 1)]
+    # 窗口内 3 行已回滚，旧行保留
+    assert fail.read_text(encoding="utf-8") == "old\t1\t1\n"
+
+
+def test_breaker_canary_alive_resets_and_continues(tmp_path, monkeypatch):
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    results.write_text(json.dumps({"tmdbId": "c", "season": 1, "episode": 1}) + "\n", encoding="utf-8")
+    canary_calls = []
+
+    def fake(tid, s, e):
+        if tid == "c":
+            canary_calls.append(1)
+            return "ok", {"urls": ["u"], "tmdbId": tid, "season": s, "episode": e, "title": "t"}
+        return "dead", None
+
+    monkeypatch.setattr(m, "process_episode", fake)
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 3)
+    retry = m.run_batch(_dead_items(7), results, fail, max_workers=1)
+    assert retry == []
+    # 7 集全 dead 全部落盘；每满 3 集探一次金丝雀 → 探了 2 次（第 3、6 集）
+    assert len(fail.read_text(encoding="utf-8").splitlines()) == 7
+    assert len(canary_calls) == 2
+
+
+def test_breaker_success_resets_streak(tmp_path, monkeypatch):
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+
+    def fake(tid, s, e):
+        if tid == "ok":
+            return "ok", {"urls": ["u"], "tmdbId": tid, "season": s, "episode": e, "title": "t"}
+        return "dead", None
+
+    monkeypatch.setattr(m, "process_episode", fake)
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 3)
+    monkeypatch.setattr(m, "_canaries_alive", lambda *a, **k: pytest.fail("不应触发"))
+    items = [("d", 1, 1), ("d", 1, 2), ("ok", 1, 1), ("d", 1, 3), ("d", 1, 4)]
+    m.run_batch(items, results, fail, max_workers=1)
+    assert len(fail.read_text(encoding="utf-8").splitlines()) == 4
+
+
+def test_breaker_disabled_in_recheck_or_zero(tmp_path, monkeypatch):
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    monkeypatch.setattr(m, "process_episode", lambda *a: ("dead", None))
+    monkeypatch.setattr(m, "_canaries_alive", lambda *a, **k: pytest.fail("不应触发"))
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 2)
+    m.run_batch(_dead_items(5), results, fail, max_workers=1, write_dead=False)
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 0)
+    m.run_batch(_dead_items(5), results, fail, max_workers=1)
+    assert len(fail.read_text(encoding="utf-8").splitlines()) == 5
+
+
+def test_rollback_fail_tail_mismatch_leaves_file(tmp_path):
+    fail = tmp_path / "f.txt"
+    fail.write_text("a\t1\t1\nb\t1\t1\n", encoding="utf-8")
+    assert m._rollback_fail_tail(fail, [("x", 1, 1)]) is False
+    assert fail.read_text(encoding="utf-8") == "a\t1\t1\nb\t1\t1\n"
+    assert m._rollback_fail_tail(fail, [("b", 1, 1)]) is True
+    assert fail.read_text(encoding="utf-8") == "a\t1\t1\n"
+
+
+def test_canaries_alive_without_history(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "process_episode", lambda *a: pytest.fail("无金丝雀不应探测"))
+    assert m._canaries_alive(tmp_path / "missing.jsonl") is False
+
+
 # ---------- main ----------
 def test_main_expands_and_backfills_year(tmp_path, monkeypatch):
     ids = tmp_path / "ids.txt"
@@ -824,6 +915,26 @@ def test_main_round_backoff_and_outage_detection(tmp_path, monkeypatch):
     m.main()
     assert rounds == [n, n, 5]
     assert sleeps == [m.ROUND_BACKOFF_MAX, min(m.ROUND_BACKOFF_BASE * 2, m.ROUND_BACKOFF_MAX)]
+
+
+def test_main_exits_2_on_breaker(tmp_path, monkeypatch):
+    ids = tmp_path / "ids.txt"
+    ids.write_text("1\n", encoding="utf-8")
+    monkeypatch.setattr(m, "_CFG", {
+        "input": str(ids), "output": str(tmp_path / "r.jsonl"), "fail_file": str(tmp_path / "f.txt"),
+        "seasons_cache": str(tmp_path / "c.jsonl"),
+    })
+    monkeypatch.setattr(m, "expand_seasons", lambda *a, **kw: {
+        "1": {"tmdbId": "1", "seasons": [{"season": 1, "episodes": [1, 2]}]}})
+    monkeypatch.setattr(m, "_SERIES_META", {})
+
+    def fake_batch(*a, **kw):
+        raise m.DeadStreakBreaker("boom")
+
+    monkeypatch.setattr(m, "run_batch", fake_batch)
+    with pytest.raises(SystemExit) as ei:
+        m.main()
+    assert ei.value.code == 2
 
 
 def test_main_recheck_dead_mode(tmp_path, monkeypatch):
