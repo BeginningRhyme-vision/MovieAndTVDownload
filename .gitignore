@@ -27,6 +27,12 @@ TVDownloader/*.jsonl
 TVDownloader/progress.txt
 TVDownloader/fail.txt
 TVDownloader/ids.txt
+# 服务器运行时文件与旁路产物
+TVDownloader/*.tsv
+TVDownloader/*.part
+TVDownloader/fetch.pid
+TVDownloader/nohup.out
+TVDownloader/.venv/
 
 # 敏感凭据，仅本地使用，切勿提交（.env.example 作为模板可提交）
 MovieDownloader/.env
