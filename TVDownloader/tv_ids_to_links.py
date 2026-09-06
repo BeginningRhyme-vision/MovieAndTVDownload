@@ -527,12 +527,15 @@ def process_episode(tid, season, episode):
                     raise Exception(f"API Error at {enc_vidup}: result is not an object")
                 servers = parts.get('servers')
                 stream = parts.get('stream')
+                # 2026-09 起 enc-dec 返回 token 为空串，后续接口不带 X-CSRF-Token 也能正常取流；
+                # token 仅在非空时携带，不再作为必需字段（否则整批 0 成功）
                 token = parts.get('token')
-                if not (servers and stream and token):
-                    raise Exception(f"API Error at {enc_vidup}: missing servers/stream/token in result")
+                if not (servers and stream):
+                    raise Exception(f"API Error at {enc_vidup}: missing servers/stream in result")
 
                 headers_with_token = HEADERS.copy()
-                headers_with_token["X-CSRF-Token"] = token
+                if token:
+                    headers_with_token["X-CSRF-Token"] = token
 
                 # 3. 获取加密的服务器列表
                 resp = _check(session.post(servers, headers=headers_with_token, timeout=TIMEOUT), "servers")

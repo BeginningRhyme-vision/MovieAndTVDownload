@@ -404,10 +404,11 @@ class _FakeResp:
 
 def _install_fake_session(monkeypatch, page_html, streams, servers=None, stream_status=200,
                           page_status=200, servers_status=200, dec_status=200,
-                          enc_resp=None, dec_servers_resp=None):
+                          enc_resp=None, dec_servers_resp=None, token="tok"):
     """streams: list of decrypted stream dicts returned in order for each server.
-    enc_resp / dec_servers_resp: 覆盖 enc-vidup / dec-vidup(servers) 的整个 _FakeResp（模拟非 JSON 等）。"""
-    seen = {"page_urls": [], "page_headers": None, "enc_urls": []}
+    enc_resp / dec_servers_resp: 覆盖 enc-vidup / dec-vidup(servers) 的整个 _FakeResp（模拟非 JSON 等）。
+    token: enc-vidup 返回的 token（线上 2026-09 起为空串）。"""
+    seen = {"page_urls": [], "page_headers": None, "enc_urls": [], "servers_headers": None}
     servers = servers if servers is not None else [{"name": f"s{i}", "data": f"d{i}"} for i in range(len(streams))]
     stream_iter = iter(streams)
 
@@ -434,12 +435,16 @@ def _install_fake_session(monkeypatch, page_html, streams, servers=None, stream_
                 if enc_resp is not None:
                     return enc_resp
                 return _FakeResp(payload={"status": 200, "result": {
-                    "servers": "https://x/servers", "stream": "https://x/stream", "token": "tok"}})
+                    "servers": "https://x/servers", "stream": "https://x/stream", "token": token}})
             raise AssertionError(url)
 
         def post(self, url, headers=None, json=None, timeout=None):
             if url == "https://x/servers":
-                assert headers["X-CSRF-Token"] == "tok"
+                seen["servers_headers"] = headers
+                if token:
+                    assert headers["X-CSRF-Token"] == token
+                else:
+                    assert "X-CSRF-Token" not in headers
                 return _FakeResp(text="enc-servers", status=servers_status)
             if url.startswith("https://x/stream/"):
                 st = stream_status
@@ -488,6 +493,24 @@ def test_process_episode_ok_without_tmdbid_in_stream(monkeypatch):
     monkeypatch.setattr(m, "_TMDB_NAMES", {})
     status, result = m.process_episode("1", 1, 1)
     assert status == "ok" and result["urls"] == ["u"] and result["title"] == ""
+
+
+@pytest.mark.parametrize("token", ["", None])
+def test_process_episode_ok_with_empty_token(monkeypatch, token):
+    # 线上 2026-09 实测 enc-vidup 返回 token 为空串，servers/stream 正常；不带 X-CSRF-Token 也能取流，
+    # 不能因 token 缺失判为瞬时错误（否则整批 0 成功、全部 retry-exhausted）
+    seen = _install_fake_session(monkeypatch, PAGE, [{"url": "u"}], token=token)
+    status, result = m.process_episode("1", 1, 1)
+    assert status == "ok" and result["urls"] == ["u"]
+    assert "X-CSRF-Token" not in seen["servers_headers"]
+
+
+def test_process_episode_missing_servers_is_retriable(monkeypatch):
+    enc = _FakeResp(payload={"status": 200, "result": {"stream": "https://x/stream", "token": ""}})
+    _install_fake_session(monkeypatch, PAGE, [{"url": "u"}], enc_resp=enc)
+    monkeypatch.setattr(m, "MAX_RETRIES", 1)
+    status, _ = m.process_episode("1", 1, 1)
+    assert status == "retry"
 
 
 def test_process_episode_title_falls_back_to_tmdb_name(monkeypatch):
