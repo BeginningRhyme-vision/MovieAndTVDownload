@@ -96,10 +96,16 @@ tv_ids_to_links:
   metadata: "tv_series.jsonl"
   # 输出：解析成功的结果，一行一集（含 season/episode 与 m3u8 地址）
   output: "results.jsonl"
-  # 解析失败记录（一行一集：tmdb_id\tseason\tepisode）
+  # 解析失败记录：集级 tmdb_id\tseason\tepisode（真无源）；剧级 tmdb_id\t-\t-（TMDB 404）；
+  # 多轮重试耗尽 tmdb_id\tseason\tepisode\tretry-exhausted（下次运行自动重试）
   fail_file: "fail.txt"
   # 季集结构缓存：TMDB /tv/{id} 展开结果，避免多轮/续跑时重复调 API
+  # 每行 {tmdbId, name, year, ended, seasons:[{season, episodes, air_dates}]}；
+  # air_dates 用于跳过未播集（air_date + air_grace_days 在今天之后，或未完结剧的 TBA 集），下次运行自动再试
   seasons_cache: "seasons_cache.jsonl"
+  # 上架宽限期（天）：刚播出的集源站通常滞后几天才上架，此窗口内不发请求、不判死，
+  # 下次运行自动纳入。设 0 则播出当天即尝试。
+  air_grace_days: 5
 
   # TMDB API Key：用于调 /tv/{id} 拿季集结构。敏感项，走 .env 的 TMDB_API_KEY，
   # 环境变量优先；此处留空，仅作本地调试回退。
@@ -112,6 +118,11 @@ tv_ids_to_links:
   tmdb_sleep: 0.1
   tmdb_timeout: 15
   tmdb_retries: 3
+  # TMDB 429 限流时按 Retry-After 等待的单次上限（秒），防止离谱值挂住线程
+  tmdb_retry_after_max: 30
+  # 缓存刷新：默认只展开未缓存的剧。在播剧后续新播出的集不会自动进缓存，
+  # 需要时运行 `python tv_ids_to_links.py --refresh-ongoing`，重新展开 ended 非 true 的剧
+  # （含旧格式缺 ended 字段的缓存行），以追加行覆盖旧缓存。
 
   # 解密服务 API 根地址（负责 enc-vidup / dec-vidup 加解密）
   api: "https://enc-dec.app/api"
@@ -119,14 +130,26 @@ tv_ids_to_links:
   # 无源404不重试，任务为纯IO等待，可拉高并发；电影版 50 实测稳定。
   max_workers: 50
   # 单集的最大重试次数与每次重试间隔（秒）
-  # 只有瞬时错误(SSL/超时/5xx)才重试，真无源404直接跳过不sleep
+  # 白名单判死：只有页面 404 或全部 server 的 stream 接口 404 才算真无源(dead)；
+  # 其余任何错误(SSL/超时/5xx/解密服务异常/结构异常)一律视为瞬时，重试后进入多轮捞回
   max_retries: 3
   retry_delay: 1
+  # 判死二次确认：首次 404 只算“疑似无源”，换出口 IP 再完整探一次，连续两次 404 才写 fail.txt，
+  # 防 CDN/代理抖动把有源集永久误判丢失；命中过 404 的集重试预算 +1。false 则单次 404 即判死。
+  dead_confirm: true
+  # 死集复查：源站后补上架或历史误判的集，可运行 `python tv_ids_to_links.py --recheck-dead`
+  # 只重探 fail_file 中集级真无源且至今未成功的集；成功追加 output，仍无源不重复写 fail_file。
   # ---- 多轮捞回：整批跑完后对“瞬时耗尽”的集自动重跑，直到清零或达上限 ----
   #   - 单集在 process_episode 内换 IP 重试 max_retries 次仍失败(瞬时耗尽) → 下一轮重跑；
   #   - 真无源404 → 永久排除，绝不再抓（注意：是“这一集”无源，不影响同剧其它集）；
   #   - output 直接就是全部轮次成功结果的合并。
   max_rounds: 8
+  # 轮间退避：第 n 轮结束后等待 min(round_backoff*n, round_backoff_max) 秒再进入下一轮，
+  # 给代理池换 IP / 源站恢复留时间。若某轮 ≥90% 且 ≥50 集都是瞬时失败（疑似代理或源站整体故障），
+  # 直接等待 round_backoff_max。达 max_rounds 仍失败的集写入 fail_file 并标记
+  # "retry-exhausted"（第 4 列），下次运行不视为已处理、自动重试。
+  round_backoff: 30
+  round_backoff_max: 300
   # 单个 HTTP 请求超时（秒）
   timeout: 12
   # 代理配置：vidup.to 有 Cloudflare 机房 IP 拦截，直连会 403，需走住宅代理。

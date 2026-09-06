@@ -13,15 +13,19 @@ tv_ids_to_links.py —— 由剧集 tmdb_id 展开季集结构，并逐集解析
 与电影版保持一致。
 """
 
+import argparse
 import random
 from curl_cffi import requests
 import re
 import json
 import os
+import sys
 import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+from urllib.parse import quote
 
 import yaml
 import requests as std_requests
@@ -84,6 +88,16 @@ MAX_RETRIES = _CFG.get("max_retries", 3)
 RETRY_DELAY = _CFG.get("retry_delay", 1)  # 秒
 TIMEOUT = _CFG.get("timeout", 12)  # 单个 HTTP 请求超时（秒）
 
+# ---- 多轮捞回的轮间退避 ----
+# 每轮之间递增等待，给 enc-dec / 代理的短时故障留恢复窗口，避免 8 轮在几秒内烧光。
+ROUND_BACKOFF_BASE = int(_CFG.get("round_backoff", 30))       # 第 n 轮后等待 base*n 秒
+ROUND_BACKOFF_MAX = int(_CFG.get("round_backoff_max", 300))   # 单次等待上限
+# 某轮“待重跑”占比 ≥ 该比例且数量 ≥ 下限，视为基础设施故障（而非个别集抖动），直接按上限等待
+OUTAGE_RETRY_RATIO = 0.9
+OUTAGE_MIN_ITEMS = 50
+# 轮次耗尽仍是瞬时失败的集，写 fail.txt 时带此第 4 列标记；load_processed 不把它们当已处理，下次运行自动再试
+RETRY_EXHAUSTED_TAG = "retry-exhausted"
+
 # ---- TMDB 季集展开 ----
 TMDB_API_KEY = _secret("tmdb_api_key", "TMDB_API_KEY")
 TMDB_BASE = "https://api.themoviedb.org/3"
@@ -92,9 +106,16 @@ TMDB_WORKERS = int(_CFG.get("tmdb_workers", 8))
 TMDB_SLEEP = float(_CFG.get("tmdb_sleep", 0.1))
 TMDB_TIMEOUT = int(_CFG.get("tmdb_timeout", 15))
 TMDB_RETRIES = int(_CFG.get("tmdb_retries", 3))
+# 429 限流时单次按 Retry-After 等待的上限（秒），防止服务端给出离谱值导致线程长时间挂住
+TMDB_RETRY_AFTER_MAX = float(_CFG.get("tmdb_retry_after_max", 30))
 # TMDB append_to_response 单次最多附带 20 个子请求
 _TMDB_APPEND_LIMIT = 20
 _TMDB_MAX_429 = 5  # 单次请求最多容忍的 429 限流次数
+# 上架宽限期（天）：播出日起 N 天内的集视同未播出，跳过不取流也不判死。
+# 源站通常在播出后数天才上架，此窗口内的页面 404 不是“真无源”，若判死会永久丢集。
+AIR_GRACE_DAYS = int(_CFG.get("air_grace_days", 5))
+# NoSource 判死前换 IP 再探一次页面确认，两次都 404 才写 fail.txt（防 CDN/代理抖动误判永久丢集）
+DEAD_CONFIRM = bool(_CFG.get("dead_confirm", True))
 
 if not TMDB_API_KEY:
     raise SystemExit(
@@ -172,6 +193,8 @@ def load_series_metadata():
 
 
 _SERIES_META = load_series_metadata()
+# tmdbId -> TMDB 剧名，由 main() 在季集展开后填充；源站不返回 title 时用它兜底
+_TMDB_NAMES = {}
 
 
 # ---------- TMDB 季集结构展开 ----------
@@ -183,8 +206,40 @@ class TmdbNotFound(Exception):
     """TMDB 查不到该剧（404）：剧级失效，整部剧永久跳过。"""
 
 
+class TmdbAuthError(Exception):
+    """TMDB 返回 401/403：API Key 无效或被封。全局性错误，继续跑每部剧都只会空转，
+    expand_seasons 不吞它，直接抛回主线程终止进程。"""
+
+
+_API_KEY_RE = re.compile(r"api_key=[^&\s]+")
+
+
+def _redact(e):
+    """requests 的 HTTPError 消息带完整 URL（含 api_key= 查询参数），打印/落盘前一律脱敏。"""
+    return _API_KEY_RE.sub("api_key=***", f"{type(e).__name__}: {e}")
+
+
+def _retry_after_seconds(resp, default=2.0, cap=None):
+    """解析 Retry-After（秒数或 HTTP-date），非法/缺失用默认值，并设上限防止单次无限等待。
+    cap 缺省取配置项 tmdb_retry_after_max（默认 30 秒）。"""
+    if cap is None:
+        cap = TMDB_RETRY_AFTER_MAX
+    raw = resp.headers.get("Retry-After")
+    wait = default
+    if raw:
+        try:
+            wait = float(raw)
+        except (TypeError, ValueError):
+            try:
+                from email.utils import parsedate_to_datetime
+                wait = (parsedate_to_datetime(raw) - datetime.now(timezone.utc)).total_seconds()
+            except Exception:
+                wait = default
+    return max(0.0, min(wait, cap))
+
+
 def _tmdb_get(path, params=None):
-    """调 TMDB v3 接口；404 抛 TmdbNotFound，其它错误重试 TMDB_RETRIES 次后抛出。"""
+    """调 TMDB v3 接口；404 抛 TmdbNotFound，401/403 抛 TmdbAuthError，其它错误重试 TMDB_RETRIES 次后抛出。"""
     q = {"api_key": TMDB_API_KEY}
     if params:
         q.update(params)
@@ -197,26 +252,27 @@ def _tmdb_get(path, params=None):
             resp = _tmdb_session.get(f"{TMDB_BASE}{path}", params=q, timeout=TMDB_TIMEOUT)
             if resp.status_code == 404:
                 raise TmdbNotFound(path)
+            if resp.status_code in (401, 403):
+                raise TmdbAuthError(f"TMDB HTTP {resp.status_code} for {path}: API Key 无效或被封")
             if resp.status_code == 429:
                 throttled += 1
                 last = Exception(f"HTTP 429 rate limited ({throttled}x)")
                 if throttled > _TMDB_MAX_429:
                     break
-                wait = float(resp.headers.get("Retry-After", 2) or 2)
-                time.sleep(wait)
+                time.sleep(_retry_after_seconds(resp))
                 continue
             resp.raise_for_status()
             if TMDB_SLEEP > 0:
                 time.sleep(TMDB_SLEEP)
             return resp.json()
-        except TmdbNotFound:
+        except (TmdbNotFound, TmdbAuthError):
             raise
         except Exception as e:
             last = e
             attempt += 1
             if attempt < TMDB_RETRIES:
                 time.sleep(1.5 * attempt)
-    raise Exception(f"TMDB request failed for {path}: {last}")
+    raise Exception(f"TMDB request failed for {path}: {_redact(last)}")
 
 
 def fetch_seasons_from_tmdb(tmdb_id):
@@ -228,10 +284,12 @@ def fetch_seasons_from_tmdb(tmdb_id):
           "tmdbId": "123",
           "name": "...",
           "year": 2011 或 None,           # first_air_date 年份，作 tv_series.jsonl 缺 start_year 时的回退
-          "seasons": [{"season": 0, "episodes": [1,2,...]}, {"season": 1, "episodes": [...]}, ...]
+          "seasons": [{"season": 0, "episodes": [1,2,...], "air_dates": {"1": "2011-04-17", ...}}, ...]
         }
     先取 /tv/{id} 拿 seasons 列表，再用 append_to_response=season/N 分批拉各季的 episodes，
     以 episode_number 为准（可正确处理编号不连续的情况），而不是简单用 episode_count 数数。
+    air_dates 记录每集播出日期（缺失则不记），供 main() 跳过尚未播出的集（源站必然无源，
+    不能因此判死）。
     """
     info = _tmdb_get(f"/tv/{tmdb_id}")
     season_numbers = []
@@ -254,13 +312,19 @@ def fetch_seasons_from_tmdb(tmdb_id):
         )
         for n in chunk:
             sd = data.get(f"season/{n}") or {}
-            eps = sorted({
-                int(e["episode_number"])
-                for e in (sd.get("episodes") or [])
-                if e.get("episode_number") is not None
-            })
+            eps = set()
+            air_dates = {}
+            for e in (sd.get("episodes") or []):
+                num = e.get("episode_number")
+                if num is None:
+                    continue
+                num = int(num)
+                eps.add(num)
+                ad = e.get("air_date")
+                if ad:
+                    air_dates[str(num)] = ad
             if eps:
-                seasons.append({"season": n, "episodes": eps})
+                seasons.append({"season": n, "episodes": sorted(eps), "air_dates": air_dates})
 
     year = None
     fad = info.get("first_air_date") or ""
@@ -271,6 +335,8 @@ def fetch_seasons_from_tmdb(tmdb_id):
         "tmdbId": str(tmdb_id),
         "name": info.get("name"),
         "year": year,
+        # 已完结/取消：缺 air_date 的集视为已播出；在播/制作中：缺 air_date 视为 TBA 未播
+        "ended": (info.get("status") or "") in ("Ended", "Canceled"),
         "seasons": seasons,
     }
 
@@ -294,15 +360,27 @@ def load_seasons_cache(cache_file):
     return cache
 
 
-def expand_seasons(ids, cache_file, fail_file, dead_shows):
+def expand_seasons(ids, cache_file, fail_file, dead_shows, refresh_ongoing=False):
     """
     对 ids 中尚未缓存的剧并发调 TMDB 展开季集，追加写入 cache_file。
     TMDB 404 的剧写 fail_file（tid\\t-\\t-）并加入 dead_shows。
+    refresh_ongoing=True 时，缓存中 ended 非 True 的剧（在播 / 旧格式缺 ended 字段）也重新展开，
+    以追加新行覆盖旧行（load_seasons_cache 同 tmdbId 取最后一行），捞回新播出的集。
     返回 {tid: cache_entry}。
     """
     cache = load_seasons_cache(cache_file)
-    todo = [tid for tid in ids if tid not in cache and tid not in dead_shows]
-    print(f"[tmdb] 季集缓存 {len(cache)} 部 | 需展开 {len(todo)} 部")
+    todo = []
+    refreshed = 0
+    for tid in ids:
+        if tid in dead_shows:
+            continue
+        if tid not in cache:
+            todo.append(tid)
+        elif refresh_ongoing and cache[tid].get("ended") is not True:
+            todo.append(tid)
+            refreshed += 1
+    print(f"[tmdb] 季集缓存 {len(cache)} 部 | 需展开 {len(todo)} 部"
+          + (f"（其中刷新未完结 {refreshed} 部）" if refresh_ongoing else ""))
     if not todo:
         return cache
 
@@ -314,12 +392,16 @@ def expand_seasons(ids, cache_file, fail_file, dead_shows):
             return tid, fetch_seasons_from_tmdb(tid), None
         except TmdbNotFound:
             return tid, None, "not_found"
+        except TmdbAuthError:
+            raise
         except Exception as e:
-            return tid, None, str(e)
+            return tid, None, _redact(e)
 
-    with ThreadPoolExecutor(max_workers=TMDB_WORKERS) as ex:
+    ex = ThreadPoolExecutor(max_workers=TMDB_WORKERS)
+    try:
         futures = [ex.submit(one, tid) for tid in todo]
         for fut in as_completed(futures):
+            # TmdbAuthError 在此抛回主线程：API Key 失效时整个任务立即终止，不再空转
             tid, entry, err = fut.result()
             with lock:
                 done += 1
@@ -337,11 +419,49 @@ def expand_seasons(ids, cache_file, fail_file, dead_shows):
                 else:
                     # 瞬时错误：本次不缓存也不判死，下次运行再试
                     print(f"[tmdb] {done}/{len(todo)} {tid} 展开失败（下次再试）: {err}")
+    except BaseException:
+        # TmdbAuthError / Ctrl+C：取消尚未开始的剧，不再用失效 Key 把剩余几千部都打一遍 401
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown(wait=True)
     return cache
 
 
 # ---------- 辅助函数 ----------
+class HttpStatusError(Exception):
+    """vidup / enc-dec 返回非 2xx。带结构化状态码，判死只看这里的 status，不做字符串匹配
+    （tmdb id 本身可能含 "404"/"503" 等子串，字符串匹配会误判）。"""
+
+    def __init__(self, status, where):
+        super().__init__(f"HTTP {status} at {where}")
+        self.status = status
+        self.where = where
+
+
+class NoSource(Exception):
+    """已确认真无源：页面 404，或有 server 列表但所有 server 的 stream 请求都 404。
+    这是唯一允许把一集判死（写 fail.txt 永久排除）的证据；其它任何异常都只算瞬时，交给多轮重试。
+    误判死的代价是永久丢失一集，误重试的代价只是多几次请求，所以判死必须保守。"""
+
+
+def _check(resp, where):
+    if resp.status_code >= 400:
+        raise HttpStatusError(resp.status_code, where)
+    return resp
+
+
+def _json(resp, where):
+    """enc-dec 偶发返回 HTML（Cloudflare 页 / 网关错误页），json() 会抛 ValueError；
+    包一层给出可读文案，并保持“默认瞬时”语义。"""
+    try:
+        return resp.json()
+    except Exception as e:
+        raise Exception(f"Non-JSON response at {where}: {e}")
+
+
 def validate(data, path):
+    if not isinstance(data, dict):
+        raise Exception(f"API Error at {path}: unexpected payload type {type(data).__name__}")
     if data.get("status") != 200:
         error_msg = data.get("error", "unknown")
         raise Exception(f"API Error at {path}: status={data.get('status')}, error={error_msg}")
@@ -349,23 +469,9 @@ def validate(data, path):
 
 
 def _is_retriable(exc):
-    """判断异常是否值得重试：只对瞬时错误（网络/SSL/超时/连接中断/5xx/403）重试。
-    真无源的干净 404（All servers failed / stream 取流 404）不重试——重试也还是 404，纯浪费。
-    """
-    msg = str(exc)
-    if "All servers failed" in msg:
-        return "404" not in msg
-    retriable_markers = (
-        "curl: (35)", "SSL", "timed out", "Timeout", "timeout",
-        "Connection", "connection", "Failed to perform", "Proxy",
-        "Could not resolve", "Recv failure", "Send failure",
-        "403",  # 偶发 Cloudflare 限流，换 IP 重试可能过
-        "500", "502", "503", "504",
-        "API Error",  # enc/dec 服务瞬时非200，换次重试可能过
-        "No servers found",  # 偶发 server 列表空，重试可能拿到
-        "Extract failed (retriable)",  # 页面200但提取不到加密文本：可能撞Cloudflare挑战页，换IP重试
-    )
-    return any(m in msg for m in retriable_markers)
+    """白名单判死：只有 NoSource（页面 404 / 所有 server 的 stream 都 404）不重试，其余一律重试。
+    网络/SSL/超时/代理/5xx/403/enc-dec 抽风/JSON 解析失败/字段缺失……全部视为瞬时。"""
+    return not isinstance(exc, NoSource)
 
 
 def _ep_label(tid, season, episode):
@@ -377,11 +483,18 @@ def process_episode(tid, season, episode):
 
     返回 (status, 结果字典或None)，status 三态供多轮捞回区分：
       - "ok"    成功，附结果字典 {urls, tmdbId, season, episode, title, + 静态元数据}
-      - "dead"  真无源的干净404 → 这一集永久排除（不影响同剧其它集）
+      - "dead"  确认真无源（NoSource）→ 这一集永久排除（不影响同剧其它集）
       - "retry" 瞬时错误换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
+
+    判死二次确认（DEAD_CONFIRM）：首次命中 NoSource 不立即判死，换 IP 再完整跑一次，
+    连续两次 NoSource 才返回 dead；确认过程最多多花 1 次尝试（总尝试数 ≤ MAX_RETRIES+1）。
+    若确认那次是瞬时错误且尝试已耗尽，返回 retry 交给下一轮（宁可多试，不误判永久丢集）。
     """
     label = _ep_label(tid, season, episode)
-    for attempt in range(1, MAX_RETRIES + 1):
+    attempt = 0
+    nosource_hits = 0
+    while True:
+        attempt += 1
         # 每集、每次重试用一个独立 Session：复用连接、绑定本次随机出口 IP
         with requests.Session(impersonate="chrome") as session:
             proxy = build_proxy()
@@ -391,7 +504,9 @@ def process_episode(tid, season, episode):
                 # 1. 获取页面，提取加密文本
                 base_url = f"https://vidup.to/tv/{tid}/{season}/{episode}/"
                 resp = session.get(base_url, timeout=TIMEOUT, headers=PAGE_HEADERS)
-                resp.raise_for_status()
+                if resp.status_code == 404:
+                    raise NoSource(f"page 404 for {label}")
+                _check(resp, "page")
                 html = resp.text
 
                 match_1 = re.search(r'\\"en\\":\\"(.*?)\\"', html)
@@ -404,70 +519,77 @@ def process_episode(tid, season, episode):
                     else:
                         raise Exception(f"Extract failed (retriable) for {label}")
 
-                # 2. 调用 enc-vidup 获取 parts
-                enc_vidup = f"{API}/enc-vidup?text={text}"
-                resp = session.get(enc_vidup, timeout=TIMEOUT, headers=HEADERS)
-                resp.raise_for_status()
-                data = resp.json()
-                parts = validate(data, enc_vidup)
-                servers = parts['servers']
-                stream = parts['stream']
-                token = parts['token']
+                # 2. 调用 enc-vidup 获取 parts（text 来自页面正则，可能含 +/= 等保留字符，必须编码）
+                enc_vidup = f"{API}/enc-vidup?text={quote(text, safe='')}"
+                resp = _check(session.get(enc_vidup, timeout=TIMEOUT, headers=HEADERS), "enc-vidup")
+                parts = validate(_json(resp, "enc-vidup"), enc_vidup)
+                if not isinstance(parts, dict):
+                    raise Exception(f"API Error at {enc_vidup}: result is not an object")
+                servers = parts.get('servers')
+                stream = parts.get('stream')
+                token = parts.get('token')
+                if not (servers and stream and token):
+                    raise Exception(f"API Error at {enc_vidup}: missing servers/stream/token in result")
 
                 headers_with_token = HEADERS.copy()
                 headers_with_token["X-CSRF-Token"] = token
 
                 # 3. 获取加密的服务器列表
-                resp = session.post(servers, headers=headers_with_token, timeout=TIMEOUT)
+                resp = _check(session.post(servers, headers=headers_with_token, timeout=TIMEOUT), "servers")
                 servers_encrypted = resp.text
 
                 # 4. 解密服务器列表
                 dec_vidup = f"{API}/dec-vidup"
-                resp = session.post(dec_vidup, json={"text": servers_encrypted}, timeout=TIMEOUT)
-                resp.raise_for_status()
-                data = resp.json()
-                servers_decrypted = validate(data, dec_vidup)
+                resp = _check(session.post(dec_vidup, json={"text": servers_encrypted}, timeout=TIMEOUT), "dec-vidup(servers)")
+                servers_decrypted = validate(_json(resp, "dec-vidup(servers)"), dec_vidup)
 
-                if not servers_decrypted:
+                if not servers_decrypted or not isinstance(servers_decrypted, list):
                     raise Exception("No servers found")
 
                 # 遍历所有服务器，收集全部可用 url
                 last_server_error = None
                 urls = []
-                result_tmdb_id = None
                 result_title = None
+                stream_404 = 0
                 for server in servers_decrypted:
+                    server_name = server.get('name', 'unknown') if isinstance(server, dict) else 'unknown'
                     try:
                         data_val = server['data']
                         # 5. 获取加密的流数据
                         stream_url = f"{stream}/{data_val}"
-                        resp = session.post(stream_url, headers=headers_with_token, timeout=TIMEOUT)
-                        resp.raise_for_status()
+                        resp = _check(session.post(stream_url, headers=headers_with_token, timeout=TIMEOUT), "stream")
                         stream_encrypted = resp.text
 
                         # 6. 解密流数据
-                        resp = session.post(dec_vidup, json={"text": stream_encrypted}, timeout=TIMEOUT)
-                        resp.raise_for_status()
-                        data = resp.json()
-                        stream_decrypted = validate(data, dec_vidup)
+                        resp = _check(session.post(dec_vidup, json={"text": stream_encrypted}, timeout=TIMEOUT), "dec-vidup(stream)")
+                        stream_decrypted = validate(_json(resp, "dec-vidup(stream)"), dec_vidup)
+                        if not isinstance(stream_decrypted, dict):
+                            raise Exception("decrypted stream is not an object")
 
                         url = stream_decrypted.get("url")
+                        if not url:
+                            raise Exception("Missing url in decrypted data")
+                        # 只以 url 为成功条件；返回的 tmdbId 仅用于告警，不参与 key 也不作为成功条件
                         r_tid = stream_decrypted.get("tmdbId")
-                        if url and r_tid:
-                            if url not in urls:
-                                urls.append(url)
-                            if result_tmdb_id is None:
-                                result_tmdb_id = r_tid
-                                result_title = stream_decrypted.get("title")
-                        else:
-                            last_server_error = "Missing url or tmdbId in decrypted data"
+                        if r_tid is not None and str(r_tid) != str(tid):
+                            print(f"  [warn] {label} server '{server_name}' 返回 tmdbId={r_tid}，与入参不一致，key 仍用入参")
+                        if url not in urls:
+                            urls.append(url)
+                        if result_title is None:
+                            result_title = stream_decrypted.get("title")
+                    except HttpStatusError as e:
+                        # 只有源站 stream 接口本身的 404 才算“该 server 无源”；enc-dec 的 404 是服务故障
+                        if e.status == 404 and e.where == "stream":
+                            stream_404 += 1
+                        last_server_error = e
+                        print(f"  Server '{server_name}' failed for {label}: {e}")
+                        continue
                     except Exception as e:
                         last_server_error = e
-                        server_name = server.get('name', 'unknown')
                         print(f"  Server '{server_name}' failed for {label}: {e}")
                         continue
 
-                if urls and result_tmdb_id:
+                if urls:
                     # 恒用入参 tid/season/episode 作为 key，保证全链路一致：
                     # 续跑去重、元数据查表、下游 R2 路径与文件名都对得上。
                     result = {
@@ -475,30 +597,39 @@ def process_episode(tid, season, episode):
                         "tmdbId": str(tid),
                         "season": int(season),
                         "episode": int(episode),
-                        "title": result_title,
+                        # 源站 title 偶尔为空，回退 TMDB 剧名，再兜底空串（下游 download_tv/fetch_subtitles 按 str 使用）
+                        "title": result_title or _TMDB_NAMES.get(str(tid)) or "",
                     }
                     result.update(_SERIES_META.get(str(tid), {}))
                     return "ok", result
 
+                if stream_404 == len(servers_decrypted):
+                    raise NoSource(f"all {stream_404} servers returned 404 for {label}")
                 raise Exception(f"All servers failed for {label}. Last error: {last_server_error}")
 
             except Exception as e:
                 if not _is_retriable(e):
-                    print(f"  [无源 404] {label}: {e}")
-                    return "dead", None
-                print(f"  [Attempt {attempt}/{MAX_RETRIES}] 瞬时错误 for {label}: {e}")
-                if attempt < MAX_RETRIES:
+                    nosource_hits += 1
+                    if not DEAD_CONFIRM or nosource_hits >= 2:
+                        print(f"  [无源 404] {label}: {e}")
+                        return "dead", None
+                    # 首次 404 只算“疑似无源”：换出口 IP 再完整探一次，防 CDN/代理抖动误判永久丢集
+                    print(f"  [疑似无源，换 IP 确认] {label}: {e}")
                     time.sleep(RETRY_DELAY)
-                else:
-                    print(f"  All {MAX_RETRIES} attempts failed for {label}")
+                    continue
+                # 命中过 NoSource 时多给 1 次预算，让确认那一跳不挤占常规重试次数
+                budget = MAX_RETRIES + (1 if (DEAD_CONFIRM and nosource_hits) else 0)
+                print(f"  [Attempt {attempt}/{budget}] 瞬时错误 for {label}: {e}")
+                if attempt < budget:
+                    time.sleep(RETRY_DELAY)
+                    continue
+                print(f"  All {budget} attempts failed for {label}")
+                return "retry", None
 
-    return "retry", None
 
-
-def load_processed(results_file, fail_file):
-    """返回 (已处理的 (tid, season, episode) 集合, 剧级失效的 tid 集合)。"""
-    processed = set()
-    dead_shows = set()
+def _load_ok_keys(results_file):
+    """results.jsonl 中已成功的 (tid, season, episode) 集合。"""
+    ok = set()
     if results_file.exists():
         with open(results_file, 'r', encoding='utf-8') as f:
             for line in f:
@@ -509,13 +640,22 @@ def load_processed(results_file, fail_file):
                     obj = json.loads(line)
                     tid, s, e = obj.get('tmdbId'), obj.get('season'), obj.get('episode')
                     if tid is not None and s is not None and e is not None:
-                        processed.add((str(tid), int(s), int(e)))
+                        ok.add((str(tid), int(s), int(e)))
                 except Exception:
                     pass
+    return ok
+
+
+def _load_fail(fail_file):
+    """解析 fail.txt，返回 (集级真无源集合, 剧级失效 tid 集合)；retry-exhausted 行忽略。"""
+    dead_eps = set()
+    dead_shows = set()
     if fail_file.exists():
         with open(fail_file, 'r', encoding='utf-8') as f:
             for line in f:
                 parts = line.strip().split("\t")
+                if len(parts) == 4 and parts[3] == RETRY_EXHAUSTED_TAG:
+                    continue
                 if len(parts) != 3:
                     continue
                 tid, s, e = parts
@@ -523,14 +663,51 @@ def load_processed(results_file, fail_file):
                     dead_shows.add(tid)
                     continue
                 try:
-                    processed.add((tid, int(s), int(e)))
+                    dead_eps.add((tid, int(s), int(e)))
                 except ValueError:
                     pass
-    return processed, dead_shows
+    return dead_eps, dead_shows
 
 
-def run_batch(to_process, results_file, fail_file, max_workers):
-    """并发处理一批集，实时落盘 ok/dead，返回本批“瞬时耗尽”待重跑的三元组列表。"""
+def load_processed(results_file, fail_file):
+    """返回 (已处理的 (tid, season, episode) 集合, 剧级失效的 tid 集合)。
+
+    fail.txt 行格式：
+      - `tid\\ts\\te`                      集级真无源 → 已处理
+      - `tid\\t-\\t-`                      剧级失效（TMDB 404）
+      - `tid\\ts\\te\\tretry-exhausted`     上次运行轮次耗尽仍是瞬时失败 → 不算已处理，本次自动再试
+    """
+    dead_eps, dead_shows = _load_fail(fail_file)
+    return _load_ok_keys(results_file) | dead_eps, dead_shows
+
+
+def load_dead_episodes(results_file, fail_file):
+    """--recheck-dead 用：fail.txt 里集级真无源、且至今未在 results.jsonl 成功过的集。
+    （复查成功的集会追加进 results.jsonl，fail.txt 旧行保留不动；results 优先，故不会重复复查。）"""
+    dead_eps, _ = _load_fail(fail_file)
+    return dead_eps - _load_ok_keys(results_file)
+
+
+def _is_unaired(air_date, today, ended, grace_days=None):
+    """判断一集是否尚未播出 / 尚在上架宽限期（源站必然或大概率无源，本次跳过、不写 fail.txt，下次运行再纳入）。
+    - air_date + grace_days 晚于今天 → 未播出（含刚播出但源站尚未上架的窗口）
+    - air_date 缺失：已完结/取消的剧视为已播出（老剧 TMDB 缺日期很常见，不能因此永久跳过）；
+      仍在播/制作中的剧视为 TBA 占位集 → 未播出
+    grace_days 缺省取配置项 air_grace_days。
+    """
+    if grace_days is None:
+        grace_days = AIR_GRACE_DAYS
+    if not air_date:
+        return not ended
+    try:
+        return date.fromisoformat(air_date[:10]) + timedelta(days=grace_days) > today
+    except ValueError:
+        return False  # 日期格式异常：不因此跳过，交给取流去判
+
+
+def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True):
+    """并发处理一批集，实时落盘 ok/dead，返回本批“瞬时耗尽”待重跑的三元组列表。
+    write_dead=False（--recheck-dead 模式）：仍无源的集不再重复写 fail.txt（旧行已在）。"""
     lock = threading.Lock()
     ok_count = 0
     dead_count = 0
@@ -549,12 +726,14 @@ def run_batch(to_process, results_file, fail_file, max_workers):
                 retry_items.append(item)
                 print(f"🔁 RETRY-LATER: {label}")
             else:
-                with open(fail_file, 'a', encoding='utf-8') as f:
-                    f.write(f"{tid}\t{s}\t{e}\n")
+                if write_dead:
+                    with open(fail_file, 'a', encoding='utf-8') as f:
+                        f.write(f"{tid}\t{s}\t{e}\n")
                 print(f"❌ DEAD: {label}")
         return status
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
         futures = {executor.submit(process_one, item): item for item in to_process}
         for future in as_completed(futures):
             item = futures[future]
@@ -570,12 +749,33 @@ def run_batch(to_process, results_file, fail_file, max_workers):
                 print(f"⚠️  Unexpected exception for {_ep_label(*item)}: {e}")
                 with lock:
                     retry_items.append(item)
+    except BaseException:
+        # Ctrl+C / 致命错误：取消尚未开始的集，不等排队任务跑完（否则数万集要跑到底才能退出）；
+        # 正在跑的集让它自然结束，避免 kill -9 截断正在写的 results.jsonl 行
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    executor.shutdown(wait=True)
 
     print(f"\n本批完成 | 成功 {ok_count} | 真无源 {dead_count} | 待重跑 {len(retry_items)}")
     return retry_items
 
 
-def main():
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(description="TMDB 季集展开 + vidup 逐集取流")
+    parser.add_argument(
+        "--refresh-ongoing", action="store_true",
+        help="重新展开缓存中未完结（ended 非 true，含旧格式缓存行）的剧，捞回新播出的集；默认只展开未缓存的剧",
+    )
+    parser.add_argument(
+        "--recheck-dead", action="store_true",
+        help="只复查 fail.txt 中集级真无源、且至今未成功的集（源站后补上架时捞回）；"
+             "成功追加 results.jsonl，仍无源不重复写 fail.txt",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args([] if argv is None else argv)
     ids_file = _resolve(_CFG.get("input", "ids.txt"))
     results_file = _resolve(_CFG.get("output", "results.jsonl"))
     fail_file = _resolve(_CFG.get("fail_file", "fail.txt"))
@@ -597,11 +797,14 @@ def main():
     processed, dead_shows = load_processed(results_file, fail_file)
 
     # ---- 第一步：TMDB 展开季集结构（带缓存）----
-    cache = expand_seasons(ids, cache_file, fail_file, dead_shows)
+    cache = expand_seasons(ids, cache_file, fail_file, dead_shows,
+                           refresh_ongoing=args.refresh_ongoing)
 
     # ---- 第二步：按 ids.txt 顺序展开成 (tid, season, episode) 任务，剔除已处理 ----
     to_process = []
     total_eps = 0
+    skipped_unaired = 0
+    today = date.today()
     for tid in ids:
         if tid in dead_shows:
             continue
@@ -612,15 +815,38 @@ def main():
         meta = _SERIES_META.setdefault(tid, {})
         if meta.get("year") is None and entry.get("year") is not None:
             meta["year"] = entry["year"]
+        if entry.get("name"):
+            _TMDB_NAMES[tid] = entry["name"]
+        # 旧版缓存行没有 ended / air_dates 字段：air_dates 缺失时不做未播判断（全部纳入），
+        # 避免把老缓存里的集全当成 TBA 跳过
+        ended = bool(entry.get("ended"))
         for s in entry["seasons"]:
+            air_dates = s.get("air_dates")
             for e in s["episodes"]:
                 total_eps += 1
                 key = (tid, int(s["season"]), int(e))
-                if key not in processed:
-                    to_process.append(key)
+                if key in processed:
+                    continue
+                # 未播集不发请求、也不写 fail.txt，下次运行到播出日期后自动纳入
+                if air_dates is not None and _is_unaired(air_dates.get(str(e)), today, ended):
+                    skipped_unaired += 1
+                    continue
+                to_process.append(key)
+
+    if args.recheck_dead:
+        # 复查模式：只跑 fail.txt 里集级真无源且至今未成功的集（源站后补上架 / 当初误判），
+        # 仍限定在 ids.txt 内、剔除剧级失效；上面的循环仍需跑一遍以填充 _SERIES_META/_TMDB_NAMES
+        order = {tid: i for i, tid in enumerate(ids)}
+        to_process = sorted(
+            (k for k in load_dead_episodes(results_file, fail_file)
+             if k[0] in order and k[0] not in dead_shows),
+            key=lambda k: (order[k[0]], k[1], k[2]),
+        )
+        print(f"[recheck-dead] 待复查真无源集: {len(to_process)}")
 
     print(f"Total shows: {len(ids)} | Total episodes: {total_eps} | "
-          f"Already processed: {len(processed)} | To process: {len(to_process)}")
+          f"Already processed: {len(processed)} | Unaired skipped: {skipped_unaired} | "
+          f"To process: {len(to_process)}")
 
     if not to_process:
         print("All episodes processed.")
@@ -638,21 +864,37 @@ def main():
         print(f"==> 第 {round_no}/{max_rounds} 轮 | 待处理 {len(pending)} 集")
         print(f"{'=' * 70}")
 
-        retry_items = run_batch(pending, results_file, fail_file, max_workers)
+        retry_items = run_batch(pending, results_file, fail_file, max_workers,
+                                write_dead=not args.recheck_dead)
 
         if not retry_items:
             print("\n==> 瞬时失败已清零，所有有源集已捞干净，正常结束。")
             break
         if round_no >= max_rounds:
+            # 第 4 列标记：这些集只是“重试耗尽”而非真无源，load_processed 不会把它们当作已处理，
+            # 下次运行会自动重跑；只是留痕方便排查本次运行的瞬时失败规模。
             with open(fail_file, 'a', encoding='utf-8') as f:
                 for tid, s, e in retry_items:
-                    f.write(f"{tid}\t{s}\t{e}\n")
-            print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(retry_items)} 集瞬时失败归入 fail_file。")
+                    f.write(f"{tid}\t{s}\t{e}\t{RETRY_EXHAUSTED_TAG}\n")
+            print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(retry_items)} 集瞬时失败记入 fail_file"
+                  f"（标记 {RETRY_EXHAUSTED_TAG}，下次运行自动重试）。")
             break
+
+        # 轮间退避：瞬时失败多半是代理/enc-dec/源站抖动，立刻重跑大概率撞同一堵墙。
+        # 若本轮几乎全部 retry（≥90% 且 ≥50 集），判定为基础设施故障，直接等上限。
+        ratio = len(retry_items) / max(len(pending), 1)
+        outage = ratio >= OUTAGE_RETRY_RATIO and len(retry_items) >= OUTAGE_MIN_ITEMS
+        wait = ROUND_BACKOFF_MAX if outage else min(ROUND_BACKOFF_BASE * round_no, ROUND_BACKOFF_MAX)
+        if outage:
+            print(f"\n==> 本轮 {len(retry_items)}/{len(pending)} 集瞬时失败（{ratio:.0%}），"
+                  f"疑似代理/源站故障，等待 {wait}s 后再试。")
+        else:
+            print(f"\n==> 本轮剩余 {len(retry_items)} 集瞬时失败，等待 {wait}s 后进入下一轮。")
+        time.sleep(wait)
         pending = retry_items
 
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
