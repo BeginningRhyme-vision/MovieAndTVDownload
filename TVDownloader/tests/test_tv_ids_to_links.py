@@ -774,7 +774,81 @@ def test_rollback_fail_tail_mismatch_leaves_file(tmp_path):
 
 def test_canaries_alive_without_history(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "process_episode", lambda *a: pytest.fail("无金丝雀不应探测"))
-    assert m._canaries_alive(tmp_path / "missing.jsonl") is False
+    assert m._canaries_alive([], tmp_path / "missing.jsonl") is None
+
+
+def test_canaries_alive_three_states(tmp_path, monkeypatch):
+    results = tmp_path / "missing.jsonl"
+    # 全瞬时错误 → None
+    monkeypatch.setattr(m, "process_episode", lambda *a: ("retry", None))
+    assert m._canaries_alive([("c", 1, 1), ("c", 1, 2)], results) is None
+    # 探测抛异常不崩，视作瞬时 → None
+    def boom(*a):
+        raise RuntimeError("x")
+    monkeypatch.setattr(m, "process_episode", boom)
+    assert m._canaries_alive([("c", 1, 1)], results) is None
+    # 一个瞬时 + 一个明确 dead → False
+    seq = iter([("retry", None), ("dead", None)])
+    monkeypatch.setattr(m, "process_episode", lambda *a: next(seq))
+    assert m._canaries_alive([("c", 1, 1), ("c", 1, 2)], results) is False
+    # 任一 ok → True
+    seq = iter([("dead", None), ("ok", {"urls": ["u"]})])
+    monkeypatch.setattr(m, "process_episode", lambda *a: next(seq))
+    assert m._canaries_alive([("c", 1, 1), ("c", 1, 2)], results) is True
+
+
+def test_pick_canaries_prefers_recent_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(m, "_load_ok_keys", lambda *a: pytest.fail("有 recent_ok 时不应读 results"))
+    picked = m._pick_canaries([("a", 1, 1), ("b", 1, 1)], tmp_path / "r.jsonl", 5)
+    assert sorted(picked) == [("a", 1, 1), ("b", 1, 1)]
+
+
+def test_breaker_no_history_all_dead_does_not_trip(tmp_path, monkeypatch):
+    """全新跑、还没有任何成功集时，连败不应熔断（无从判断上游）。"""
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    monkeypatch.setattr(m, "process_episode", lambda *a: ("dead", None))
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 3)
+    retry = m.run_batch(_dead_items(7), results, fail, max_workers=1)
+    assert retry == []
+    assert len(fail.read_text(encoding="utf-8").splitlines()) == 7
+
+
+def test_breaker_canary_all_retry_does_not_trip(tmp_path, monkeypatch):
+    """金丝雀全是瞬时错误（如限流）→ 放行，不回滚 fail。"""
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    results.write_text(json.dumps({"tmdbId": "c", "season": 1, "episode": 1}) + "\n", encoding="utf-8")
+
+    def fake(tid, s, e):
+        return ("retry", None) if tid == "c" else ("dead", None)
+
+    monkeypatch.setattr(m, "process_episode", fake)
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 3)
+    retry = m.run_batch(_dead_items(4), results, fail, max_workers=1)
+    assert retry == []
+    assert len(fail.read_text(encoding="utf-8").splitlines()) == 4
+
+
+def test_breaker_recent_ok_used_as_canary(tmp_path, monkeypatch):
+    """本轮刚成功过的集应优先作金丝雀，而不是读 results.jsonl。"""
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    monkeypatch.setattr(m, "_load_ok_keys", lambda *a: pytest.fail("不应读 results"))
+    probed = []
+
+    def fake(tid, s, e):
+        if tid == "ok":
+            probed.append((tid, s, e))
+            return "ok", {"urls": ["u"], "tmdbId": tid, "season": s, "episode": e, "title": "t"}
+        return "dead", None
+
+    monkeypatch.setattr(m, "process_episode", fake)
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 3)
+    items = [("ok", 1, 1)] + _dead_items(3)
+    m.run_batch(items, results, fail, max_workers=1)
+    # 第一次是正常处理，第二次是作金丝雀复探
+    assert probed == [("ok", 1, 1), ("ok", 1, 1)]
 
 
 # ---------- main ----------

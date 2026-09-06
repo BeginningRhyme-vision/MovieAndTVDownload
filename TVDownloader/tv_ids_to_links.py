@@ -23,6 +23,7 @@ import sys
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from urllib.parse import quote
@@ -718,39 +719,53 @@ def _is_unaired(air_date, today, ended, grace_days=None):
         return False  # 日期格式异常：不因此跳过，交给取流去判
 
 
-def _pick_canaries(results_file, k):
-    """从 results.jsonl 已成功的集中随机挑 k 个作金丝雀（历史有源，正常情况下复探应仍能成功）。"""
-    ok = list(_load_ok_keys(results_file))
-    return random.sample(ok, min(k, len(ok)))
+def _pick_canaries(recent_ok, results_file, k):
+    """挑 k 个历史成功集作金丝雀：优先本轮刚成功的集（最能代表当前代码 + 当前上游），
+    本轮尚无成功时才回退解析 results.jsonl。"""
+    pool = list(recent_ok) or list(_load_ok_keys(results_file))
+    return random.sample(pool, min(k, len(pool)))
 
 
-def _canaries_alive(results_file, k=None):
-    """复探 k 个历史成功集：任一仍能取到流 → 上游正常。全 dead / 无可用金丝雀 → False。"""
+def _canaries_alive(recent_ok, results_file, k=None):
+    """复探 k 个历史成功集，返回三态：
+    True  任一仍能取到流 → 上游正常；
+    False 无一成功且至少一个明确 dead → 上游疑似 404 化；
+    None  无金丝雀可用 / 全是瞬时错误 → 无法判断（调用方放行，不熔断）。"""
     k = CANARY_COUNT if k is None else k
-    canaries = _pick_canaries(results_file, k)
+    canaries = _pick_canaries(recent_ok, results_file, k)
     if not canaries:
-        print("  [熔断] results 中无历史成功集可作金丝雀，无法证明上游正常。")
-        return False
+        print("  [熔断] 无历史成功集可作金丝雀，无法判断上游状态，放行。")
+        return None
+    saw_dead = False
     for tid, s, e in canaries:
-        status, _ = process_episode(tid, s, e)
+        try:
+            status, _ = process_episode(tid, s, e)
+        except Exception as e_:
+            status = f"exception: {e_}"
         print(f"  [熔断] 金丝雀 {_ep_label(tid, s, e)} → {status}")
         if status == "ok":
             return True
-    return False
+        if status == "dead":
+            saw_dead = True
+    return False if saw_dead else None
 
 
 def _rollback_fail_tail(fail_file, items):
-    """把本次连败窗口写入 fail.txt 的末尾 len(items) 行撤销（写入受 lock 串行化，必然位于文件尾）。
+    """撤销本次连败窗口写入 fail.txt 的末尾 len(items) 行（写入受 lock 串行化，必然位于文件尾）。
+    只做字节级 truncate，不重写整个文件，中途被 kill 也不会损坏已有内容。
     尾部与预期不一致时不动文件，返回 False 由调用方提示人工处理。"""
     if not items:
         return True
-    expected = [f"{tid}\t{s}\t{e}" for tid, s, e in items]
-    lines = fail_file.read_text(encoding='utf-8').splitlines()
-    if lines[-len(expected):] != expected:
-        return False
-    with open(fail_file, 'w', encoding='utf-8') as f:
-        for line in lines[:-len(expected)]:
-            f.write(line + '\n')
+    tail = "".join(f"{tid}\t{s}\t{e}\n" for tid, s, e in items).encode("utf-8")
+    with open(fail_file, "rb+") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        if size < len(tail):
+            return False
+        f.seek(size - len(tail))
+        if f.read() != tail:
+            return False
+        f.truncate(size - len(tail))
     return True
 
 
@@ -758,13 +773,14 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True)
     """并发处理一批集，实时落盘 ok/dead，返回本批“瞬时耗尽”待重跑的三元组列表。
     write_dead=False（--recheck-dead 模式）：仍无源的集不再重复写 fail.txt（旧行已在），且不启用熔断。
     熔断：连续 DEAD_STREAK_BREAKER 集 dead（无任何成功间隔）→ 持锁暂停全员，复探金丝雀；
-    金丝雀存活则清零继续，否则回滚窗口内 fail 行并抛 DeadStreakBreaker。"""
+    金丝雀存活或无法判断则清零继续，明确失败则回滚窗口内 fail 行并抛 DeadStreakBreaker。"""
     lock = threading.Lock()
     ok_count = 0
     dead_count = 0
     retry_items = []
     breaker_on = write_dead and DEAD_STREAK_BREAKER > 0
     dead_streak = []   # 当前连败窗口内已写入 fail.txt 的集（按写入顺序）
+    recent_ok = deque(maxlen=50)   # 本轮最近成功的集，作金丝雀候选
     tripped = False
 
     def process_one(item):
@@ -773,13 +789,15 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True)
         status, result = process_episode(tid, s, e)
         label = _ep_label(tid, s, e)
         with lock:
-            if tripped:
-                return "retry"   # 熔断后到达的结果一律不落盘，留给下次运行
             if status == "ok" and result:
+                # 熔断后到达的成功仍照常落盘（真成功没理由丢）
                 with open(results_file, 'a', encoding='utf-8') as f:
                     f.write(json.dumps(result, ensure_ascii=False) + '\n')
                 print(f"✅ SUCCESS: {result.get('title')} ({label})")
                 dead_streak.clear()
+                recent_ok.append((str(tid), int(s), int(e)))
+            elif tripped:
+                return "retry"   # 熔断后到达的 dead/retry 一律不落盘，留给下次运行
             elif status == "retry":
                 retry_items.append(item)
                 print(f"🔁 RETRY-LATER: {label}")
@@ -792,10 +810,8 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True)
                     dead_streak.append(item)
                     if len(dead_streak) >= DEAD_STREAK_BREAKER:
                         print(f"\n⚠️  [熔断] 连续 {len(dead_streak)} 集判死且无一成功，暂停并复探金丝雀…")
-                        if _canaries_alive(results_file):
-                            print("  [熔断] 金丝雀存活，上游正常，这段剧为真无源，继续。\n")
-                            dead_streak.clear()
-                        else:
+                        verdict = _canaries_alive(recent_ok, results_file)
+                        if verdict is False:
                             tripped = True
                             rolled = _rollback_fail_tail(fail_file, dead_streak)
                             shows = sorted({t for t, _, _ in dead_streak})
@@ -805,6 +821,9 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True)
                             raise DeadStreakBreaker(
                                 f"连续 {len(dead_streak)} 集判死且 {CANARY_COUNT} 个历史成功集复探全部失败，"
                                 f"疑似上游系统性变更，已停止以免整批误杀")
+                        print("  [熔断] 金丝雀存活，上游正常，这段剧为真无源，继续。\n" if verdict else
+                              "  [熔断] 金丝雀结果无法判断，放行继续。\n")
+                        dead_streak.clear()
         return status
 
     executor = ThreadPoolExecutor(max_workers=max_workers)
