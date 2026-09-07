@@ -592,6 +592,7 @@ _MP4_CHUNK_NO_RETRY_MARKERS = (
     _NEEDS_REFETCH_MARKER,        # 403/410 直链过期
     "服务器未按 Range 响应",      # 200 全量响应，服务端不支持 Range
     "服务器返回的不是视频分片",   # 首块是 HTML/m3u8
+    "直链块不可用",               # 404 直链不存在 / 416 Range 越界
 )
 
 
@@ -1455,6 +1456,9 @@ def _download_mp4_chunk(url, headers, start, end, index):
                     raise RuntimeError(
                         f"直链已失效（HTTP {status}），{_NEEDS_REFETCH_MARKER}: {url}"
                     )
+                if status in (404, 416):
+                    # 404 直链不存在 / 416 Range 越界（探测总长与实际不符）：同一 url 重试无意义
+                    raise RuntimeError(f"直链块不可用（HTTP {status}）: {url}")
                 if status in (429, 503):
                     record_block_status(status)
                 response.raise_for_status()

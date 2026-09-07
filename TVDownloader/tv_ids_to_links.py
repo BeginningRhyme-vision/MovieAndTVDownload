@@ -721,12 +721,14 @@ def process_episode(tid, season, episode, providers=None):
       - "dead"  确认真无源（NoSource）→ 这一集永久排除（不影响同剧其它集）
       - "retry" 瞬时错误换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
 
-    多源：同一次尝试内按 providers 顺序逐家取流，首家命中即返回；
-    某家 NoSource 或瞬时错误都继续试下一家；全部跑完仍无 url 时，
-    只要有任一家是瞬时错误就按瞬时处理（重试），全部 NoSource 才算一次“疑似无源”。
+    多源：同一次尝试内按 providers 顺序逐家取流，把各家给出的 url 全部汇总
+    （按 url 去重、保持 providers 顺序），下载侧按节点顺序逐个尝试，某家的流
+    画质/码率不达标时还能落到下一家；有任一家给出 url 即 ok。
+    全部跑完仍无 url 时，只要有任一家是瞬时错误就按瞬时处理（重试），
+    全部 NoSource 才算一次“疑似无源”。
 
     判死二次确认（DEAD_CONFIRM）：首次全家 NoSource 不立即判死，换 IP 再完整跑一次，
-    连续两次全家 NoSource 才返回 dead；确认过程最多多花 1 次尝试（总尝试数 ≤ MAX_RETRIES+1）。
+    累计两次全家 NoSource 才返回 dead；确认过程最多多花 1 次尝试（总尝试数 ≤ MAX_RETRIES+1）。
     若确认那次是瞬时错误且尝试已耗尽，返回 retry 交给下一轮（宁可多试，不误判永久丢集）。
     """
     label = _ep_label(tid, season, episode)
@@ -742,12 +744,13 @@ def process_episode(tid, season, episode, providers=None):
                 session.proxies = proxy
             try:
                 urls = []
+                seen_urls = set()
                 result_title = None
                 nosource_errors = []
                 transient_errors = []
                 for name in providers:
                     try:
-                        urls, result_title = PROVIDERS[name](session, tid, season, episode)
+                        provider_urls, provider_title = PROVIDERS[name](session, tid, season, episode)
                     except NoSource as e:
                         nosource_errors.append(f"{name}: {e}")
                         continue
@@ -755,9 +758,17 @@ def process_episode(tid, season, episode, providers=None):
                         transient_errors.append(f"{name}: {e}")
                         print(f"  [{name} 瞬时错误] {label}: {e}")
                         continue
-                    if urls:
-                        break
-                    transient_errors.append(f"{name}: empty urls")
+                    if not provider_urls:
+                        transient_errors.append(f"{name}: empty urls")
+                        continue
+                    # 汇总各家 url：按 providers 顺序拼接、按 url 去重，
+                    # 给下载侧尽可能多的候选节点（某家画质不达标时还能落到下一家）
+                    for u in provider_urls:
+                        if u["url"] not in seen_urls:
+                            seen_urls.add(u["url"])
+                            urls.append(u)
+                    if result_title is None and provider_title:
+                        result_title = provider_title
 
                 if urls:
                     # 恒用入参 tid/season/episode 作为 key，保证全链路一致：

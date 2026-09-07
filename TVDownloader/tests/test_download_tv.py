@@ -815,6 +815,18 @@ def test_download_mp4_chunk_non_video_first_block_no_retry(mp4_env, monkeypatch)
     assert d._download_mp4_chunk("u", {}, 10, 16, 1) == b"</html>"
 
 
+@pytest.mark.parametrize("status", [404, 416])
+def test_download_mp4_chunk_404_416_no_retry(mp4_env, monkeypatch, status):
+    # 404 直链不存在 / 416 Range 越界：同一 url 重试无意义，块级不退避
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 5)
+    sleeps = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    session = _install_range_session(monkeypatch, b"", status=status)
+    with pytest.raises(RuntimeError, match=f"直链块不可用（HTTP {status}）"):
+        d._download_mp4_chunk("u", {}, 0, 9, 0)
+    assert len(session.calls) == 1 and sleeps == []
+
+
 def test_download_mp4_direct_expired_link_needs_refetch(mp4_env, monkeypatch):
     _install_range_session(monkeypatch, b"", status=403)
     node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": 10}
