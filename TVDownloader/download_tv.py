@@ -2600,9 +2600,12 @@ def _run_pipeline():
         print(f"错误: 找不到 {INPUT_JSONL}")
         return
 
-    entries = []
-    input_ids = set()
+    # 读入取流结果。同一集可能因多次运行/复扫出现多行，保留**最后一次**出现的
+    # 那条：越晚写入的 url 越新，对 vidlink 这类带时效签名的直链尤其重要
+    # （保留首次出现会拿到早已过期的链接，白白浪费一次下载尝试）。
+    by_key = {}
     duplicate_input_count = 0
+    invalid_input_count = 0
     with open(INPUT_JSONL, "r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, 1):
             line = line.strip()
@@ -2615,16 +2618,24 @@ def _run_pipeline():
                 continue
 
             normalized_id = record_episode_key(entry)
-            if normalized_id and normalized_id in input_ids:
-                duplicate_input_count += 1
+            if not normalized_id:
+                # 缺 tmdbId/season/episode：无法定位到具体一集，下发下去也只会
+                # 在 process_one_entry 里判"缺少字段"确定性失败并写一条 FAILED_LOG。
+                # 在此直接计数跳过，避免残缺输入放大成等量的失败记录与日志噪声。
+                invalid_input_count += 1
                 continue
-            if normalized_id:
-                input_ids.add(normalized_id)
-            entries.append(entry)
+            if normalized_id in by_key:
+                duplicate_input_count += 1
+            by_key[normalized_id] = entry
+
+    # dict 保持插入顺序：同一集重复出现时 by_key[key] 已被后来者覆盖，
+    # 但键的位置仍是首次出现的位置，故整体顺序与输入文件一致。
+    entries = list(by_key.values())
 
     print(
         f"共读取 {len(entries)} 个去重后的条目（集）；"
         f"输入文件内跳过 {duplicate_input_count} 个重复集"
+        f"（同集保留最新一条）、{invalid_input_count} 个缺少身份字段的条目"
     )
 
     ignored_errors = {

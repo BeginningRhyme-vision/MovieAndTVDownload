@@ -1609,6 +1609,77 @@ def test_degrade_success_log_is_deduped_by_key(sandbox, monkeypatch):
     assert "s3_key" not in records[0]
 
 
+def test_run_pipeline_keeps_latest_duplicate_and_skips_invalid(sandbox, monkeypatch):
+    """输入去重保留最后一条；缺身份字段的行读入即跳过。
+
+    同一集在多次运行/复扫后会有多行，越晚写入的 url 越新 —— 对 vidlink 这类
+    带时效签名的直链，保留首次出现等于拿一条早已过期的链接白跑一趟。
+    缺 tmdbId/season/episode 的行无法定位到集，放进流水线只会放大成等量的
+    确定性失败记录，故在读入阶段就计数跳过。
+    """
+    lines = [
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["old"]},
+        {"tmdbId": "2", "season": 1, "episode": 1, "urls": ["only"]},
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["new"]},  # 覆盖首条
+        {"urls": ["x"]},                       # 缺全部身份字段
+        {"tmdbId": "3", "urls": ["y"]},        # 缺 season/episode
+    ]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+
+    seen = []
+
+    def fake_process(entry, processed_ids):
+        seen.append((d.record_episode_key(entry), entry.get("urls")))
+        return "x", False, {"error": "低于红线", "retriable": False}
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    d._run_pipeline()
+
+    keys = sorted(k for k, _ in seen)
+    assert keys == ["1_S01E01", "2_S01E01"]      # 残缺行未进入流水线
+    urls_of_1 = dict(seen)["1_S01E01"]
+    assert urls_of_1 == ["new"]                   # 保留的是最后一条
+
+
+def test_run_pipeline_preserves_input_order(sandbox, monkeypatch):
+    """去重改用 dict 后仍须保持输入文件顺序（dict 保插入序）。"""
+    lines = [
+        {"tmdbId": str(i), "season": 1, "episode": 1, "urls": ["u"]}
+        for i in (5, 3, 9, 1)
+    ]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "DOWNLOAD_QUEUE_DEPTH", 1)
+    monkeypatch.setattr(d, "MAX_WORKERS", 1)
+
+    order = []
+
+    def fake_process(entry, processed_ids):
+        order.append(entry["tmdbId"])
+        return "x", False, {"error": "低于红线", "retriable": False}
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    d._run_pipeline()
+    assert order == ["5", "3", "9", "1"]
+
+
 # ---------------------------------------------------------------- reupload
 def test_reupload_pending_flow(sandbox, monkeypatch, capsys):
     monkeypatch.setattr(d, "S3_ENABLED", True)

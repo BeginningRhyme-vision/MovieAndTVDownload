@@ -542,6 +542,31 @@ def test_process_episode_ok_uses_input_key_and_merges_meta(monkeypatch):
     assert result["year"] == 2011 and result["original_title"] == "Orig"
 
 
+def test_process_episode_meta_cannot_override_identity(monkeypatch):
+    """剧级元数据绝不能覆盖本集的身份字段。
+
+    _SERIES_META 来自 tv_series.jsonl（一剧一条）。若该表哪天多出 season/
+    episode/tmdbId 之类的键，直接 update 会把本集身份改掉，下游据此拼文件名与
+    R2 对象键，成片会静默写到错误位置且极难发现。这里显式塞入污染键做回归。
+    """
+    _install_fake_session(monkeypatch, PAGE, [{"url": "u1", "title": "Real"}])
+    monkeypatch.setattr(m, "_SERIES_META", {"42": {
+        # 污染键：全部应被忽略
+        "tmdbId": "999", "season": 99, "episode": 99,
+        "urls": ["evil"], "title": "EvilTitle",
+        # 正常元数据：应被合并
+        "year": 2011, "runtime_minutes": 45,
+    }})
+    status, result = m.process_episode("42", 2, 3)
+    assert status == "ok"
+    assert result["tmdbId"] == "42"
+    assert result["season"] == 2 and result["episode"] == 3
+    assert result["title"] == "Real"
+    assert _urls(result) == ["u1"]
+    # 非身份字段仍正常合并
+    assert result["year"] == 2011 and result["runtime_minutes"] == 45
+
+
 def test_process_episode_ok_without_tmdbid_in_stream(monkeypatch):
     # 解密结果缺 tmdbId 不再是失败条件，只要有 url 即成功；title 无任何来源时兜底空串（下游按 str 用）
     _install_fake_session(monkeypatch, PAGE, [{"url": "u"}])

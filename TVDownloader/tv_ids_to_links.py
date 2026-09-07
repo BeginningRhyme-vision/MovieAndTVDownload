@@ -217,6 +217,9 @@ def load_series_metadata():
 
 
 _SERIES_META = load_series_metadata()
+# 每集结果里的"身份字段"：由 process_episode 用入参权威写入，合并剧级元数据时
+# 必须保护、绝不允许被覆盖（下游据此做去重、拼文件名与 R2 对象键）。
+_IDENTITY_KEYS = frozenset({"urls", "tmdbId", "season", "episode", "title"})
 # tmdbId -> TMDB 剧名，由 main() 在季集展开后填充；源站不返回 title 时用它兜底
 _TMDB_NAMES = {}
 
@@ -781,7 +784,13 @@ def process_episode(tid, season, episode, providers=None):
                         # 源站 title 偶尔为空，回退 TMDB 剧名，再兜底空串（下游 download_tv/fetch_subtitles 按 str 使用）
                         "title": result_title or _TMDB_NAMES.get(str(tid)) or "",
                     }
-                    result.update(_SERIES_META.get(str(tid), {}))
+                    # 合并剧级静态元数据，但**绝不覆盖上面的身份字段**：元数据来自
+                    # tv_series.jsonl，是剧级的（一剧一条），若它哪天多出 season/
+                    # episode/tmdbId 之类的键，直接 update 会把本集的真实身份改掉，
+                    # 下游据此拼 R2 路径与文件名，成片会静默写到错误的位置且极难发现。
+                    for meta_key, meta_value in _SERIES_META.get(str(tid), {}).items():
+                        if meta_key not in _IDENTITY_KEYS:
+                            result[meta_key] = meta_value
                     return "ok", result
 
                 if transient_errors:
