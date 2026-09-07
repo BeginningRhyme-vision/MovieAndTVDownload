@@ -204,6 +204,36 @@ def test_move_to_target_folder_cleans_partial_on_failure(sandbox, monkeypatch):
     assert not (base / "tv_000001" / "1_S01E01.mp4").exists()
 
 
+def test_move_to_target_folder_places_holder_before_moving(sandbox, monkeypatch):
+    """移动在锁外执行，锁内先落 0 字节占位把目录名额定死。
+
+    这样并发的其它 worker 在锁内计数时就能看到它、不会把同一目录算成未满，
+    从而在跨盘（shutil.move 退化为 copy+del）时既不串行化也不超容量。
+    """
+    base = sandbox / "downloads"
+    temp = sandbox / "temp"
+    temp.mkdir()
+    src = temp / "a.mp4"
+    src.write_bytes(b"v")
+    seen = {}
+
+    real_move = d.shutil.move
+
+    def spy(src_path, dst_path):
+        # 移动发生时占位文件已存在，且此刻不再持有 folder_lock。
+        seen["holder_exists"] = os.path.exists(dst_path)
+        seen["lock_free"] = d.folder_lock.acquire(blocking=False)
+        if seen["lock_free"]:
+            d.folder_lock.release()
+        return real_move(src_path, dst_path)
+
+    monkeypatch.setattr(d.shutil, "move", spy)
+    final = d.move_to_target_folder(str(src), "1_S01E01")
+    assert seen == {"holder_exists": True, "lock_free": True}
+    assert final == str(base / "tv_000001" / "1_S01E01.mp4")
+    assert (base / "tv_000001" / "1_S01E01.mp4").read_bytes() == b"v"
+
+
 def test_clean_temp_directory(sandbox):
     temp = sandbox / "temp"
     temp.mkdir()
@@ -315,8 +345,14 @@ def test_permanent_markers_match_movie_version():
 
     movie = Path(__file__).resolve().parents[2] / "MovieDownloader" / "download_movies.py"
     src = movie.read_text(encoding="utf-8")
+    # mp4 直链相关的 marker 是 TV 侧多源接入（vidlink）独有的，MovieDownloader
+    # 目前只有 m3u8 一条路径，故不参与对齐校验。
+    tv_only = {
+        "需重新取流", "直链块不可用", "直链不支持 Range",
+        "服务器未按 Range 响应", "直链总长异常", "直链下载长度不符",
+    }
     for marker in d._PERMANENT_FAILURE_MARKERS:
-        if marker.startswith("缺少 "):
+        if marker.startswith("缺少 ") or marker in tv_only:
             continue
         assert marker in src, marker
 
@@ -387,6 +423,42 @@ def test_parse_media_playlist_ts(monkeypatch):
     assert urls == ["https://cdn/x/seg0.ts", "https://cdn/x/seg1.ts"]
     assert durations == [4.0, 3.5]
     assert init is None
+
+
+def test_playlist_parsers_forward_node_headers(monkeypatch):
+    """取流阶段记录的节点专属请求头必须透传到 m3u8 两级 playlist 请求。
+
+    某些源站没有正确的 Referer/UA 会直接 403/428，丢头等于白白损失一个可用源。
+    """
+    seen = []
+
+    def fake_request(method, url, **kwargs):
+        seen.append(kwargs.get("headers"))
+        return "#EXTM3U\n#EXTINF:4.0,\nseg0.ts\n"
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    node_headers = {"Referer": "https://src/"}
+    d.parse_master_playlist("https://cdn/x/i.m3u8", headers=node_headers)
+    d.parse_media_playlist("https://cdn/x/i.m3u8", headers=node_headers)
+    assert seen == [node_headers, node_headers]
+
+
+def test_download_segments_forwards_headers(sandbox, monkeypatch):
+    """分片下载同样要带节点头，否则正片阶段会整片 403。"""
+    seen = []
+
+    def fake_single(url, index, retry_max, delay, headers=None):
+        seen.append(headers)
+        return b"x"
+
+    monkeypatch.setattr(d, "download_single_segment", fake_single)
+    out = os.path.join(str(sandbox), "o.ts")
+    node_headers = {"User-Agent": "okhttp/4.9.3"}
+    d.download_segments(
+        ["u0", "u1"], out, init_url="i", headers=node_headers, concurrency=1
+    )
+    # init 段 + 2 个媒体分片都带上了节点头
+    assert seen == [node_headers] * 3
 
 
 def test_parse_media_playlist_fmp4_init(monkeypatch):
@@ -491,7 +563,7 @@ def test_process_one_entry_node_fallback_and_cleanup(sandbox, monkeypatch):
     """Two nodes: first raises a retriable error, second a permanent one -> still retriable."""
     calls = []
 
-    def fake_master(url, retries=None):
+    def fake_master(url, retries=None, headers=None):
         calls.append((url, retries))
         if url == "u1":
             raise RuntimeError("Read timed out")
@@ -512,7 +584,9 @@ def test_process_one_entry_node_fallback_and_cleanup(sandbox, monkeypatch):
 def test_process_one_entry_permanent_only(sandbox, monkeypatch):
     monkeypatch.setattr(
         d, "parse_master_playlist",
-        lambda url, retries=None: (_ for _ in ()).throw(RuntimeError("没有找到媒体播放列表")),
+        lambda url, retries=None, headers=None: (_ for _ in ()).throw(
+            RuntimeError("没有找到媒体播放列表")
+        ),
     )
     monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
     entry = {"tmdbId": 1, "season": 1, "episode": 1, "urls": ["u"]}
@@ -528,9 +602,14 @@ def test_process_one_entry_happy_path_builds_job(sandbox, monkeypatch):
     monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
     monkeypatch.setattr(
         d, "parse_master_playlist",
-        lambda url, retries=None: [("1920x1080", "https://cdn/i.m3u8", 5000.0)],
+        lambda url, retries=None, headers=None: [
+            ("1920x1080", "https://cdn/i.m3u8", 5000.0)
+        ],
     )
-    monkeypatch.setattr(d, "parse_media_playlist", lambda url: (seg_urls, durations, None))
+    monkeypatch.setattr(
+        d, "parse_media_playlist",
+        lambda url, headers=None: (seg_urls, durations, None),
+    )
     monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
     monkeypatch.setattr(d, "probe_resolution", lambda p: None)
     monkeypatch.setattr(d, "SAMPLE_COUNT", 4)
@@ -538,7 +617,7 @@ def test_process_one_entry_happy_path_builds_job(sandbox, monkeypatch):
     monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
 
     def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
-                      init_url=None, force_init=False):
+                      init_url=None, force_init=False, headers=None):
         if end_idx is None:
             end_idx = len(urls)
         n = end_idx - start_idx
@@ -599,7 +678,7 @@ def test_mp4_request_headers_drop_referer_and_xhr():
 def test_process_one_entry_dict_urls_use_m3u8_path(sandbox, monkeypatch):
     calls = []
 
-    def fake_master(url, retries=None):
+    def fake_master(url, retries=None, headers=None):
         calls.append((url, retries))
         raise RuntimeError("Read timed out")
 
@@ -632,7 +711,9 @@ def test_process_one_entry_mp4_branch_builds_job(sandbox, monkeypatch):
     monkeypatch.setattr(d, "_download_mp4_direct", fake_direct)
     monkeypatch.setattr(
         d, "parse_master_playlist",
-        lambda url, retries=None: pytest.fail("mp4 节点不应走 playlist 解析"),
+        lambda url, retries=None, headers=None: pytest.fail(
+            "mp4 节点不应走 playlist 解析"
+        ),
     )
     node = {"url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4",
             "headers": {"User-Agent": "okhttp/4.9.3"}, "quality": 1080, "size": 1}
@@ -649,7 +730,10 @@ def test_process_one_entry_mp4_branch_builds_job(sandbox, monkeypatch):
 
 
 def test_process_one_entry_mp4_then_m3u8_fallback(sandbox, monkeypatch):
-    """mp4 直链 403 过期 -> 可重试；切到备用 m3u8 节点，残留 ts 被清理。"""
+    """mp4 直链 403 过期属确定性失败；切到备用 m3u8 节点，残留 ts 被清理。
+
+    末节点是瞬时错误 -> 整集仍判可重试（any_retriable 不被首节点的确定性失败连坐）。
+    """
     calls = []
 
     def fake_direct(node, output_path, label, runtime_minutes=None):
@@ -657,9 +741,9 @@ def test_process_one_entry_mp4_then_m3u8_fallback(sandbox, monkeypatch):
             fh.write(b"partial")
         raise RuntimeError(f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: x")
 
-    def fake_master(url, retries=None):
+    def fake_master(url, retries=None, headers=None):
         calls.append((url, retries))
-        raise RuntimeError("没有找到媒体播放列表")
+        raise RuntimeError("Read timed out")
 
     monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
     monkeypatch.setattr(d, "_download_mp4_direct", fake_direct)
@@ -670,16 +754,56 @@ def test_process_one_entry_mp4_then_m3u8_fallback(sandbox, monkeypatch):
     ]}
     _, ok, info = d.process_one_entry(entry, set())
     assert ok is False
-    assert info["retriable"] is True  # 直链过期可重试，不被末节点确定性失败连坐
+    assert info["retriable"] is True
     assert calls == [("https://v/m.m3u8", None)]
     assert not os.path.exists(os.path.join(d.TEMP_DIR, "temp_1_S01E01.ts"))
     assert d.processing_ids == set()
 
 
-def test_refetch_marker_is_retriable_and_classified():
+def test_process_one_entry_mp4_expired_only_is_permanent(sandbox, monkeypatch):
+    """唯一节点是过期直链时整集判确定性失败：本脚本无法重新取流，重投同一条 url 必然再挂。"""
+    def fake_direct(node, output_path, label, runtime_minutes=None):
+        raise RuntimeError(f"直链已失效（HTTP 410），{d._NEEDS_REFETCH_MARKER}: x")
+
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "_download_mp4_direct", fake_direct)
+    entry = {"tmdbId": 1, "season": 1, "episode": 1, "urls": [
+        {"url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4"},
+    ]}
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False and info["retriable"] is False
+
+
+def test_refetch_marker_is_permanent_and_classified():
+    """403/410 过期直链：判死（交由上游重跑取流），但统计上单列一类便于观测。"""
     msg = f"直链已失效（HTTP 410），{d._NEEDS_REFETCH_MARKER}: u"
-    assert d._classify_failure(msg) is True
+    assert d._classify_failure(msg) is False
     assert d.classify_reject_reason(msg) == "直链失效需重新取流"
+
+
+@pytest.mark.parametrize("msg,category", [
+    ("直链块不可用（HTTP 404）: u", "直链块不可用(404/416)"),
+    ("直链不支持 Range 分块下载: u", "直链不支持Range"),
+    ("服务器未按 Range 响应（HTTP 200）", "直链不支持Range"),
+    ("直链总长异常(0): u", "直链总长异常"),
+    ("直链下载长度不符：1 != 2", "直链总长异常"),
+])
+def test_mp4_failures_are_permanent_and_classified(msg, category):
+    """mp4 直链的确定性失败：同一条 url 重下必然复现，不该占用下一轮下载槽位。"""
+    assert d._classify_failure(msg) is False
+    assert d.classify_reject_reason(msg) == category
+
+
+def test_mp4_probe_failure_stays_retriable():
+    """探测失败文案同时覆盖网络异常与"无法确定总长"两种来源，无法区分。
+
+    按"宁可多试一轮也不误杀"的取向保持可重试；统计上单列"直链探测失败"类目，
+    便于跑完后从占比判断到底是源站抖动还是直链本身不可用。
+    """
+    for msg in ("直链探测失败: u; Read timed out",
+                "直链探测失败：无法确定文件总长: u"):
+        assert d._classify_failure(msg) is True
+        assert d.classify_reject_reason(msg) == "直链探测失败"
 
 
 class _FakeResp:
@@ -827,12 +951,48 @@ def test_download_mp4_chunk_404_416_no_retry(mp4_env, monkeypatch, status):
     assert len(session.calls) == 1 and sleeps == []
 
 
+def test_download_mp4_chunk_aborts_immediately_when_event_set(mp4_env, monkeypatch):
+    """整片已判失败时，在途块必须立刻放弃、不再发请求也不再退避。
+
+    否则同片其它块会跑满 SEG_RETRY_MAX 次退避（最长十几分钟），
+    占死下载槽位、拖慢换下一个取流节点。
+    """
+    import threading
+
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 5)
+    session = _install_range_session(monkeypatch, b"", status=500)
+    abort = threading.Event()
+    abort.set()
+    with pytest.raises(RuntimeError, match="已随整片失败取消"):
+        d._download_mp4_chunk("u", {}, 0, 9, 0, abort)
+    assert session.calls == []
+
+
+def test_download_mp4_chunk_abort_wakes_up_backoff(mp4_env, monkeypatch):
+    """退避等待期间整片判失败：用 Event.wait 立刻醒来，不空等完整个退避。"""
+    import threading
+
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "SEG_RETRY_DELAY", 30)
+    abort = threading.Event()
+    session = _install_range_session(monkeypatch, b"", status=500)
+    # 首次请求失败进入退避，退避中 abort 被置位 -> 直接结束，不再重试。
+    monkeypatch.setattr(abort, "wait", lambda timeout: True)
+    monkeypatch.setattr(
+        d.time, "sleep", lambda s: pytest.fail("有 abort_event 时不该用 sleep")
+    )
+    with pytest.raises(RuntimeError, match="重试后仍失败"):
+        d._download_mp4_chunk("u", {}, 0, 9, 0, abort)
+    assert len(session.calls) == 1
+
+
 def test_download_mp4_direct_expired_link_needs_refetch(mp4_env, monkeypatch):
     _install_range_session(monkeypatch, b"", status=403)
     node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": 10}
     with pytest.raises(RuntimeError, match=d._NEEDS_REFETCH_MARKER) as exc:
         d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
-    assert d._classify_failure(str(exc.value)) is True
+    # 判死：本脚本读固化的 results.jsonl，无法重新取流，重投同一条 url 必然再挂。
+    assert d._classify_failure(str(exc.value)) is False
 
 
 def test_download_mp4_direct_quality_prefilter(mp4_env, monkeypatch):
@@ -986,6 +1146,100 @@ def test_main_lock_lifecycle(sandbox):
         fh.write("1")
     d.release_main_lock()
     assert os.path.exists(d.MAIN_LOCK_FILE)
+
+
+def test_acquire_main_lock_rejects_concurrent_run(sandbox, monkeypatch):
+    """已有存活主流程时必须 fail-fast：并发跑会重复下载并互相覆盖日志。"""
+    monkeypatch.setattr(d, "is_main_running", lambda: True)
+    with pytest.raises(SystemExit) as exc:
+        d.acquire_main_lock()
+    assert exc.value.code == 1
+    assert not os.path.exists(d.MAIN_LOCK_FILE)
+
+
+# ---------------------------------------------------------------- pipeline batching
+def test_run_pipeline_batches_download_submissions(sandbox, monkeypatch):
+    """分批投递：同时在途的下载 future 不超过 DOWNLOAD_QUEUE_DEPTH，但每一集都要跑到。
+
+    一次性把整轮全部集 submit 进 pending，会让 wait(FIRST_COMPLETED) 每次都对
+    全部未完成 future 挂/摘 waiter，几万集时主循环退化成 O(N²)。分批后 wait
+    规模恒定在槽位量级，语义（每集都处理、失败分类不变）必须完全一致。
+    """
+    entries = [
+        {"tmdbId": str(i), "season": 1, "episode": 1, "urls": ["u"]}
+        for i in range(20)
+    ]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MAX_WORKERS", 2)
+    monkeypatch.setattr(d, "DOWNLOAD_QUEUE_DEPTH", 4)
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+
+    lock = __import__("threading").Lock()
+    state = {"inflight": 0, "peak": 0, "seen": []}
+
+    def fake_process(entry, processed_ids):
+        with lock:
+            state["inflight"] += 1
+            state["peak"] = max(state["peak"], state["inflight"])
+            state["seen"].append(entry["tmdbId"])
+        try:
+            # 确定性失败：不进转封装，也不触发下一轮。
+            return entry["tmdbId"], False, {
+                "error": "没有找到媒体播放列表", "retriable": False,
+            }
+        finally:
+            with lock:
+                state["inflight"] -= 1
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    d._run_pipeline()
+
+    assert sorted(state["seen"], key=int) == [str(i) for i in range(20)]
+    assert state["peak"] <= d.DOWNLOAD_QUEUE_DEPTH
+    failed = _read_jsonl(d.FAILED_LOG)
+    assert len(failed) == 20 and all(r["stage"] == "download" for r in failed)
+
+
+def test_run_pipeline_retries_only_retriable_entries(sandbox, monkeypatch):
+    """分批投递不影响多轮语义：只有可重试的失败才进下一轮。"""
+    entries = [
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["u"]},
+        {"tmdbId": "2", "season": 1, "episode": 1, "urls": ["u"]},
+    ]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in entries),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", True)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 3)
+    monkeypatch.setattr(d, "ROUND_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(d, "DOWNLOAD_QUEUE_DEPTH", 1)
+
+    attempts = []
+
+    def fake_process(entry, processed_ids):
+        attempts.append(entry["tmdbId"])
+        if entry["tmdbId"] == "1":
+            return "1", False, {"error": "Read timed out", "retriable": True}
+        return "2", False, {"error": "低于红线", "retriable": False}
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    d._run_pipeline()
+
+    # tmdbId=1 可重试 -> 跑满 3 轮；tmdbId=2 确定性失败 -> 只跑第一轮。
+    assert attempts.count("1") == 3 and attempts.count("2") == 1
 
 
 # ---------------------------------------------------------------- reupload

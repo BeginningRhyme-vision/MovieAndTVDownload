@@ -90,6 +90,14 @@ START_FOLDER_INDEX = _CFG.get("start_folder_index", 1)
 
 # 下载线程池固定保持的影片下载数。
 MAX_WORKERS = _CFG.get("max_workers", 32)
+# 主循环同时持有的“下载 future”上限（分批投递深度）。
+# 一次性把整轮几万集全 submit 进 pending，会让 wait(FIRST_COMPLETED) 每次都对
+# 全部未完成 future 挂/摘 waiter，主循环退化成 O(N²)。分批后 wait 规模恒定在
+# 槽位量级。必须 > max_workers，否则下载池喂不满、并发上不去。
+DOWNLOAD_QUEUE_DEPTH = max(
+    int(MAX_WORKERS) + 1,
+    int(_CFG.get("download_queue_depth", int(MAX_WORKERS) * 2)),
+)
 # 独立的 FFmpeg 转封装/移动线程数，不占用上面的下载槽位。
 CONVERT_WORKERS = _CFG.get("convert_workers", 16)
 # 单部影片同时下载的分片数。
@@ -172,7 +180,9 @@ S3_PREFIX = (_S3_CFG.get("prefix", "") or "").strip("/")
 S3_ACCESS_KEY = _s3_secret("access_key", "R2_ACCESS_KEY")
 S3_SECRET_KEY = _s3_secret("secret_key", "R2_SECRET_KEY")
 UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
-MAX_PENDING_UPLOADS = _S3_CFG.get("max_pending_uploads", 64)
+# 反压上限至少为 1：配成 0 会让 BoundedSemaphore 初值为 0，主循环首次 acquire
+# 就永久阻塞（release 只能由已提交的上传 future 触发，永远不会发生）。
+MAX_PENDING_UPLOADS = max(1, int(_S3_CFG.get("max_pending_uploads", 64)))
 UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
 UPLOAD_RETRY_DELAY = _S3_CFG.get("upload_retry_delay", 3)
 DELETE_LOCAL_AFTER_UPLOAD = bool(_S3_CFG.get("delete_local_after_upload", True))
@@ -581,10 +591,21 @@ _PERMANENT_FAILURE_MARKERS = (
     "低于红线",                   # 实测分辨率低于红线
     "码率未达到",                 # 采样码率未达到按高度平方缩放的门槛
     "服务器返回的不是视频分片",   # 源返回 HTML/m3u8，通常是无效源
+    # ---- mp4 直链：同一条 url 重下必然复现的确定性失败 ----
+    # 本脚本读的是固化的 results.jsonl，没有重新取流的能力，多轮重投拿到的
+    # 还是同一条 url，白烧带宽与下载槽位。这类失败要靠重跑 tv_ids_to_links.py
+    # 换一条新直链来修复，故在此判死、只留 failed.jsonl 供上游重新取流。
+    "需重新取流",                 # 403/410 签名直链已过期
+    "直链块不可用",               # 404 直链不存在 / 416 Range 越界
+    "直链不支持 Range",           # 服务端不支持 Range 分块
+    "服务器未按 Range 响应",      # 块请求被 200 全量响应
+    "直链总长异常",               # 探测出的总长 <= 0
+    "直链下载长度不符",           # 各块均成功但总长对不上，探测总长本身有误
 )
 
-# mp4 直链（vidlink 签名 url 带 sign&t 时效）返回 403/410 时的文案标记：
-# 不是画质问题也不是源站故障，而是直链过期——保持“可重试”，让下一轮/重新取流有机会。
+# mp4 直链（vidlink 签名 url 带 sign&t 时效）返回 403/410 时的文案标记。
+# 注意：它同时也在 _PERMANENT_FAILURE_MARKERS 中——本脚本无法重新取流，
+# 重试同一条过期 url 必然再挂，判死后交由上游重跑取流修复。
 _NEEDS_REFETCH_MARKER = "需重新取流"
 
 # mp4 直链单块下载中“重试也没用”的文案：命中即不再走块级退避重试，直接上抛。
@@ -626,6 +647,14 @@ _REJECT_REASON_RULES = (
     ("正片缺片率过高", ("缺片率过高",)),
     ("源返回非视频分片", ("服务器返回的不是视频分片",)),
     ("直链失效需重新取流", (_NEEDS_REFETCH_MARKER,)),
+    # mp4 直链专属类目：与上面的 m3u8 类目并列，便于在收尾统计里单独看
+    # vidlink 直链的淘汰构成（多源接入后校准门槛/判断源质量的关键数据）。
+    # 放在“超时/SSL”之前：这几条是确定性结论，不该被通用网络类目抢先命中。
+    ("直链块不可用(404/416)", ("直链块不可用",)),
+    ("直链不支持Range", ("直链不支持 Range", "服务器未按 Range 响应")),
+    ("直链总长异常", ("直链总长异常", "直链下载长度不符")),
+    ("直链块重试耗尽", ("直链块",)),
+    ("直链探测失败", ("直链探测失败",)),
     ("源站5xx", ("HTTP Error 5", "500 Server Error", "502", "503", "504")),
     ("超时", ("timed out", "timeout", "超时")),
     ("SSL/连接错误", ("SSL", "Connection", "ConnectionError")),
@@ -799,7 +828,20 @@ def _pid_alive(pid):
 
 
 def acquire_main_lock():
-    """主流程启动时写入 PID 锁文件。"""
+    """主流程启动时抢占 PID 锁；已有存活主流程时直接拒绝启动。
+
+    两个主流程并发跑会各自持有独立的 processing_ids/processed_ids 内存态，
+    彼此看不见对方在下哪一集，必然重复下载同一集并交错追加 success/pending，
+    还会互相覆盖 os.replace 的原子重写结果导致记录丢失。故此处 fail-fast。
+    """
+    if is_main_running():
+        print(
+            "检测到已有 download_tv.py 主流程在运行"
+            f"（锁文件 {MAIN_LOCK_FILE}）。并发运行会重复下载并覆盖日志记录，"
+            "本次启动已中止。确认上一进程确实已退出后可删除该锁文件重试。",
+            flush=True,
+        )
+        sys.exit(1)
     with open(MAIN_LOCK_FILE, "w", encoding="utf-8") as file:
         file.write(str(os.getpid()))
 
@@ -861,12 +903,16 @@ def clean_temp_directory():
 
 def move_to_target_folder(temp_mp4, key):
     """
-    在同一把锁内选择目录并移动文件，防止高并发时目录容量超限。
+    先在锁内选定落点目录并占位，再在锁外执行移动，防止高并发时目录容量超限。
     shutil.move 同时支持跨文件系统移动。
     成品文件名为集级 key（`{tmdbId}_S01E03.mp4`）。
 
     用模块级游标 _current_folder_index 缓存"当前正在填的目录号"，从它起找而非
     每次从 START 全量重扫已满目录，把大批量下的 O(N²) listdir 降为 ~O(N)。
+
+    移动本身放在锁外：base_dir 与 temp_dir 跨盘时 shutil.move 是 copy+delete，
+    一部片要几十秒；若在锁内做，所有转封装 worker 会被这把全局锁完全串行化。
+    锁内已用 0 字节占位文件把目标名额定死，故锁外移动不会导致目录超容量。
     """
     global _current_folder_index
     with folder_lock:
@@ -885,33 +931,43 @@ def move_to_target_folder(temp_mp4, key):
             if mp4_count < MAX_VIDEOS_PER_FOLDER or os.path.exists(final_path):
                 # 缓存住当前落点目录：下次从这里起找，跳过前面已满目录。
                 _current_folder_index = index
-                remove_file(final_path)
-                print(f"  [{key}] 正在移动到: {final_path}", flush=True)
-                # 跨文件系统时 shutil.move 是 copy+del，若 copy 中途失败
-                # （目标盘写满/IO 错误）会在 final_path 留下半成品 mp4：它不在
-                # cleanup_paths、去重表也无登记，会成孤儿并白占目录名额。故失败
-                # 时先清掉半成品再抛出，交由上层按转封装失败处理。
-                try:
-                    shutil.move(temp_mp4, final_path)
-                except Exception:
-                    remove_file(final_path)
-                    raise
-                return final_path
+                # 占位：立即以空文件占住该名额，这样并发的其它 worker 在锁内
+                # 计数时就能看到它，不会把同一目录算成未满而超容量。空文件的
+                # 大小为 0，扫描去重（scan_downloaded_mp4_ids 只认非空 mp4）
+                # 也不会把它误判为已下载成品。
+                with open(final_path, "wb"):
+                    pass
+                break
             index += 1
+
+    # 锁外移动：失败时清掉占位/半成品，交由上层按转封装失败处理。
+    # 跨文件系统时 shutil.move 是 copy+del，若 copy 中途失败（目标盘写满/IO
+    # 错误）会在 final_path 留下半成品 mp4：它不在 cleanup_paths、去重表也无
+    # 登记，会成孤儿并白占目录名额。
+    try:
+        shutil.move(temp_mp4, final_path)
+    except Exception:
+        remove_file(final_path)
+        raise
+    print(f"  [{key}] 已移动到: {final_path}", flush=True)
+    return final_path
 
 
 # ---------- M3U8 解析 ----------
-def parse_master_playlist(master_url, retries=None):
+def parse_master_playlist(master_url, retries=None, headers=None):
     """返回 [(resolution, media_playlist_url, declared_bandwidth_kbps), ...]。
 
     retries 为 None 时用默认强度 PLAYLIST_RETRY_MAX；方案C fallback 里对
     非末节点传更小的值，以便坏节点快速判定并换下一个备用节点。
+    headers 为取流阶段记录的节点专属请求头（如特定 Referer/UA），与全局
+    HEADERS 合并后使用；为空时行为与旧版完全一致。
     """
     text = request_with_retry(
         "GET", master_url, as_text=True,
         retries=PLAYLIST_RETRY_MAX if retries is None else retries,
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
+        headers=headers,
     )
     lines = [line.strip() for line in text.splitlines()]
     variants = []
@@ -951,19 +1007,21 @@ def parse_master_playlist(master_url, retries=None):
     return variants
 
 
-def parse_media_playlist(playlist_url):
+def parse_media_playlist(playlist_url, headers=None):
     """
     解析媒体播放列表，返回 (分片 URL 列表, 时长列表, init 段 URL)。
 
     同时支持 MPEG-TS 和 fMP4：fMP4 会带 #EXT-X-MAP 声明一个 init 段，
     该段必须写在所有媒体分片之前，否则产出的文件无法解码。TS 没有
     init 段，返回 None。
+    headers 同 parse_master_playlist：节点专属请求头，为空时用全局 HEADERS。
     """
     text = request_with_retry(
         "GET", playlist_url, as_text=True,
         retries=PLAYLIST_RETRY_MAX,
         backoff=PLAYLIST_RETRY_BACKOFF,
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
+        headers=headers,
     )
     lines = [line.strip() for line in text.splitlines()]
     init_url = None
@@ -1134,13 +1192,14 @@ def validate_segment_content(content, url):
         raise RuntimeError(f"服务器返回的不是视频分片: {url}")
 
 
-def download_single_segment(url, index, retry_max, delay):
+def download_single_segment(url, index, retry_max, delay, headers=None):
     last_error = None
     for attempt in range(1, retry_max + 1):
         try:
             # 外层已经负责精确重试次数，因此这里关闭额外应用层重试。
             content = request_with_retry(
-                "GET", url, retries=1, as_text=False, timeout=60
+                "GET", url, retries=1, as_text=False, timeout=60,
+                headers=headers,
             )
             validate_segment_content(content, url)
             return content
@@ -1170,6 +1229,7 @@ def download_segments(
     concurrency=SEGMENT_CONCURRENCY,
     init_url=None,
     force_init=False,
+    headers=None,
 ):
     """
     并发下载、按索引顺序写入分片。
@@ -1189,6 +1249,8 @@ def download_segments(
     分片之前。默认只在新建文件（start_idx == 0，wb 模式）时写入一次。
     force_init=True 时，即使 start_idx>0（如中间采样单独成文件）也强制写一次
     init 段——否则 fMP4 中间采样片缺 moov，ffprobe 无法探测分辨率/编码。
+    headers 为取流阶段记录的节点专属请求头，透传给每个分片请求；为空时用全局
+    HEADERS（与旧版行为一致）。
     """
     if end_idx is None:
         end_idx = len(segment_urls)
@@ -1210,7 +1272,7 @@ def download_segments(
         # force_init 强制补写，保证该采样文件自身可被 ffprobe 探测。
         if init_url and (mode == "wb" or force_init):
             init_data = download_single_segment(
-                init_url, -1, SEG_RETRY_MAX, SEG_RETRY_DELAY
+                init_url, -1, SEG_RETRY_MAX, SEG_RETRY_DELAY, headers
             )
             output_file.write(init_data)
             init_bytes = len(init_data)
@@ -1236,6 +1298,7 @@ def download_segments(
                     index,
                     SEG_RETRY_MAX,
                     SEG_RETRY_DELAY,
+                    headers,
                 )
                 future_to_index[future] = index
                 next_submit += 1
@@ -1437,13 +1500,21 @@ def _mp4_probe_total_size(url, headers, declared_size):
     raise RuntimeError(f"直链探测失败：无法确定文件总长: {url}")
 
 
-def _download_mp4_chunk(url, headers, start, end, index):
-    """下载 [start, end] 闭区间字节块；服务端不按 Range 响应（200）时视为失败。"""
+def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
+    """下载 [start, end] 闭区间字节块；服务端不按 Range 响应（200）时视为失败。
+
+    abort_event 置位表示"整片已判失败、无需再抢救本块"：此时不再进入下一次
+    退避重试，立即抛错让工作线程尽快归还。否则同片其它块失败后，在跑的块仍会
+    跑满 SEG_RETRY_MAX 次退避（最长可达十几分钟），占死下载槽位、拖慢换节点，
+    直接损害整体下载成功率。
+    """
     last_error = None
     request_headers = dict(headers)
     request_headers["Range"] = f"bytes={start}-{end}"
     expected = end - start + 1
     for attempt in range(1, SEG_RETRY_MAX + 1):
+        if abort_event is not None and abort_event.is_set():
+            raise RuntimeError(f"直链块 {index + 1} 已随整片失败取消")
         try:
             session = get_session()
             merged = dict(HEADERS)
@@ -1479,6 +1550,7 @@ def _download_mp4_chunk(url, headers, start, end, index):
             if (
                 any(marker in message for marker in _MP4_CHUNK_NO_RETRY_MARKERS)
                 or attempt == SEG_RETRY_MAX
+                or (abort_event is not None and abort_event.is_set())
             ):
                 break
             wait = min(SEG_RETRY_DELAY * (2 ** (attempt - 1)), 60)
@@ -1487,7 +1559,12 @@ def _download_mp4_chunk(url, headers, start, end, index):
                 f"    直链块 {index + 1} 下载失败 "
                 f"({attempt}/{SEG_RETRY_MAX}): {exc}; {wait:.1f}s 后重试"
             )
-            time.sleep(wait)
+            # 用 Event.wait 代替 sleep：整片一旦判失败可立刻醒来，不必空等完退避。
+            if abort_event is not None:
+                if abort_event.wait(wait):
+                    break
+            else:
+                time.sleep(wait)
     raise RuntimeError(
         f"直链块 {index + 1} 重试后仍失败: {last_error}"
     ) from last_error
@@ -1534,6 +1611,9 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
         f"并发 {MP4_CONCURRENCY}"
     )
     with open(output_path, "wb") as output_file:
+        # 整片失败信号：任一块判失败即置位，让在跑的块立刻放弃退避重试并归还
+        # 线程，避免 ThreadPoolExecutor.__exit__ 的 shutdown(wait=True) 干等。
+        abort_event = threading.Event()
         with ThreadPoolExecutor(max_workers=MP4_CONCURRENCY) as executor:
             next_submit = 0
             write_cursor = 0
@@ -1553,7 +1633,7 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
                     start, end = chunks[next_submit]
                     future = executor.submit(
                         _download_mp4_chunk, url, headers, start, end,
-                        next_submit,
+                        next_submit, abort_event,
                     )
                     future_to_index[future] = next_submit
                     next_submit += 1
@@ -1572,7 +1652,10 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
                     output_file.write(done_buffer.pop(write_cursor))
                     write_cursor += 1
                 if failure is not None:
-                    # 其余在途块跑完即止，不再投递；残留文件由上层节点循环清理。
+                    # 置位中止信号 + 取消未启动块：在跑的块会在下次重试点立即
+                    # 退出，整片失败能在秒级归还下载槽位并换下一个取流节点。
+                    # 残留文件由上层节点循环清理。
+                    abort_event.set()
                     for future in list(future_to_index):
                         future.cancel()
                     break
@@ -1652,13 +1735,9 @@ def process_one_entry(entry, processed_ids):
             return label, False, {"error": "duplicate entry currently processing"}
         processing_ids.add(normalized_id)
 
-    # 磁盘水位兜底：仅在此处（尚未开始任何下载动作前）阻塞。磁盘吃紧时新集
-    # 在闸门前等待，不会占用 temp/带宽；已在跑的下载不受影响。
-    wait_for_disk_gate()
-
-    print(f"\n开始处理: {label} - {title}")
-    os.makedirs(TEMP_DIR, exist_ok=True)
-
+    # 以下直到 try 之前只有不会抛异常的纯赋值与 def：ID 锁一旦持有，任何可能
+    # 抛异常的动作（磁盘闸门等待、建目录）都必须在 try 内，否则会绕过 finally
+    # 的 discard，让该集 ID 在本进程内永久卡在“处理中”、后续轮次全被跳过。
     handed_off_to_conversion = False
     cleanup_paths = set()
     final_ts = os.path.join(TEMP_DIR, f"temp_{safe_file_token(normalized_id)}.ts")
@@ -1675,6 +1754,9 @@ def process_one_entry(entry, processed_ids):
         默认 PLAYLIST_RETRY_MAX 死磕，不放过最后的机会。
         """
         url = node["url"]
+        # 取流阶段记录的节点专属请求头（如特定 Referer/UA）：m3u8 与 mp4 两条
+        # 分支都必须携带，否则某些源站会 403/428 直接判死，白白损失可用源。
+        node_headers = node.get("headers") or None
         if node["type"] == "mp4":
             resolution, bitrate = _download_mp4_direct(
                 node, final_ts, label, runtime_minutes
@@ -1702,7 +1784,8 @@ def process_one_entry(entry, processed_ids):
             return conversion_job
 
         variants = parse_master_playlist(
-            url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK
+            url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK,
+            headers=node_headers,
         )
         if not variants:
             raise RuntimeError("没有找到媒体播放列表或清晰度变体")
@@ -1755,7 +1838,7 @@ def process_one_entry(entry, processed_ids):
 
             try:
                 segment_urls, durations, init_url = parse_media_playlist(
-                    playlist_url
+                    playlist_url, headers=node_headers
                 )
                 sample_count = min(SAMPLE_COUNT, len(segment_urls))
                 # 从影片“正中间”连续取 sample_count 段测码率：片头常是 logo/黑场/
@@ -1774,6 +1857,7 @@ def process_one_entry(entry, processed_ids):
                         # 中间采样 start_idx>0 走 ab 模式不会自动写 init，强制补一次
                         # moov，否则 fMP4 采样片缺编解码参数导致 ffprobe 探测失败。
                         force_init=True,
+                        headers=node_headers,
                     )
                 )
                 sample_failed_set = set(sample_failed_indices)
@@ -1882,6 +1966,7 @@ def process_one_entry(entry, processed_ids):
             end_idx=None,
             concurrency=SEGMENT_CONCURRENCY,
             init_url=best_init_url,
+            headers=node_headers,
         )
         failed_segment_indices = sorted(set(failed_segment_indices))
         failed_segment_set = set(failed_segment_indices)
@@ -1949,6 +2034,12 @@ def process_one_entry(entry, processed_ids):
         return conversion_job
 
     try:
+        # 磁盘水位兜底：仅在此处（尚未开始任何下载动作前）阻塞。磁盘吃紧时新集
+        # 在闸门前等待，不会占用 temp/带宽；已在跑的下载不受影响。
+        wait_for_disk_gate()
+        print(f"\n开始处理: {label} - {title}")
+        os.makedirs(TEMP_DIR, exist_ok=True)
+
         # 方案C：依次尝试各取流节点，任一节点下完即成功；全部失败才判失败。
         conversion_job = None
         last_exc = None
@@ -2504,29 +2595,45 @@ def _run_pipeline():
                     flush=True,
                 )
 
-            # 注入本轮下载 future，并单独跟踪“本轮下载 future”集合。
+            # 分批投递：不再一次性把整轮全部集 submit 进 pending。同时存在的
+            # 下载 future 上限为 DOWNLOAD_QUEUE_DEPTH，wait() 每次挂/摘 waiter
+            # 的规模从 O(整轮集数) 降到 O(槽位数)——全量重跑几万集时，一次性
+            # 全投会让主循环退化成 O(N²) 空转，把 CPU 耗在 waiter 管理上。
+            # 语义完全不变：本轮每一集仍会被逐一投递，且全部有结论后才进下一轮；
+            # 附带收益是磁盘占用更平滑（未投递的集不占 temp）。
+            next_submit = 0
             round_download_futures = set()
-            for entry in current_batch:
-                f = download_executor.submit(
-                    process_one_entry, entry, processed_ids
-                )
-                download_future_to_entry[f] = entry
-                stage_of[f] = "download"
-                pending.add(f)
-                round_download_futures.add(f)
+
+            def submit_downloads():
+                nonlocal next_submit
+                while (
+                    len(round_download_futures) < DOWNLOAD_QUEUE_DEPTH
+                    and next_submit < len(current_batch)
+                ):
+                    entry = current_batch[next_submit]
+                    next_submit += 1
+                    f = download_executor.submit(
+                        process_one_entry, entry, processed_ids
+                    )
+                    download_future_to_entry[f] = entry
+                    stage_of[f] = "download"
+                    pending.add(f)
+                    round_download_futures.add(f)
 
             round_failed_retriable = []
+            submit_downloads()
 
             # 关键：只等“本轮下载 future”全部离开 download 阶段即算本轮下载完成，
             # 不等 pending 全空。上一轮遗留的转封装/上传在同一循环里并行推进，
             # 但不阻塞本轮判定——这正是方案 A 的并行精髓。
-            remaining_downloads = set(round_download_futures)
-            while remaining_downloads:
+            # 循环条件涵盖“还有在途下载”或“还有未投递的集”，二者皆空才收尾；
+            # 此时 pending 必非空（submit_downloads 已在上一轮末尾补满），
+            # 不会出现 wait 空集合的忙等。
+            while round_download_futures or next_submit < len(current_batch):
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
                 for future in done:
                     pending.discard(future)
-                    if future in remaining_downloads:
-                        remaining_downloads.discard(future)
+                    round_download_futures.discard(future)
                     # 单个 future 处理若抛异常（如日志写盘 OSError/磁盘满、
                     # 状态字典错位 KeyError），只记录并跳过，绝不让异常逃逸出
                     # 主循环——否则同批其余 future 全丢、整条流水线崩溃、在途
@@ -2536,6 +2643,8 @@ def _run_pipeline():
                         handle_done_future(future, round_failed_retriable)
                     except Exception as exc:
                         print(f"⚠️ future 处理异常，已跳过该条: {exc}", flush=True)
+                # 腾出槽位后立即补投，保持下载池始终满载。
+                submit_downloads()
 
             # 本轮下载全部有结论，决定是否再来一轮。
             if not round_failed_retriable:

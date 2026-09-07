@@ -211,6 +211,11 @@ download_tv:
   start_folder_index: 1
   # 并发控制
   max_workers: 32          # 同时下载的集数
+  # 主循环同时持有的“下载 future”上限（分批投递深度），必须 > max_workers。
+  # 一次性把整轮几万集全部 submit 会让 wait(FIRST_COMPLETED) 每次都对全部
+  # 未完成 future 挂/摘 waiter，主循环退化成 O(N²)；分批后 wait 规模恒定。
+  # 留空/不配时默认 max_workers × 2。
+  download_queue_depth: 64
   convert_workers: 16      # 独立的 FFmpeg 转封装线程数（与 upload_workers 对齐）
   segment_concurrency: 64  # 单集同时下载的分片数
   # 画质探测与分片重试
@@ -230,8 +235,10 @@ download_tv:
   # 按 Range 分块并发下载，单块失败按 seg_retry_max/seg_retry_delay 重试；不做断点续传
   # （残留文件视为脏数据整段重下，启动时 temp_* 也会被清理）。
   # 请求头使用取流阶段记录的 headers（如 okhttp UA），并去掉 Session 默认的 Referer/X-Requested-With。
-  # 直链 403/410 视为签名过期，标记“需重新取流”并按可重试处理；非 206 / 首块非视频内容
-  # 属确定性失败，不做块级重试直接换节点。
+  # 直链 403/410 视为签名过期，标记“需重新取流”；它与非 206 / 404 / 416 /
+  # 首块非视频内容一样属确定性失败——本脚本读的是固化的 results.jsonl，没有
+  # 重新取流的能力，多轮重投拿到的还是同一条 url，必然再挂。故一律不重试、
+  # 直接换下一个节点，并留在 failed.jsonl 里等重跑 tv_ids_to_links.py 修复。
   # 内存估算：每集最多 (mp4_concurrency 在途 + 2×mp4_concurrency 已下完待落盘) × mp4_chunk_size
   #   ≈ 3 × 8 × 8MB = 192MB；全局上限再乘 max_workers（32 → 约 6GB，仅在所有 worker 同时
   #   跑 mp4 直链且乱序严重时才会逼近）。内存紧张时优先调小 mp4_concurrency 或 mp4_chunk_size。
