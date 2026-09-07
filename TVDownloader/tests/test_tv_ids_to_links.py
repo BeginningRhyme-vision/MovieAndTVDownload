@@ -404,13 +404,44 @@ class _FakeResp:
 
 def _install_fake_session(monkeypatch, page_html, streams, servers=None, stream_status=200,
                           page_status=200, servers_status=200, dec_status=200,
-                          enc_resp=None, dec_servers_resp=None, token="tok"):
-    """streams: list of decrypted stream dicts returned in order for each server.
-    enc_resp / dec_servers_resp: 覆盖 enc-vidup / dec-vidup(servers) 的整个 _FakeResp（模拟非 JSON 等）。
-    token: enc-vidup 返回的 token（线上 2026-09 起为空串）。"""
-    seen = {"page_urls": [], "page_headers": None, "enc_urls": [], "servers_headers": None}
-    servers = servers if servers is not None else [{"name": f"s{i}", "data": f"d{i}"} for i in range(len(streams))]
-    stream_iter = iter(streams)
+                          enc_resp=None, dec_servers_resp=None, token="tok",
+                          vidlink_resp=None, vidlink_enc="ENCTID",
+                          vidfast_page_status=404, vidfast_streams=None):
+    """三家取流源的假 Session，按域名路由。
+
+    vidup（vidup.to / enc-vidup / dec-vidup / https://x/...）：
+      streams: list of decrypted stream dicts returned in order for each server.
+      enc_resp / dec_servers_resp: 覆盖 enc-vidup / dec-vidup(servers) 的整个 _FakeResp（模拟非 JSON 等）。
+      token: enc-vidup 返回的 token（线上 2026-09 起为空串）。
+    vidlink（enc-vidlink / vidlink.pro/api/b/tv）：
+      vidlink_resp: 整个 _FakeResp；默认 200 + body null（无源）。
+    vidfast（vidfast.vc / enc-vidfast / dec-vidfast / https://y/...）：
+      vidfast_page_status: 默认 404（无源）；vidfast_streams 同 streams 语义。
+    默认 vidlink/vidfast 都无源，旧的 vidup 单源用例语义不变。"""
+    seen = {"page_urls": [], "page_headers": None, "enc_urls": [], "servers_headers": None,
+            "vidlink_urls": [], "vidlink_headers": None, "vidfast_page_urls": [], "order": []}
+    sites = {
+        "vidup": {
+            "host": "https://vidup.to/", "base": "https://x", "html": page_html,
+            "page_status": page_status, "servers": servers, "streams": iter(streams),
+            "page_urls": seen["page_urls"],
+        },
+        "vidfast": {
+            "host": "https://vidfast.vc/", "base": "https://y", "html": page_html,
+            "page_status": vidfast_page_status, "servers": None, "streams": iter(vidfast_streams or []),
+            "page_urls": seen["vidfast_page_urls"],
+        },
+    }
+    for name, site in sites.items():
+        n = len(streams if name == "vidup" else (vidfast_streams or []))
+        if site["servers"] is None:
+            site["servers"] = [{"name": f"s{i}", "data": f"d{i}"} for i in range(n)]
+
+    def _site_by_base(url):
+        for name, site in sites.items():
+            if url.startswith(site["base"] + "/"):
+                return name, site
+        raise AssertionError(url)
 
     class FakeSession:
         def __init__(self, *a, **k):
@@ -423,46 +454,66 @@ def _install_fake_session(monkeypatch, page_html, streams, servers=None, stream_
             return False
 
         def get(self, url, timeout=None, headers=None):
-            if url.startswith("https://vidup.to/"):
-                seen["page_urls"].append(url)
-                seen["page_headers"] = headers
-                ps = page_status
-                if isinstance(ps, list):  # 按次序给出状态码，最后一个重复使用
-                    ps = ps.pop(0) if len(ps) > 1 else ps[0]
-                return _FakeResp(text=page_html, status=ps)
-            if "/enc-vidup" in url:
-                seen["enc_urls"].append(url)
-                if enc_resp is not None:
-                    return enc_resp
-                return _FakeResp(payload={"status": 200, "result": {
-                    "servers": "https://x/servers", "stream": "https://x/stream", "token": token}})
+            for name, site in sites.items():
+                if url.startswith(site["host"]):
+                    seen["order"].append(name)
+                    site["page_urls"].append(url)
+                    if name == "vidup":
+                        seen["page_headers"] = headers
+                    ps = site["page_status"]
+                    if isinstance(ps, list):  # 按次序给出状态码，最后一个重复使用
+                        ps = ps.pop(0) if len(ps) > 1 else ps[0]
+                    return _FakeResp(text=site["html"], status=ps)
+                if f"/enc-{name}" in url:
+                    if name == "vidup":
+                        seen["enc_urls"].append(url)
+                        if enc_resp is not None:
+                            return enc_resp
+                    base = site["base"]
+                    return _FakeResp(payload={"status": 200, "result": {
+                        "servers": f"{base}/servers", "stream": f"{base}/stream", "token": token}})
+            if "/enc-vidlink" in url:
+                seen["order"].append("vidlink")
+                return _FakeResp(payload={"status": 200, "result": vidlink_enc})
+            if url.startswith("https://vidlink.pro/api/b/tv/"):
+                seen["vidlink_urls"].append(url)
+                seen["vidlink_headers"] = headers
+                return vidlink_resp if vidlink_resp is not None else _FakeResp(payload=None)
             raise AssertionError(url)
 
         def post(self, url, headers=None, json=None, timeout=None):
-            if url == "https://x/servers":
-                seen["servers_headers"] = headers
+            for name in sites:
+                if url.endswith(f"/dec-{name}"):
+                    site = sites[name]
+                    if json["text"] == "enc-servers":
+                        if name == "vidup" and dec_servers_resp is not None:
+                            return dec_servers_resp
+                        return _FakeResp(payload={"status": 200, "result": site["servers"]})
+                    return _FakeResp(payload={"status": 200, "result": next(site["streams"])}, status=dec_status)
+            name, site = _site_by_base(url)
+            if url == f"{site['base']}/servers":
+                if name == "vidup":
+                    seen["servers_headers"] = headers
                 if token:
                     assert headers["X-CSRF-Token"] == token
                 else:
                     assert "X-CSRF-Token" not in headers
                 return _FakeResp(text="enc-servers", status=servers_status)
-            if url.startswith("https://x/stream/"):
-                st = stream_status
+            if url.startswith(f"{site['base']}/stream/"):
+                st = stream_status if name == "vidup" else 200
                 if isinstance(st, dict):
                     st = st.get(url.rsplit("/", 1)[1], 200)
                 return _FakeResp(text="enc-stream", status=st)
-            if url.endswith("/dec-vidup"):
-                if json["text"] == "enc-servers":
-                    if dec_servers_resp is not None:
-                        return dec_servers_resp
-                    return _FakeResp(payload={"status": 200, "result": servers})
-                return _FakeResp(payload={"status": 200, "result": next(stream_iter)}, status=dec_status)
             raise AssertionError(url)
 
     monkeypatch.setattr(m.requests, "Session", FakeSession)
     monkeypatch.setattr(m, "build_proxy", lambda: None)
     monkeypatch.setattr(m.time, "sleep", lambda *_: None)
     return seen
+
+
+def _urls(result):
+    return [u["url"] for u in result["urls"]]
 
 
 PAGE = 'window.x = "{\\"en\\":\\"ENC\\"}"'
@@ -482,7 +533,11 @@ def test_process_episode_ok_uses_input_key_and_merges_meta(monkeypatch):
     assert "X-Requested-With" not in seen["page_headers"]
     # key 恒用入参，不信任解密返回的 tmdbId
     assert result["tmdbId"] == "42" and result["season"] == 2 and result["episode"] == 3
-    assert result["urls"] == ["u1", "u2"]
+    assert _urls(result) == ["u1", "u2"]
+    assert result["urls"][0] == {"url": "u1", "provider": "vidup", "type": "m3u8",
+                                 "headers": {}, "quality": None, "size": None}
+    # vidup 命中后不再打 vidlink / vidfast
+    assert seen["order"] == ["vidup"]
     assert result["title"] == "Show Name"
     assert result["year"] == 2011 and result["original_title"] == "Orig"
 
@@ -492,7 +547,7 @@ def test_process_episode_ok_without_tmdbid_in_stream(monkeypatch):
     _install_fake_session(monkeypatch, PAGE, [{"url": "u"}])
     monkeypatch.setattr(m, "_TMDB_NAMES", {})
     status, result = m.process_episode("1", 1, 1)
-    assert status == "ok" and result["urls"] == ["u"] and result["title"] == ""
+    assert status == "ok" and _urls(result) == ["u"] and result["title"] == ""
 
 
 @pytest.mark.parametrize("token", ["", None])
@@ -501,7 +556,7 @@ def test_process_episode_ok_with_empty_token(monkeypatch, token):
     # 不能因 token 缺失判为瞬时错误（否则整批 0 成功、全部 retry-exhausted）
     seen = _install_fake_session(monkeypatch, PAGE, [{"url": "u"}], token=token)
     status, result = m.process_episode("1", 1, 1)
-    assert status == "ok" and result["urls"] == ["u"]
+    assert status == "ok" and _urls(result) == ["u"]
     assert "X-CSRF-Token" not in seen["servers_headers"]
 
 
@@ -552,7 +607,7 @@ def test_process_episode_404_then_ok_is_not_dead(monkeypatch):
     # 首次 404 是 CDN/代理抖动，换 IP 后拿到 url → ok，不得误判永久丢集
     seen = _install_fake_session(monkeypatch, PAGE, [{"url": "u"}], page_status=[404, 200])
     status, result = m.process_episode("1", 1, 1)
-    assert status == "ok" and result["urls"] == ["u"]
+    assert status == "ok" and _urls(result) == ["u"]
     assert len(seen["page_urls"]) == 2
 
 
@@ -587,7 +642,7 @@ def test_process_episode_partial_404_still_ok(monkeypatch):
         stream_status={"d1": 404},
     )
     status, result = m.process_episode("1", 1, 1)
-    assert status == "ok" and result["urls"] == ["u"]
+    assert status == "ok" and _urls(result) == ["u"]
     assert len(seen["page_urls"]) == 1
 
 
@@ -662,6 +717,127 @@ def test_process_episode_token_fallback(monkeypatch):
     _install_fake_session(monkeypatch, page, [{"url": "u", "tmdbId": "1"}])
     status, result = m.process_episode("1", 0, 1)
     assert status == "ok" and result["season"] == 0
+
+
+# ---------- 多源编排（vidup → vidlink → vidfast） ----------
+VIDLINK_OK = {"stream": {"qualities": {
+    "480": {"url": "https://cdn/480.mp4", "size": 100},
+    "1080": {"url": "https://cdn/1080.mp4", "size": 900, "codecName": "h264"},
+    "720": {"url": "https://cdn/720.mp4", "size": "bad"},
+    "360": {"url": "", "size": 10},
+}}, "captions": []}
+
+
+def test_process_episode_falls_through_to_vidlink(monkeypatch):
+    # vidup 页面 404（无源）→ vidlink 命中 → ok，不打 vidfast，不触发二次确认
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404,
+                                 vidlink_resp=_FakeResp(payload=VIDLINK_OK))
+    monkeypatch.setattr(m, "_TMDB_NAMES", {"7": "Name"})
+    status, result = m.process_episode("7", 1, 2)
+    assert status == "ok"
+    assert seen["order"] == ["vidup", "vidlink"]
+    assert seen["vidlink_urls"] == ["https://vidlink.pro/api/b/tv/ENCTID/1/2"]
+    assert seen["vidlink_headers"]["Origin"] == "https://vidlink.pro"
+    # 画质降序；size 非法为 None；空 url 丢弃；下载头是 okhttp 且不带 Referer
+    assert [(u["quality"], u["size"]) for u in result["urls"]] == [(1080, 900), (720, None), (480, 100)]
+    assert all(u["provider"] == "vidlink" and u["type"] == "mp4" for u in result["urls"])
+    assert result["urls"][0]["headers"] == {"User-Agent": "okhttp/4.9.3"}
+    assert result["title"] == "Name"
+    assert len(seen["page_urls"]) == 1
+
+
+def test_process_episode_falls_through_to_vidfast(monkeypatch):
+    # vidup 404 + vidlink null → vidfast 命中
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404,
+                                 vidfast_page_status=200, vidfast_streams=[{"url": "vf1", "title": "VF"}])
+    status, result = m.process_episode("1", 1, 1)
+    assert status == "ok"
+    assert seen["order"] == ["vidup", "vidlink", "vidfast"]
+    assert seen["vidfast_page_urls"] == ["https://vidfast.vc/tv/1/1/1/"]
+    assert result["urls"] == [{"url": "vf1", "provider": "vidfast", "type": "m3u8",
+                               "headers": {}, "quality": None, "size": None}]
+    assert result["title"] == "VF"
+
+
+def test_process_episode_dead_only_when_all_providers_nosource(monkeypatch):
+    # 三家都无源 → 换 IP 二次确认（三家再跑一遍）→ dead
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404)
+    status, result = m.process_episode("1", 1, 1)
+    assert status == "dead" and result is None
+    assert seen["order"] == ["vidup", "vidlink", "vidfast"] * 2
+
+
+def test_process_episode_vidlink_transient_blocks_dead(monkeypatch):
+    # vidup/vidfast 无源，但 vidlink 5xx：不能判死，走 retry
+    monkeypatch.setattr(m, "MAX_RETRIES", 2)
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404,
+                                 vidlink_resp=_FakeResp(status=503))
+    status, _ = m.process_episode("1", 1, 1)
+    assert status == "retry"
+    assert seen["order"] == ["vidup", "vidlink", "vidfast"] * 2
+
+
+def test_process_episode_vidlink_missing_qualities_is_transient(monkeypatch):
+    monkeypatch.setattr(m, "MAX_RETRIES", 1)
+    _install_fake_session(monkeypatch, PAGE, [], page_status=404,
+                          vidlink_resp=_FakeResp(payload={"stream": {}}))
+    status, _ = m.process_episode("1", 1, 1)
+    assert status == "retry"
+
+
+def test_process_episode_vidlink_404_is_transient(monkeypatch):
+    # vidlink 404 不是无源证据（路由变更/enc 异常/WAF），只有 200+null 才算 NoSource
+    monkeypatch.setattr(m, "MAX_RETRIES", 1)
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404,
+                                 vidlink_resp=_FakeResp(status=404))
+    status, _ = m.process_episode("1", 1, 1)
+    assert status == "retry"
+    # 走的是瞬时重试路径而不是 DEAD_CONFIRM 复探：MAX_RETRIES=1 只跑一轮
+    assert seen["order"] == ["vidup", "vidlink", "vidfast"]
+
+
+def test_process_episode_vidlink_enc_is_url_quoted(monkeypatch):
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=404,
+                                 vidlink_resp=_FakeResp(payload=VIDLINK_OK),
+                                 vidlink_enc="a/b+c=")
+    status, _ = m.process_episode("1", 1, 1)
+    assert status == "ok"
+    assert seen["vidlink_urls"] == ["https://vidlink.pro/api/b/tv/a%2Fb%2Bc%3D/1/1"]
+
+
+def test_process_episode_vidlink_size_bool_and_dup_url(monkeypatch):
+    payload = {"stream": {"qualities": {
+        "1080": {"url": "https://cdn/same.mp4", "size": True},
+        "720": {"url": "https://cdn/same.mp4", "size": 5},
+        "480": {"url": "https://cdn/480.mp4", "size": 0},
+        "360": {"url": "https://cdn/360.mp4", "size": 7.9},
+    }}}
+    _install_fake_session(monkeypatch, PAGE, [], page_status=404,
+                          vidlink_resp=_FakeResp(payload=payload))
+    status, result = m.process_episode("1", 1, 1)
+    assert status == "ok"
+    # size=True 不能被当成 1；重复 url 只保留首个（高画质）；size<=0 为 None；float 截断为 int
+    assert [(u["quality"], u["size"]) for u in result["urls"]] == [(1080, None), (480, None), (360, 7)]
+
+
+def test_process_episode_respects_providers_arg(monkeypatch):
+    # 只指定 vidlink：不打 vidup/vidfast
+    seen = _install_fake_session(monkeypatch, PAGE, [{"url": "u"}],
+                                 vidlink_resp=_FakeResp(payload=VIDLINK_OK))
+    status, result = m.process_episode("1", 1, 1, providers=["vidlink"])
+    assert status == "ok" and seen["order"] == ["vidlink"]
+    assert result["urls"][0]["provider"] == "vidlink"
+
+
+def test_resolve_providers():
+    assert m._resolve_providers(["vidfast", " vidup", "vidfast", ""]) == ["vidfast", "vidup"]
+    # 逗号分隔字符串（CLI --providers / config 写成字符串）不能被逐字符拆开
+    assert m._resolve_providers("vidup, vidlink") == ["vidup", "vidlink"]
+    assert m._resolve_providers("vidlink") == ["vidlink"]
+    with pytest.raises(SystemExit):
+        m._resolve_providers(["nope"])
+    with pytest.raises(SystemExit):
+        m._resolve_providers([])
 
 
 # ---------- run_batch ----------

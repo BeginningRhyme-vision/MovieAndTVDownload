@@ -1,13 +1,17 @@
 """
-tv_ids_to_links.py —— 由剧集 tmdb_id 展开季集结构，并逐集解析出可播放的 m3u8 地址。
+tv_ids_to_links.py —— 由剧集 tmdb_id 展开季集结构，并逐集从多个取流源解析出可下载地址。
 
 与电影版 tmdb_ids_to_links.py 的差异：
     - 处理单位从“一部电影”变为“一集”：(tmdb_id, season, episode) 三元组。
     - 取流前先调 TMDB /tv/{id}（含 append_to_response=season/N）拿准确的季集结构，
       结果缓存到 seasons_cache.jsonl，多轮/续跑不重复调 API。
-    - vidup.to 的 TV 页面地址：https://vidup.to/tv/{tmdb_id}/{season}/{episode}/
+    - 多源：按 config.providers（默认 vidup → vidlink → vidfast）顺序逐家取流，首家命中即返回；
+      全部真无源才判 dead。vidup.to / vidfast.vc 同构（页面 → enc → servers → dec → stream，出 m3u8），
+      vidlink.pro 为 enc-vidlink(tmdb id) → /api/b/tv 直接返 JSON（出带时效签名的 mp4 直链）。
     - fail.txt 一行一集：tmdb_id\\tseason\\tepisode；剧级失效（TMDB 查不到）记为 tmdb_id\\t-\\t-
     - results.jsonl 一行一集：{urls, tmdbId, season, episode, title, + tv_series.jsonl 静态元数据}
+      urls 每项为 {url, provider, type("m3u8"|"mp4"), headers, quality, size}；
+      历史文件中 urls 元素可能仍是纯字符串（旧 vidup m3u8），下游需兼容。
 
 其余机制（住宅代理随机端口、enc-dec 加解密、三态 ok/dead/retry、进程内多轮捞回）
 与电影版保持一致。
@@ -75,14 +79,23 @@ def _secret(cfg_key, env_key, source=None):
     return (src.get(cfg_key, "") or "").strip()
 
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-    "Referer": "https://vidup.to/",
-    "X-Requested-With": "XMLHttpRequest"
-}
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 
-# 抓取 vidup.to 页面时不能带 X-Requested-With，否则会被 Cloudflare 拦成 403
-PAGE_HEADERS = {k: v for k, v in HEADERS.items() if k != "X-Requested-With"}
+
+def _site_headers(site):
+    """vidup 同构站（vidup.to / vidfast.vc）的 (页面头, 接口头)。
+    页面请求不能带 X-Requested-With，否则会被 Cloudflare 拦成 403；后续接口要带。"""
+    api = {"User-Agent": UA, "Referer": f"https://{site}/", "X-Requested-With": "XMLHttpRequest"}
+    page = {k: v for k, v in api.items() if k != "X-Requested-With"}
+    return page, api
+
+
+VIDLINK_API_HEADERS = {"User-Agent": UA, "Origin": "https://vidlink.pro", "Referer": "https://vidlink.pro/"}
+# vidlink CDN（hakunaymatata.com）校验请求头：浏览器 UA → 428，带任何 Referer → 429，
+# 只有 okhttp UA + 不带 Referer 才 206。随 url 一起写进 results.jsonl，供 download_tv.py 直接使用。
+VIDLINK_DOWNLOAD_HEADERS = {"User-Agent": "okhttp/4.9.3"}
+
+DEFAULT_PROVIDERS = ["vidup", "vidlink", "vidfast"]
 
 API = _CFG.get("api", "https://enc-dec.app/api")
 MAX_RETRIES = _CFG.get("max_retries", 3)
@@ -489,7 +502,218 @@ def _ep_label(tid, season, episode):
     return f"{tid} S{int(season):02d}E{int(episode):02d}"
 
 
-def process_episode(tid, season, episode):
+# ---------- 取流源（provider）----------
+# 每个 provider 的签名：fn(session, tid, season, episode) -> (urls, title)
+#   urls  非空列表，每项 {url, provider, type("m3u8"|"mp4"), headers, quality, size}
+#   title 源站给的剧名，可为 None
+# 语义：真无源抛 NoSource（唯一判死证据）；其余任何异常都视为瞬时错误。
+def _url_entry(url, provider, type_, headers=None, quality=None, size=None):
+    return {
+        "url": url,
+        "provider": provider,
+        "type": type_,
+        # 下载该 url 时必须携带的请求头（空表示用 download_tv 默认头）
+        "headers": dict(headers or {}),
+        # 源站声明的画质高度（int）与文件大小（bytes）；m3u8 源不声明，留 None 由下游探测
+        "quality": quality,
+        "size": size,
+    }
+
+
+def _fetch_vidup_like(session, site, api_name, tid, season, episode):
+    """vidup.to / vidfast.vc 同构链路：
+    页面正则 → enc-{api} → servers POST → dec-{api} → 逐 server stream POST → dec-{api} 取 url。"""
+    label = _ep_label(tid, season, episode)
+    page_headers, api_headers = _site_headers(site)
+
+    # 1. 获取页面，提取加密文本
+    resp = session.get(f"https://{site}/tv/{tid}/{season}/{episode}/", timeout=TIMEOUT, headers=page_headers)
+    if resp.status_code == 404:
+        raise NoSource(f"page 404 for {label}")
+    _check(resp, "page")
+    html = resp.text
+
+    match_1 = re.search(r'\\"en\\":\\"(.*?)\\"', html)
+    match = re.search(r'\\"token\\":\\"(.*?)\\"', html)
+    if match_1:
+        text = match_1.group(1)
+    elif match:
+        text = match.group(1)
+    else:
+        raise Exception(f"Extract failed (retriable) for {label}")
+
+    # 2. 调用 enc-{api} 获取 parts（text 来自页面正则，可能含 +/= 等保留字符，必须编码）
+    enc_url = f"{API}/enc-{api_name}?text={quote(text, safe='')}"
+    resp = _check(session.get(enc_url, timeout=TIMEOUT, headers=api_headers), f"enc-{api_name}")
+    parts = validate(_json(resp, f"enc-{api_name}"), enc_url)
+    if not isinstance(parts, dict):
+        raise Exception(f"API Error at {enc_url}: result is not an object")
+    servers = parts.get('servers')
+    stream = parts.get('stream')
+    # 2026-09 起 enc-dec 返回 token 为空串，后续接口不带 X-CSRF-Token 也能正常取流；
+    # token 仅在非空时携带，不再作为必需字段（否则整批 0 成功）
+    token = parts.get('token')
+    if not (servers and stream):
+        raise Exception(f"API Error at {enc_url}: missing servers/stream in result")
+
+    headers_with_token = dict(api_headers)
+    if token:
+        headers_with_token["X-CSRF-Token"] = token
+
+    # 3. 获取加密的服务器列表
+    resp = _check(session.post(servers, headers=headers_with_token, timeout=TIMEOUT), "servers")
+    servers_encrypted = resp.text
+
+    # 4. 解密服务器列表
+    dec_url = f"{API}/dec-{api_name}"
+    resp = _check(session.post(dec_url, json={"text": servers_encrypted}, timeout=TIMEOUT), f"dec-{api_name}(servers)")
+    servers_decrypted = validate(_json(resp, f"dec-{api_name}(servers)"), dec_url)
+
+    if not servers_decrypted or not isinstance(servers_decrypted, list):
+        raise Exception("No servers found")
+
+    # 遍历所有服务器，收集全部可用 url
+    last_server_error = None
+    urls = []
+    result_title = None
+    stream_404 = 0
+    for server in servers_decrypted:
+        server_name = server.get('name', 'unknown') if isinstance(server, dict) else 'unknown'
+        try:
+            data_val = server['data']
+            # 5. 获取加密的流数据
+            stream_url = f"{stream}/{data_val}"
+            resp = _check(session.post(stream_url, headers=headers_with_token, timeout=TIMEOUT), "stream")
+            stream_encrypted = resp.text
+
+            # 6. 解密流数据
+            resp = _check(session.post(dec_url, json={"text": stream_encrypted}, timeout=TIMEOUT), f"dec-{api_name}(stream)")
+            stream_decrypted = validate(_json(resp, f"dec-{api_name}(stream)"), dec_url)
+            if not isinstance(stream_decrypted, dict):
+                raise Exception("decrypted stream is not an object")
+
+            url = stream_decrypted.get("url")
+            if not url:
+                raise Exception("Missing url in decrypted data")
+            # 只以 url 为成功条件；返回的 tmdbId 仅用于告警，不参与 key 也不作为成功条件
+            r_tid = stream_decrypted.get("tmdbId")
+            if r_tid is not None and str(r_tid) != str(tid):
+                print(f"  [warn] {label} {api_name} server '{server_name}' 返回 tmdbId={r_tid}，与入参不一致，key 仍用入参")
+            if all(u["url"] != url for u in urls):
+                urls.append(_url_entry(url, api_name, "m3u8"))
+            if result_title is None:
+                result_title = stream_decrypted.get("title")
+        except HttpStatusError as e:
+            # 只有源站 stream 接口本身的 404 才算“该 server 无源”；enc-dec 的 404 是服务故障
+            if e.status == 404 and e.where == "stream":
+                stream_404 += 1
+            last_server_error = e
+            print(f"  {api_name} server '{server_name}' failed for {label}: {e}")
+            continue
+        except Exception as e:
+            last_server_error = e
+            print(f"  {api_name} server '{server_name}' failed for {label}: {e}")
+            continue
+
+    if urls:
+        return urls, result_title
+    if stream_404 == len(servers_decrypted):
+        raise NoSource(f"all {stream_404} {api_name} servers returned 404 for {label}")
+    raise Exception(f"All {api_name} servers failed for {label}. Last error: {last_server_error}")
+
+
+def _fetch_vidup(session, tid, season, episode):
+    return _fetch_vidup_like(session, "vidup.to", "vidup", tid, season, episode)
+
+
+def _fetch_vidfast(session, tid, season, episode):
+    return _fetch_vidup_like(session, "vidfast.vc", "vidfast", tid, season, episode)
+
+
+def _fetch_vidlink(session, tid, season, episode):
+    """vidlink.pro：enc-vidlink(tmdb id) → GET /api/b/tv/{enc}/{s}/{e} 直接返 JSON（不需再 dec）。
+    stream.qualities.{360,480,720,1080}.{url,size,...}，url 为带时效签名的 mp4 直链。
+    无源的唯一证据是 HTTP 200 + body null；404 可能是路由变更 / enc 值异常 / WAF 拦截，
+    按瞬时处理（判死必须保守）。"""
+    label = _ep_label(tid, season, episode)
+    enc_url = f"{API}/enc-vidlink?text={quote(str(tid), safe='')}"
+    resp = _check(session.get(enc_url, timeout=TIMEOUT, headers=VIDLINK_API_HEADERS), "enc-vidlink")
+    enc = validate(_json(resp, "enc-vidlink"), enc_url)
+    if not isinstance(enc, str) or not enc:
+        raise Exception(f"API Error at {enc_url}: result is not a string")
+
+    # enc 作为路径段拼接，含 / ? # 等字符会拼错 URL，必须编码
+    resp = session.get(f"https://vidlink.pro/api/b/tv/{quote(enc, safe='')}/{season}/{episode}",
+                       timeout=TIMEOUT, headers=VIDLINK_API_HEADERS)
+    _check(resp, "vidlink-api")
+    data = _json(resp, "vidlink-api")
+    if data is None:
+        raise NoSource(f"vidlink api null for {label}")
+    if not isinstance(data, dict):
+        raise Exception(f"vidlink api: unexpected payload type {type(data).__name__}")
+
+    stream = data.get("stream")
+    qualities = stream.get("qualities") if isinstance(stream, dict) else None
+    if not isinstance(qualities, dict) or not qualities:
+        # 有响应但没有画质表：不是 null，不能当无源证据，交给重试
+        raise Exception(f"vidlink api: missing stream.qualities for {label}")
+
+    entries = []
+    seen_urls = set()
+    for q, info in qualities.items():
+        url = info.get("url") if isinstance(info, dict) else None
+        # 多个画质可能指向同一 url，按 url 去重（与 vidup 分支一致）
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        try:
+            quality = int(q)
+        except (TypeError, ValueError):
+            quality = None
+        size = info.get("size")
+        # bool 是 int 子类：size=true 会被 int() 成 1，必须排除
+        if isinstance(size, bool) or not isinstance(size, (int, float)) or size <= 0:
+            size = None
+        else:
+            size = int(size)
+        entries.append(_url_entry(url, "vidlink", "mp4", VIDLINK_DOWNLOAD_HEADERS, quality, size))
+    if not entries:
+        raise Exception(f"vidlink api: qualities without url for {label}")
+    # 画质从高到低，下游按顺序择优
+    entries.sort(key=lambda u: (u["quality"] is None, -(u["quality"] or 0)))
+    return entries, None
+
+
+PROVIDERS = {
+    "vidup": _fetch_vidup,
+    "vidlink": _fetch_vidlink,
+    "vidfast": _fetch_vidfast,
+}
+
+
+def _resolve_providers(names):
+    """校验 provider 名单（config.yaml providers / --providers），去重保序；未知名字直接退出。
+    允许传逗号分隔字符串（config 误写成 "vidup,vidlink" 时不至于逐字符报"未知取流源 'v'"）。"""
+    if isinstance(names, str):
+        names = names.split(",")
+    out = []
+    for n in names:
+        n = str(n).strip()
+        if not n:
+            continue
+        if n not in PROVIDERS:
+            raise SystemExit(f"未知取流源 '{n}'，可选：{', '.join(PROVIDERS)}")
+        if n not in out:
+            out.append(n)
+    if not out:
+        raise SystemExit("providers 为空：至少配置一个取流源")
+    return out
+
+
+ACTIVE_PROVIDERS = _resolve_providers(_CFG.get("providers") or DEFAULT_PROVIDERS)
+
+
+def process_episode(tid, season, episode, providers=None):
     """处理单集，仅对瞬时错误重试。
 
     返回 (status, 结果字典或None)，status 三态供多轮捞回区分：
@@ -497,11 +721,16 @@ def process_episode(tid, season, episode):
       - "dead"  确认真无源（NoSource）→ 这一集永久排除（不影响同剧其它集）
       - "retry" 瞬时错误换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
 
-    判死二次确认（DEAD_CONFIRM）：首次命中 NoSource 不立即判死，换 IP 再完整跑一次，
-    连续两次 NoSource 才返回 dead；确认过程最多多花 1 次尝试（总尝试数 ≤ MAX_RETRIES+1）。
+    多源：同一次尝试内按 providers 顺序逐家取流，首家命中即返回；
+    某家 NoSource 或瞬时错误都继续试下一家；全部跑完仍无 url 时，
+    只要有任一家是瞬时错误就按瞬时处理（重试），全部 NoSource 才算一次“疑似无源”。
+
+    判死二次确认（DEAD_CONFIRM）：首次全家 NoSource 不立即判死，换 IP 再完整跑一次，
+    连续两次全家 NoSource 才返回 dead；确认过程最多多花 1 次尝试（总尝试数 ≤ MAX_RETRIES+1）。
     若确认那次是瞬时错误且尝试已耗尽，返回 retry 交给下一轮（宁可多试，不误判永久丢集）。
     """
     label = _ep_label(tid, season, episode)
+    providers = list(ACTIVE_PROVIDERS if providers is None else providers)
     attempt = 0
     nosource_hits = 0
     while True:
@@ -512,96 +741,23 @@ def process_episode(tid, season, episode):
             if proxy:
                 session.proxies = proxy
             try:
-                # 1. 获取页面，提取加密文本
-                base_url = f"https://vidup.to/tv/{tid}/{season}/{episode}/"
-                resp = session.get(base_url, timeout=TIMEOUT, headers=PAGE_HEADERS)
-                if resp.status_code == 404:
-                    raise NoSource(f"page 404 for {label}")
-                _check(resp, "page")
-                html = resp.text
-
-                match_1 = re.search(r'\\"en\\":\\"(.*?)\\"', html)
-                match = re.search(r'\\"token\\":\\"(.*?)\\"', html)
-                if match_1:
-                    text = match_1.group(1)
-                else:
-                    if match:
-                        text = match.group(1)
-                    else:
-                        raise Exception(f"Extract failed (retriable) for {label}")
-
-                # 2. 调用 enc-vidup 获取 parts（text 来自页面正则，可能含 +/= 等保留字符，必须编码）
-                enc_vidup = f"{API}/enc-vidup?text={quote(text, safe='')}"
-                resp = _check(session.get(enc_vidup, timeout=TIMEOUT, headers=HEADERS), "enc-vidup")
-                parts = validate(_json(resp, "enc-vidup"), enc_vidup)
-                if not isinstance(parts, dict):
-                    raise Exception(f"API Error at {enc_vidup}: result is not an object")
-                servers = parts.get('servers')
-                stream = parts.get('stream')
-                # 2026-09 起 enc-dec 返回 token 为空串，后续接口不带 X-CSRF-Token 也能正常取流；
-                # token 仅在非空时携带，不再作为必需字段（否则整批 0 成功）
-                token = parts.get('token')
-                if not (servers and stream):
-                    raise Exception(f"API Error at {enc_vidup}: missing servers/stream in result")
-
-                headers_with_token = HEADERS.copy()
-                if token:
-                    headers_with_token["X-CSRF-Token"] = token
-
-                # 3. 获取加密的服务器列表
-                resp = _check(session.post(servers, headers=headers_with_token, timeout=TIMEOUT), "servers")
-                servers_encrypted = resp.text
-
-                # 4. 解密服务器列表
-                dec_vidup = f"{API}/dec-vidup"
-                resp = _check(session.post(dec_vidup, json={"text": servers_encrypted}, timeout=TIMEOUT), "dec-vidup(servers)")
-                servers_decrypted = validate(_json(resp, "dec-vidup(servers)"), dec_vidup)
-
-                if not servers_decrypted or not isinstance(servers_decrypted, list):
-                    raise Exception("No servers found")
-
-                # 遍历所有服务器，收集全部可用 url
-                last_server_error = None
                 urls = []
                 result_title = None
-                stream_404 = 0
-                for server in servers_decrypted:
-                    server_name = server.get('name', 'unknown') if isinstance(server, dict) else 'unknown'
+                nosource_errors = []
+                transient_errors = []
+                for name in providers:
                     try:
-                        data_val = server['data']
-                        # 5. 获取加密的流数据
-                        stream_url = f"{stream}/{data_val}"
-                        resp = _check(session.post(stream_url, headers=headers_with_token, timeout=TIMEOUT), "stream")
-                        stream_encrypted = resp.text
-
-                        # 6. 解密流数据
-                        resp = _check(session.post(dec_vidup, json={"text": stream_encrypted}, timeout=TIMEOUT), "dec-vidup(stream)")
-                        stream_decrypted = validate(_json(resp, "dec-vidup(stream)"), dec_vidup)
-                        if not isinstance(stream_decrypted, dict):
-                            raise Exception("decrypted stream is not an object")
-
-                        url = stream_decrypted.get("url")
-                        if not url:
-                            raise Exception("Missing url in decrypted data")
-                        # 只以 url 为成功条件；返回的 tmdbId 仅用于告警，不参与 key 也不作为成功条件
-                        r_tid = stream_decrypted.get("tmdbId")
-                        if r_tid is not None and str(r_tid) != str(tid):
-                            print(f"  [warn] {label} server '{server_name}' 返回 tmdbId={r_tid}，与入参不一致，key 仍用入参")
-                        if url not in urls:
-                            urls.append(url)
-                        if result_title is None:
-                            result_title = stream_decrypted.get("title")
-                    except HttpStatusError as e:
-                        # 只有源站 stream 接口本身的 404 才算“该 server 无源”；enc-dec 的 404 是服务故障
-                        if e.status == 404 and e.where == "stream":
-                            stream_404 += 1
-                        last_server_error = e
-                        print(f"  Server '{server_name}' failed for {label}: {e}")
+                        urls, result_title = PROVIDERS[name](session, tid, season, episode)
+                    except NoSource as e:
+                        nosource_errors.append(f"{name}: {e}")
                         continue
                     except Exception as e:
-                        last_server_error = e
-                        print(f"  Server '{server_name}' failed for {label}: {e}")
+                        transient_errors.append(f"{name}: {e}")
+                        print(f"  [{name} 瞬时错误] {label}: {e}")
                         continue
+                    if urls:
+                        break
+                    transient_errors.append(f"{name}: empty urls")
 
                 if urls:
                     # 恒用入参 tid/season/episode 作为 key，保证全链路一致：
@@ -617,9 +773,9 @@ def process_episode(tid, season, episode):
                     result.update(_SERIES_META.get(str(tid), {}))
                     return "ok", result
 
-                if stream_404 == len(servers_decrypted):
-                    raise NoSource(f"all {stream_404} servers returned 404 for {label}")
-                raise Exception(f"All servers failed for {label}. Last error: {last_server_error}")
+                if transient_errors:
+                    raise Exception(f"All providers failed for {label}: {transient_errors}")
+                raise NoSource("; ".join(nosource_errors))
 
             except Exception as e:
                 if not _is_retriable(e):
@@ -857,7 +1013,7 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True)
 
 
 def _parse_args(argv):
-    parser = argparse.ArgumentParser(description="TMDB 季集展开 + vidup 逐集取流")
+    parser = argparse.ArgumentParser(description="TMDB 季集展开 + 多源（vidup/vidlink/vidfast）逐集取流")
     parser.add_argument(
         "--refresh-ongoing", action="store_true",
         help="重新展开缓存中未完结（ended 非 true，含旧格式缓存行）的剧，捞回新播出的集；默认只展开未缓存的剧",
@@ -867,11 +1023,19 @@ def _parse_args(argv):
         help="只复查 fail.txt 中集级真无源、且至今未成功的集（源站后补上架时捞回）；"
              "成功追加 results.jsonl，仍无源不重复写 fail.txt",
     )
+    parser.add_argument(
+        "--providers", default=None,
+        help=f"取流源顺序，逗号分隔，覆盖 config.yaml providers；可选：{','.join(PROVIDERS)}",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv=None):
+    global ACTIVE_PROVIDERS
     args = _parse_args([] if argv is None else argv)
+    if args.providers:
+        ACTIVE_PROVIDERS = _resolve_providers(args.providers)
+    print(f"取流源顺序：{' → '.join(ACTIVE_PROVIDERS)}")
     ids_file = _resolve(_CFG.get("input", "ids.txt"))
     results_file = _resolve(_CFG.get("output", "results.jsonl"))
     fail_file = _resolve(_CFG.get("fail_file", "fail.txt"))
@@ -966,7 +1130,7 @@ def main(argv=None):
         except DeadStreakBreaker as e:
             print(f"\n{'!' * 70}\n==> 熔断退出：{e}\n"
                   f"    本窗口的 fail 行已回滚，其余未结算的集下次运行自动续跑；"
-                  f"请先人工核实 vidup / enc-dec 链路是否变更再重启。\n{'!' * 70}")
+                  f"请先人工核实 {' / '.join(ACTIVE_PROVIDERS)} 与 enc-dec 链路是否变更再重启。\n{'!' * 70}")
             raise SystemExit(2)
 
         if not retry_items:

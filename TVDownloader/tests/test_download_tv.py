@@ -565,6 +565,283 @@ def test_process_one_entry_happy_path_builds_job(sandbox, monkeypatch):
     assert "55_S01E02" in d.processing_ids
 
 
+# ---------------------------------------------------------------- multi-source: url entries / mp4 direct
+def test_normalize_url_entry_str_and_dict():
+    assert d._normalize_url_entry("  https://a/m.m3u8 ") == {
+        "url": "https://a/m.m3u8", "provider": "vidup", "type": "m3u8",
+        "headers": {}, "quality": None, "size": None,
+    }
+    node = d._normalize_url_entry({
+        "url": "https://cdn/f.mp4", "provider": "vidlink", "type": "MP4",
+        "headers": {"User-Agent": "okhttp/4.9.3", "X": None},
+        "quality": "1080", "size": "123",
+    })
+    assert node == {
+        "url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4",
+        "headers": {"User-Agent": "okhttp/4.9.3"}, "quality": 1080, "size": 123,
+    }
+    # 缺 type/headers 时补默认；非法条目返回 None
+    assert d._normalize_url_entry({"url": "u"})["type"] == "m3u8"
+    assert d._normalize_url_entry({"url": "u", "headers": "bad"})["headers"] == {}
+    for bad in ("", "  ", None, 5, {}, {"url": ""}, {"url": "u", "type": "dash"}):
+        assert d._normalize_url_entry(bad) is None
+
+
+def test_mp4_request_headers_drop_referer_and_xhr():
+    headers = d._mp4_request_headers({"User-Agent": "okhttp/4.9.3"})
+    assert headers == {
+        "Referer": None, "X-Requested-With": None, "User-Agent": "okhttp/4.9.3",
+    }
+    # 条目显式给 Referer 时以条目为准
+    assert d._mp4_request_headers({"Referer": "https://x/"})["Referer"] == "https://x/"
+
+
+def test_process_one_entry_dict_urls_use_m3u8_path(sandbox, monkeypatch):
+    calls = []
+
+    def fake_master(url, retries=None):
+        calls.append((url, retries))
+        raise RuntimeError("Read timed out")
+
+    monkeypatch.setattr(d, "parse_master_playlist", fake_master)
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    entry = {
+        "tmdbId": 1, "season": 2, "episode": 3,
+        "urls": [
+            {"url": "u1", "provider": "vidup", "type": "m3u8"},
+            "u2",
+            {"url": "", "provider": "broken"},  # 非法条目被跳过
+        ],
+    }
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False and info["retriable"] is True
+    assert calls == [("u1", d.PLAYLIST_RETRY_FALLBACK), ("u2", None)]
+
+
+def test_process_one_entry_mp4_branch_builds_job(sandbox, monkeypatch):
+    seen = {}
+
+    def fake_direct(node, output_path, label, runtime_minutes=None):
+        seen["node"] = node
+        seen["runtime"] = runtime_minutes
+        with open(output_path, "wb") as fh:
+            fh.write(b"x")
+        return "1920x1080", 4321.4
+
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "_download_mp4_direct", fake_direct)
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None: pytest.fail("mp4 节点不应走 playlist 解析"),
+    )
+    node = {"url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4",
+            "headers": {"User-Agent": "okhttp/4.9.3"}, "quality": 1080, "size": 1}
+    entry = {"tmdbId": "9", "season": 1, "episode": 1, "urls": [node],
+             "title": "Show", "year": 2011, "runtime_minutes": 45}
+    label, ok, job = d.process_one_entry(entry, set())
+    assert ok is True and label == "9_S01E01"
+    assert seen["node"]["url"] == node["url"] and seen["runtime"] == 45
+    assert job["url"] == "https://cdn/f.mp4"  # str，保持 finalize/success_info 契约
+    assert job["resolution"] == "1920x1080" and job["bitrate_kbps"] == 4321
+    assert job["missing_segment_count"] == 0 and job["missing_segment_indices"] == []
+    assert job["final_ts"].endswith("temp_9_S01E01.ts")
+    assert "9_S01E01" in d.processing_ids
+
+
+def test_process_one_entry_mp4_then_m3u8_fallback(sandbox, monkeypatch):
+    """mp4 直链 403 过期 -> 可重试；切到备用 m3u8 节点，残留 ts 被清理。"""
+    calls = []
+
+    def fake_direct(node, output_path, label, runtime_minutes=None):
+        with open(output_path, "wb") as fh:
+            fh.write(b"partial")
+        raise RuntimeError(f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: x")
+
+    def fake_master(url, retries=None):
+        calls.append((url, retries))
+        raise RuntimeError("没有找到媒体播放列表")
+
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "_download_mp4_direct", fake_direct)
+    monkeypatch.setattr(d, "parse_master_playlist", fake_master)
+    entry = {"tmdbId": 1, "season": 1, "episode": 1, "urls": [
+        {"url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4"},
+        {"url": "https://v/m.m3u8", "provider": "vidfast", "type": "m3u8"},
+    ]}
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert info["retriable"] is True  # 直链过期可重试，不被末节点确定性失败连坐
+    assert calls == [("https://v/m.m3u8", None)]
+    assert not os.path.exists(os.path.join(d.TEMP_DIR, "temp_1_S01E01.ts"))
+    assert d.processing_ids == set()
+
+
+def test_refetch_marker_is_retriable_and_classified():
+    msg = f"直链已失效（HTTP 410），{d._NEEDS_REFETCH_MARKER}: u"
+    assert d._classify_failure(msg) is True
+    assert d.classify_reject_reason(msg) == "直链失效需重新取流"
+
+
+class _FakeResp:
+    def __init__(self, status, headers=None, content=b""):
+        self.status_code = status
+        self.headers = headers or {}
+        self.content = content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise d.requests.HTTPError(f"HTTP {self.status_code}", response=self)
+
+
+class _FakeRangeSession:
+    """按 Range 头切片返回 206；status 指定时统一返回该状态码。"""
+
+    def __init__(self, data, status=None):
+        self.data = data
+        self.status = status
+        self.calls = []
+
+    def request(self, method, url, headers=None, **kwargs):
+        headers = dict(headers or {})
+        self.calls.append((url, headers.get("Range"), headers))
+        if self.status is not None:
+            return _FakeResp(self.status)
+        start, end = (int(x) for x in headers["Range"][6:].split("-"))
+        end = min(end, len(self.data) - 1)
+        return _FakeResp(
+            206,
+            {"Content-Range": f"bytes {start}-{end}/{len(self.data)}"},
+            self.data[start:end + 1],
+        )
+
+
+@pytest.fixture
+def mp4_env(sandbox, monkeypatch):
+    monkeypatch.setattr(d, "MP4_CHUNK_SIZE", 4)
+    monkeypatch.setattr(d, "MP4_CONCURRENCY", 2)
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 1)
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (1920, 1080))
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    monkeypatch.setattr(d, "_probe_duration", lambda p: None)
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 0.0)
+    monkeypatch.setattr(d, "record_block_status", lambda s: None)
+    return sandbox
+
+
+def _install_range_session(monkeypatch, data, status=None):
+    session = _FakeRangeSession(data, status)
+    monkeypatch.setattr(d, "get_session", lambda: session)
+    return session
+
+
+def test_download_mp4_direct_chunks_and_headers(mp4_env, monkeypatch):
+    data = b"abcdefghij"
+    session = _install_range_session(monkeypatch, data)
+    out = os.path.join(d.TEMP_DIR, "temp_x.ts")
+    node = {"url": "https://cdn/f.mp4", "type": "mp4",
+            "headers": {"User-Agent": "okhttp/4.9.3"}, "quality": 1080, "size": None}
+    resolution, bitrate = d._download_mp4_direct(node, out, "x", runtime_minutes=1)
+    assert resolution == "1920x1080"
+    assert bitrate == pytest.approx(len(data) * 8 / 60 / 1000)
+    with open(out, "rb") as fh:
+        assert fh.read() == data
+    ranges = sorted(r for _, r, _ in session.calls)
+    assert ranges == ["bytes=0-0", "bytes=0-3", "bytes=4-7", "bytes=8-9"]
+    for _, _, headers in session.calls:
+        assert headers["User-Agent"] == "okhttp/4.9.3"
+        assert headers["Referer"] is None and headers["X-Requested-With"] is None
+
+
+def test_download_mp4_direct_overwrites_stale_file(mp4_env, monkeypatch):
+    """残留 ts（无论长度）一律重下，不做续传。"""
+    data = b"abcdefghij"
+    session = _install_range_session(monkeypatch, data)
+    out = os.path.join(d.TEMP_DIR, "temp_x.ts")
+    os.makedirs(d.TEMP_DIR, exist_ok=True)
+    for stale in (data[:4], data, data + b"zz"):
+        with open(out, "wb") as fh:
+            fh.write(stale)
+        session.calls.clear()
+        d._download_mp4_direct({"url": "u", "type": "mp4", "headers": {},
+                                "quality": None, "size": None}, out, "x", runtime_minutes=1)
+        with open(out, "rb") as fh:
+            assert fh.read() == data
+        assert sorted(r for _, r, _ in session.calls) == [
+            "bytes=0-0", "bytes=0-3", "bytes=4-7", "bytes=8-9"]
+
+
+def test_download_mp4_direct_no_range_support_fails_fast(mp4_env, monkeypatch):
+    """探测返回 200（服务端不支持 Range）时：即便带 declared size 也直接判不支持，
+    不进入分块下载；块级 200 亦不做退避重试。"""
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 5)
+    sleeps = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+
+    class _FullSession:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, method, url, headers=None, **kwargs):
+            self.calls += 1
+            return _FakeResp(200, {}, b"abc")
+
+    session = _FullSession()
+    monkeypatch.setattr(d, "get_session", lambda: session)
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": 10}
+    with pytest.raises(RuntimeError, match="不支持 Range"):
+        d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
+    assert session.calls == 1
+
+    with pytest.raises(RuntimeError, match="未按 Range 响应"):
+        d._download_mp4_chunk("u", {}, 0, 2, 0)
+    assert session.calls == 2 and sleeps == []
+
+
+def test_download_mp4_chunk_non_video_first_block_no_retry(mp4_env, monkeypatch):
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 5)
+    sleeps = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    session = _install_range_session(monkeypatch, b"<html>nope</html>")
+    with pytest.raises(RuntimeError, match="不是视频分片"):
+        d._download_mp4_chunk("u", {}, 0, 9, 0)
+    assert len(session.calls) == 1 and sleeps == []
+    # 非首块不做内容校验
+    assert d._download_mp4_chunk("u", {}, 10, 16, 1) == b"</html>"
+
+
+def test_download_mp4_direct_expired_link_needs_refetch(mp4_env, monkeypatch):
+    _install_range_session(monkeypatch, b"", status=403)
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": 10}
+    with pytest.raises(RuntimeError, match=d._NEEDS_REFETCH_MARKER) as exc:
+        d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
+    assert d._classify_failure(str(exc.value)) is True
+
+
+def test_download_mp4_direct_quality_prefilter(mp4_env, monkeypatch):
+    session = _install_range_session(monkeypatch, b"abc")
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": 480, "size": None}
+    with pytest.raises(RuntimeError, match="低于红线") as exc:
+        d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
+    assert d._classify_failure(str(exc.value)) is False
+    assert session.calls == []  # 声明画质不达标：一个字节都不下
+
+
+def test_download_mp4_direct_bitrate_gate(mp4_env, monkeypatch):
+    _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "_probe_duration", lambda p: 100.0)
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 5000.0)
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
+    with pytest.raises(RuntimeError, match="码率未达到") as exc:
+        d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
+    assert d._classify_failure(str(exc.value)) is False
+
+
 # ---------------------------------------------------------------- finalize / upload
 def test_finalize_one_entry_success_and_failure(sandbox, monkeypatch):
     temp = sandbox / "temp"

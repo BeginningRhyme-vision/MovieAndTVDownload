@@ -109,6 +109,10 @@ PLAYLIST_RETRY_BACKOFF_MAX = float(_CFG.get("playlist_retry_backoff_max", 60.0))
 # 方案C 分阶重试：多节点 fallback 时，非末节点用更小的 playlist 重试次数，
 # 坏节点快速判定并换下一个备用节点；末节点/单节点仍用 PLAYLIST_RETRY_MAX 死磕。
 PLAYLIST_RETRY_FALLBACK = int(_CFG.get("playlist_retry_fallback", 3))
+# mp4 直链（vidlink 等）按 Range 分块并发下载：每块字节数与并发块数。
+# 块太小会放大请求次数（CDN 限速/风控），太大则单块失败重传代价高；8MB 是折中。
+MP4_CHUNK_SIZE = int(_CFG.get("mp4_chunk_size", 8 * 1024 * 1024))
+MP4_CONCURRENCY = int(_CFG.get("mp4_concurrency", 8))
 MIN_RESOLUTION_HEIGHT = int(_CFG.get("min_resolution_height", 1080))
 # 唯一宽松系数：同时放宽“分辨率红线”与“码率门槛”两关（合并原来的两个容差系数）。
 LENIENCY = float(_CFG.get("leniency", 0.8))
@@ -579,6 +583,17 @@ _PERMANENT_FAILURE_MARKERS = (
     "服务器返回的不是视频分片",   # 源返回 HTML/m3u8，通常是无效源
 )
 
+# mp4 直链（vidlink 签名 url 带 sign&t 时效）返回 403/410 时的文案标记：
+# 不是画质问题也不是源站故障，而是直链过期——保持“可重试”，让下一轮/重新取流有机会。
+_NEEDS_REFETCH_MARKER = "需重新取流"
+
+# mp4 直链单块下载中“重试也没用”的文案：命中即不再走块级退避重试，直接上抛。
+_MP4_CHUNK_NO_RETRY_MARKERS = (
+    _NEEDS_REFETCH_MARKER,        # 403/410 直链过期
+    "服务器未按 Range 响应",      # 200 全量响应，服务端不支持 Range
+    "服务器返回的不是视频分片",   # 首块是 HTML/m3u8
+)
+
 
 def _classify_failure(error_msg):
     """判断一次下载失败是否值得下一轮重试。
@@ -609,6 +624,7 @@ _REJECT_REASON_RULES = (
     ("采样数据异常", ("采样数据或采样时长",)),
     ("正片缺片率过高", ("缺片率过高",)),
     ("源返回非视频分片", ("服务器返回的不是视频分片",)),
+    ("直链失效需重新取流", (_NEEDS_REFETCH_MARKER,)),
     ("源站5xx", ("HTTP Error 5", "500 Server Error", "502", "503", "504")),
     ("超时", ("timed out", "timeout", "超时")),
     ("SSL/连接错误", ("SSL", "Connection", "ConnectionError")),
@@ -1317,6 +1333,288 @@ def convert_ts_to_mp4(ts_path, mp4_path):
         return False
 
 
+# ---------- 取流条目归一化 / mp4 直链下载 ----------
+# 上游 tv_ids_to_links.py 写入的 urls 元素有两种形态：
+#   - 纯 str：历史 results.jsonl（旧 vidup m3u8）；
+#   - dict：{"url","provider","type":"m3u8"|"mp4","headers","quality","size"}。
+# 这里统一归一成 dict，下游按 type 分支；非法条目返回 None（调用方跳过）。
+def _normalize_url_entry(item):
+    if isinstance(item, str):
+        url = item.strip()
+        if not url:
+            return None
+        return {
+            "url": url, "provider": "vidup", "type": "m3u8",
+            "headers": {}, "quality": None, "size": None,
+        }
+    if not isinstance(item, dict):
+        return None
+    url = item.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    type_ = str(item.get("type") or "m3u8").lower()
+    if type_ not in ("m3u8", "mp4"):
+        return None
+    headers = item.get("headers")
+    if not isinstance(headers, dict):
+        headers = {}
+    return {
+        "url": url.strip(),
+        "provider": str(item.get("provider") or "unknown"),
+        "type": type_,
+        "headers": {str(k): str(v) for k, v in headers.items() if v is not None},
+        "quality": parse_int(item.get("quality")),
+        "size": parse_int(item.get("size")),
+    }
+
+
+def _mp4_request_headers(node_headers):
+    """mp4 直链请求头：以条目自带 headers 为准，去掉默认的 vidup Referer 与 XHR 头。
+
+    vidlink CDN 带任何 Referer 都会 429，浏览器 UA 无 Referer 会 428，
+    只有取流阶段验证过的 headers（okhttp UA、无 Referer）能拿到 206。
+    值为 None 的键会被 requests 在合并 Session 头时删除。
+    """
+    headers = {"Referer": None, "X-Requested-With": None}
+    headers.update(node_headers or {})
+    return headers
+
+
+def _probe_duration(path):
+    """ffprobe 读容器时长（秒）；失败返回 None。"""
+    command = [
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "default=nokey=1:noprint_wrappers=1", path,
+    ]
+    try:
+        result = subprocess.run(
+            command, check=True, capture_output=True, text=True,
+            errors="replace", timeout=120,
+        )
+        return float(result.stdout.strip())
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+
+
+def _mp4_probe_total_size(url, headers, declared_size):
+    """用 Range: bytes=0-0 探测直链总长并验证 Range 支持。
+
+    403/410 视为签名直链过期，抛带 _NEEDS_REFETCH_MARKER 的错误（可重试，
+    由上层多轮/重新取流兜底）。返回 (total_size, range_ok)：range_ok 仅由
+    状态码是否为 206 决定；206 但 Content-Range 总长为 * 时回退到条目声明的 size。
+    """
+    session = get_session()
+    request_headers = dict(HEADERS)
+    request_headers.update(headers)
+    request_headers["Range"] = "bytes=0-0"
+    range_ok = False
+    try:
+        with session.request(
+            "GET", url, headers=request_headers, timeout=30, stream=True
+        ) as response:
+            status = response.status_code
+            if status in (403, 410):
+                raise RuntimeError(
+                    f"直链已失效（HTTP {status}），{_NEEDS_REFETCH_MARKER}: {url}"
+                )
+            if status in (429, 503):
+                record_block_status(status)
+            response.raise_for_status()
+            range_ok = status == 206
+            if range_ok:
+                content_range = response.headers.get("Content-Range", "")
+                match = re.search(r"/(\d+)\s*$", content_range)
+                if match:
+                    return int(match.group(1)), True
+            length = parse_int(response.headers.get("Content-Length"))
+            if status == 200 and length:
+                return length, False
+    except (requests.RequestException, ConnectionError, TimeoutError) as exc:
+        raise RuntimeError(f"直链探测失败: {url}; {exc}") from exc
+    if declared_size:
+        return declared_size, range_ok
+    raise RuntimeError(f"直链探测失败：无法确定文件总长: {url}")
+
+
+def _download_mp4_chunk(url, headers, start, end, index):
+    """下载 [start, end] 闭区间字节块；服务端不按 Range 响应（200）时视为失败。"""
+    last_error = None
+    request_headers = dict(headers)
+    request_headers["Range"] = f"bytes={start}-{end}"
+    expected = end - start + 1
+    for attempt in range(1, SEG_RETRY_MAX + 1):
+        try:
+            session = get_session()
+            merged = dict(HEADERS)
+            merged.update(request_headers)
+            with session.request(
+                "GET", url, headers=merged, timeout=60
+            ) as response:
+                status = response.status_code
+                if status in (403, 410):
+                    raise RuntimeError(
+                        f"直链已失效（HTTP {status}），{_NEEDS_REFETCH_MARKER}: {url}"
+                    )
+                if status in (429, 503):
+                    record_block_status(status)
+                response.raise_for_status()
+                if status != 206:
+                    raise RuntimeError(f"服务器未按 Range 响应（HTTP {status}）")
+                content = response.content
+            if len(content) != expected:
+                raise RuntimeError(
+                    f"块长度不符：期望 {expected} 实得 {len(content)}"
+                )
+            if index == 0:
+                # 首块校验：源返回 HTML/m3u8 而非视频数据时尽早判无效源。
+                validate_segment_content(content, url)
+            return content
+        except Exception as exc:
+            last_error = exc
+            message = str(exc)
+            if (
+                any(marker in message for marker in _MP4_CHUNK_NO_RETRY_MARKERS)
+                or attempt == SEG_RETRY_MAX
+            ):
+                break
+            wait = min(SEG_RETRY_DELAY * (2 ** (attempt - 1)), 60)
+            wait += random.uniform(0, min(1.0, wait * 0.2))
+            print(
+                f"    直链块 {index + 1} 下载失败 "
+                f"({attempt}/{SEG_RETRY_MAX}): {exc}; {wait:.1f}s 后重试"
+            )
+            time.sleep(wait)
+    raise RuntimeError(
+        f"直链块 {index + 1} 重试后仍失败: {last_error}"
+    ) from last_error
+
+
+def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
+    """mp4 直链：Range 分块并发下载到 output_path，并做画质筛选。
+
+    流程：
+      1. quality 声明存在时先过分辨率红线（不达标直接确定性淘汰，省流量）；
+      2. Range 探测总长 → 按 MP4_CHUNK_SIZE 分块，MP4_CONCURRENCY 并发，
+         严格按块序落盘（复用分片下载的滑动窗口思路）；不做断点续传；
+      3. 下载完成后 ffprobe 实测分辨率/编码/时长，码率 = 字节×8/时长 对齐
+         bitrate_threshold（与 m3u8 路径同一套门槛）。
+    返回 (resolution_str, bitrate_kbps)。任何块失败即整体失败（直链无“缺片豁免”）。
+    """
+    url = node["url"]
+    headers = _mp4_request_headers(node.get("headers"))
+    quality = node.get("quality")
+    if quality and not meets_resolution_redline(quality):
+        raise RuntimeError(
+            f"声明分辨率 {quality}p 低于红线 {MIN_RESOLUTION_HEIGHT}"
+            f"（容差 {LENIENCY:.2f}），跳过"
+        )
+
+    total_size, range_ok = _mp4_probe_total_size(url, headers, node.get("size"))
+    if not range_ok:
+        raise RuntimeError(f"直链不支持 Range 分块下载: {url}")
+    if total_size <= 0:
+        raise RuntimeError(f"直链总长异常({total_size}): {url}")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    # 不做断点续传：节点失败时上层会删掉残留 ts，启动时也会清理 temp_*，
+    # 残留文件无法证明与本次直链一致，存在即视为脏数据重下。
+    remove_file(output_path)
+
+    chunks = [
+        (start, min(start + MP4_CHUNK_SIZE, total_size) - 1)
+        for start in range(0, total_size, MP4_CHUNK_SIZE)
+    ]
+    print(
+        f"  [{label}] 直链分块下载 {total_size} 字节，"
+        f"{len(chunks)} 块 × {MP4_CHUNK_SIZE // (1024 * 1024)}MB，"
+        f"并发 {MP4_CONCURRENCY}"
+    )
+    with open(output_path, "wb") as output_file:
+        with ThreadPoolExecutor(max_workers=MP4_CONCURRENCY) as executor:
+            next_submit = 0
+            write_cursor = 0
+            done_buffer = {}
+            future_to_index = {}
+            max_buffered = MP4_CONCURRENCY * 2
+            failure = None
+
+            def refill():
+                nonlocal next_submit
+                while (
+                    failure is None
+                    and len(future_to_index) < MP4_CONCURRENCY
+                    and next_submit < len(chunks)
+                    and (len(done_buffer) < max_buffered or not future_to_index)
+                ):
+                    start, end = chunks[next_submit]
+                    future = executor.submit(
+                        _download_mp4_chunk, url, headers, start, end,
+                        next_submit,
+                    )
+                    future_to_index[future] = next_submit
+                    next_submit += 1
+
+            refill()
+            while future_to_index:
+                done, _ = wait(future_to_index.keys(), return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = future_to_index.pop(future)
+                    try:
+                        done_buffer[index] = future.result()
+                    except Exception as exc:
+                        if failure is None:
+                            failure = exc
+                while write_cursor < len(chunks) and write_cursor in done_buffer:
+                    output_file.write(done_buffer.pop(write_cursor))
+                    write_cursor += 1
+                if failure is not None:
+                    # 其余在途块跑完即止，不再投递；残留文件由上层节点循环清理。
+                    for future in list(future_to_index):
+                        future.cancel()
+                    break
+                refill()
+        output_file.flush()
+
+    if failure is not None:
+        raise failure
+    written = os.path.getsize(output_path)
+    if written != total_size:
+        raise RuntimeError(f"直链下载长度不符：{written} != {total_size}")
+
+    actual_size = probe_resolution(output_path)
+    if not actual_size:
+        raise RuntimeError("采样探测分辨率失败（可重试）")
+    resolution = f"{actual_size[0]}x{actual_size[1]}"
+    height = actual_size[1]
+    print(f"  [{label}] 直链实测分辨率: {resolution}")
+    if not meets_resolution_redline(height):
+        raise RuntimeError(
+            f"分辨率 {resolution} 低于红线 {MIN_RESOLUTION_HEIGHT}"
+            f"（容差 {LENIENCY:.2f}），跳过"
+        )
+
+    duration = _probe_duration(output_path)
+    if not duration or duration <= 0:
+        minutes = parse_int(runtime_minutes)
+        duration = minutes * 60 if minutes else None
+    if not duration:
+        raise RuntimeError("采样数据或采样时长异常：无法确定直链时长")
+    bitrate = total_size * 8 / duration / 1000
+    codec = probe_codec(output_path)
+    min_bitrate = bitrate_threshold(height, codec)
+    codec_label = codec or "unknown"
+    print(
+        f"  [{label}] 直链 {resolution} 编码 {codec_label}，"
+        f"码率 {bitrate:.0f} kbps，门槛 {min_bitrate:.0f} kbps"
+    )
+    if bitrate < min_bitrate:
+        raise RuntimeError(
+            f"分辨率 {resolution} 流（{codec_label}）"
+            f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+        )
+    return resolution, bitrate
+
+
 # ---------- 单集处理 ----------
 def process_one_entry(entry, processed_ids):
     """处理一集。返回 (label, success, info)，label 为集级 key（缺 key 时回退 tmdbId）。"""
@@ -1326,8 +1624,14 @@ def process_one_entry(entry, processed_ids):
     normalized_id = episode_key(tmdb_id, season, episode)
     label = normalized_id or normalize_tmdb_id(tmdb_id)
     title = entry.get("title", "")
-    urls = entry.get("urls", [])
+    # urls 元素兼容 str（历史 vidup m3u8）与 dict（多源：m3u8/mp4 + headers）。
+    urls = [
+        node for node in (
+            _normalize_url_entry(item) for item in (entry.get("urls") or [])
+        ) if node
+    ]
     year = entry.get("year")
+    runtime_minutes = entry.get("runtime_minutes")
 
     if not normalized_id or not urls:
         return label, False, {
@@ -1357,13 +1661,42 @@ def process_one_entry(entry, processed_ids):
     temp_mp4 = os.path.join(TEMP_DIR, f"temp_{safe_file_token(normalized_id)}.mp4")
     cleanup_paths.update((final_ts, temp_mp4))
 
-    def _attempt_download(url, is_last_node):
-        """对单个取流节点(url)尝试完整下载，成功返回 conversion_job，失败抛异常。
+    def _attempt_download(node, is_last_node):
+        """对单个取流节点尝试完整下载，成功返回 conversion_job，失败抛异常。
 
+        node 为归一化后的 dict；按 type 分支：m3u8 走 playlist 解析 + 采样 +
+        分片拼接；mp4 走 Range 分块直链下载（画质筛选在 _download_mp4_direct 内）。
         is_last_node=False（还有备用节点）时，master playlist 解析用短重试
         PLAYLIST_RETRY_FALLBACK，坏节点快速判定即换下一个；末节点/单节点用
         默认 PLAYLIST_RETRY_MAX 死磕，不放过最后的机会。
         """
+        url = node["url"]
+        if node["type"] == "mp4":
+            resolution, bitrate = _download_mp4_direct(
+                node, final_ts, label, runtime_minutes
+            )
+            conversion_job = {
+                "tmdbId": tmdb_id,
+                "season": season,
+                "episode": episode,
+                "normalized_id": normalized_id,
+                "title": title,
+                "year": year,
+                "url": url,
+                "final_ts": final_ts,
+                "temp_mp4": temp_mp4,
+                "cleanup_paths": list(cleanup_paths),
+                "bitrate_kbps": round(bitrate),
+                "resolution": resolution,
+                "missing_segment_count": 0,
+                "missing_segment_indices": [],
+            }
+            print(
+                f"  [{label}] 直链下载完成，已释放下载槽位并进入转封装队列",
+                flush=True,
+            )
+            return conversion_job
+
         variants = parse_master_playlist(
             url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK
         )
@@ -1616,12 +1949,16 @@ def process_one_entry(entry, processed_ids):
         conversion_job = None
         last_exc = None
         any_retriable = False  # 只要有任一节点是“可重试失败”，整集就值得下一轮重试
-        for idx, url in enumerate(urls, start=1):
+        for idx, node in enumerate(urls, start=1):
             is_last_node = idx == len(urls)
             try:
                 if idx > 1:
-                    print(f"  [{label}] 切换备用节点 {idx}/{len(urls)}", flush=True)
-                conversion_job = _attempt_download(url, is_last_node)
+                    print(
+                        f"  [{label}] 切换备用节点 {idx}/{len(urls)} "
+                        f"({node['provider']}/{node['type']})",
+                        flush=True,
+                    )
+                conversion_job = _attempt_download(node, is_last_node)
                 break
             except Exception as exc:
                 last_exc = exc

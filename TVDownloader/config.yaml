@@ -124,8 +124,14 @@ tv_ids_to_links:
   # 需要时运行 `python tv_ids_to_links.py --refresh-ongoing`，重新展开 ended 非 true 的剧
   # （含旧格式缺 ended 字段的缓存行），以追加行覆盖旧缓存。
 
-  # 解密服务 API 根地址（负责 enc-vidup / dec-vidup 加解密）
+  # 解密服务 API 根地址（负责 enc-vidup / dec-vidup / enc-vidfast / dec-vidfast / enc-vidlink 加解密）
   api: "https://enc-dec.app/api"
+  # 取流源顺序：同一次尝试内按此顺序逐家取流，首家命中即返回，不再打后面的源。
+  # 某家真无源或瞬时错误都继续试下一家；全部跑完仍无 url 时，只要有任一家是瞬时错误就重试，
+  # 全部真无源才算一次“疑似无源”（再走 dead_confirm 换 IP 复探）。可用：vidup / vidlink / vidfast。
+  # vidup、vidfast 出 m3u8；vidlink 出带时效签名的 mp4 直链（带 quality/size，下载头 okhttp）。
+  # 命令行 --providers vidlink,vidfast 可临时覆盖（如 --recheck-dead 只用新源复扫）。
+  providers: [vidup, vidlink, vidfast]
   # 并发线程数：同时解析多少集。配合住宅代理分散 IP。
   # 无源404不重试，任务为纯IO等待，可拉高并发；电影版 50 实测稳定。
   # 2026-09 全量实跑：50 并发时老剧段（判死需 2 轮 × 5 server）仅 ~72 集/分钟，瓶颈在代理 RTT，
@@ -220,6 +226,17 @@ download_tv:
   playlist_retry_backoff_max: 60.0  # 退避间隔上限（秒）
   # 多节点 fallback：非末节点用更小的重试次数快速判定坏节点并换下一个备用节点
   playlist_retry_fallback: 3
+  # ---- mp4 直链下载（vidlink 等 type=mp4 的取流条目）----
+  # 按 Range 分块并发下载，单块失败按 seg_retry_max/seg_retry_delay 重试；不做断点续传
+  # （残留文件视为脏数据整段重下，启动时 temp_* 也会被清理）。
+  # 请求头使用取流阶段记录的 headers（如 okhttp UA），并去掉 Session 默认的 Referer/X-Requested-With。
+  # 直链 403/410 视为签名过期，标记“需重新取流”并按可重试处理；非 206 / 首块非视频内容
+  # 属确定性失败，不做块级重试直接换节点。
+  # 内存估算：每集最多 (mp4_concurrency 在途 + 2×mp4_concurrency 已下完待落盘) × mp4_chunk_size
+  #   ≈ 3 × 8 × 8MB = 192MB；全局上限再乘 max_workers（32 → 约 6GB，仅在所有 worker 同时
+  #   跑 mp4 直链且乱序严重时才会逼近）。内存紧张时优先调小 mp4_concurrency 或 mp4_chunk_size。
+  mp4_chunk_size: 8388608   # 单块大小（字节），默认 8MB
+  mp4_concurrency: 8        # 同一集内并发块数
   # ==== 画质筛选（单一码率曲线，与 MovieDownloader 完全一致）====
   # 【第 1 关 · 分辨率红线】 h ≥ min_resolution_height × leniency
   # 【第 2 关 · 码率门槛】   br ≥ bitrate_<codec> × (h / 1080)² × leniency
