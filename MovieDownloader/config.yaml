@@ -57,22 +57,43 @@ tmdb_ids_to_links:
   output: "results.jsonl"
   # 解析失败的 tmdb_id 记录
   fail_file: "fail.txt"
-  # 解密服务 API 根地址（负责 enc-vidup / dec-vidup 加解密）
+  # 解密服务 API 根地址（负责各 provider 的 enc-* / dec-* 加解密）
   api: "https://enc-dec.app/api"
+  # ---- 多源取流 ----
+  # 按顺序逐家取流，把各家给出的 url 全部汇总进 urls 数组（按 url 去重、保持此处顺序），
+  # 下载侧按节点顺序逐个尝试；任一家给出 url 即算成功。
+  # 2026-09-08 对 348601 部 vidup 判死影片分层抽样 300 部实测（详见 AGENTS.md §10）：
+  #   videasy 11.7%（独占 11）、vidfast 8.0%（独占 0）、vidlink 6.7%（独占 5），ANY 13.3%
+  #   命中 url 全部唯一、随机抽 18 条拉流 18/18 成功、vidup 复探 39/40 仍无源（97.5% 是真增量）
+  # 注意：与 TVDownloader 的结论相反（那边 vidlink 是主力、videasy 与 vidfast 完全重合）。
+  # vidfast 独占为 0，但与 vidup 同构（零维护成本）且 servers 更多，留作坡度冗余。
+  # 可用 --providers a,b 在命令行覆盖，便于单独验证某一家的实际贡献。
+  providers: [vidup, videasy, vidlink, vidfast]
   # 并发线程数：同时解析多少个 tmdb_id。配合住宅代理分散 IP。
   # 提速优化：无源404已改为不重试（省2/3请求），任务变纯IO等待，可拉高并发；50 实测更稳
   max_workers: 50
   # 单个 id 的最大重试次数与每次重试间隔（秒）
-  # 现在只有瞬时错误(SSL/超时/5xx)才重试，真无源404直接跳过不sleep，故 delay 缩短到 1
+  # 白名单判死：只有源站明确表示无此片（vidup/vidfast 页面 404 或全部 server 的 stream 404、
+  # vidlink 返回 null、videasy 全部 server 空）才算真无源；其余任何错误（SSL/超时/5xx/
+  # 解密服务异常/结构异常）一律视为瞬时，重试后进入多轮捞回。
   max_retries: 3
   retry_delay: 1
+  # 判死二次确认：首次无源只算"疑似"，换出口 IP 再把所有 provider 完整探一次，
+  # 连续两次全家无源才写 fail.txt，防 CDN/代理抖动把有源片永久误判丢失；
+  # 命中过无源的片重试预算 +1。false 则单次无源即判死。
+  dead_confirm: true
   # ---- 多轮捞回：整批跑完后对“瞬时耗尽”的 ID 自动重跑，直到清零或达上限 ----
   # 进程内不定轮循环，替代旧的外部 retry_runner.sh：
   #   - 单 ID 在 process_tmdb_id 内换 IP 重试 max_retries 次仍失败(瞬时耗尽) → 下一轮重跑；
-  #   - 真无源404 → 永久排除，绝不再抓；
+  #   - 确认真无源 → 永久排除，绝不再抓；
   #   - output 直接就是全部轮次成功结果的合并（原 total_results.jsonl）。
   # max_rounds 为兜底上限（含第一轮），防极端情况死循环。
   max_rounds: 8
+  # 轮间退避（秒）：第 n 轮后等待 round_backoff*n，上限 round_backoff_max。
+  # 给 enc-dec / 代理 / 源站的短时故障留恢复窗口，避免多轮在几秒内烧光重试预算。
+  # 某轮"待重跑"占比 ≥90% 且数量 ≥50 时判定为基础设施故障，直接等满上限。
+  round_backoff: 30
+  round_backoff_max: 300
   # 单个 HTTP 请求超时（秒）。启用 Session 连接复用后握手更快。
   # 分阶段实测：正常各阶段中位 0.5~3.7s、单请求 P90≈15s、取流循环 max≈13s，
   # 20s 给卡死请求留太久空耗线程；降到 12s 可让长尾/卡死请求早 3~8s 放弃，
@@ -145,6 +166,29 @@ download_movies:
   # 方案C 多节点 fallback：非末节点用更小的重试次数快速判定坏节点并换下一个备用节点；
   # 末节点/单节点仍用 playlist_retry_max 死磕。
   playlist_retry_fallback: 3
+  # ---- mp4 直链下载（vidlink 等 type=mp4 的取流条目）----
+  # 按 Range 分块并发下载，单块失败按 seg_retry_max/seg_retry_delay 重试；不做断点续传
+  # （残留文件视为脏数据整段重下，启动时 temp_* 也会被清理）。
+  # 请求头使用取流阶段记录的 headers（如 okhttp UA），并去掉 Session 默认的 Referer/X-Requested-With。
+  # 直链 403/410 视为签名过期，标记“需重新取流”；它与非 206 / 404 / 416 /
+  # 首块非视频内容一样属确定性失败——本脚本读的是固化的 results.jsonl，没有
+  # 重新取流的能力，多轮重投拿到的还是同一条 url，必然再挂。故一律不重试、
+  # 直接换下一个节点，并留在 failed.jsonl 里等重跑 tmdb_ids_to_links.py 修复。
+  # 内存估算：每部片最多 (mp4_concurrency 在途 + 2×mp4_concurrency 已下完待落盘) × mp4_chunk_size
+  #   ≈ 3 × 8 × 8MB = 192MB；全局上限再乘 max_workers（32 → 约 6GB，仅在所有 worker 同时
+  #   跑 mp4 直链且乱序严重时才会逼近）。内存紧张时优先调小 mp4_concurrency 或 mp4_chunk_size。
+  mp4_chunk_size: 8388608   # 单块大小（字节），默认 8MB
+  mp4_concurrency: 8        # 同一部片内并发块数
+  # 画质预检样本大小（字节）：整片下载前先取头部这么多字节，用 ffprobe 读 moov
+  # 判分辨率/编码/时长，码率 = Range 探测到的总长 × 8 / 时长。判定口径与下完整片
+  # 后完全一致，却只花几 MB —— 避免 1~5GB 的整片下完才发现码率不达标而白丢。
+  # moov 在文件尾部（非 faststart）时探测失败，此时放行走整片下载后再验，不误杀。
+  # 只对 total_size > mp4_sample_size×2 的文件预检：更小的文件采样等于整片下两遍。
+  mp4_sample_size: 8388608
+  # 预检时长优先取上游 runtime_minutes（TMDB 元数据，可信的整片时长）。仅当它缺失
+  # 才回退到样本探测，且样本时长低于此值（秒）时视为"疑似样本自身时长而非整片时长"
+  # —— 用它当分母会让码率虚高几十倍、预检形同虚设，故判为不可信并放行整片下载。
+  mp4_min_trusted_duration: 600
   # ==== 画质筛选（单一码率曲线，防误杀重设计 2026-09-03）====
   # 【整体流程】一部片的 master 里通常有多条清晰度流(variant)。对每条候选流采样测得
   #   (实测高度 h、视频编码 codec、采样码率 br)，依次过两道“合格判定”关；两关都合格的
