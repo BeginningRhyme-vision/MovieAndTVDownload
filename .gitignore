@@ -14,6 +14,10 @@ MovieDownloader/__pycache__/
 # 私有记忆文件，仅供本地使用，不纳入 git 跟踪
 MovieDownloader/AGENTS.md
 TVDownloader/AGENTS.md
+# 私有使用手册，含服务器地址与运维细节，不纳入 git 跟踪
+TVDownloader/README.md
+# 多源探测工具（一次性调研用），暂不纳入 git 跟踪
+TVDownloader/probe_sources.py
 
 # 运行期产物，不纳入 git 跟踪
 MovieDownloader/download_movies.main.lock
