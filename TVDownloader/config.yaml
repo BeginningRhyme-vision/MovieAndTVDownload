@@ -250,7 +250,12 @@ download_tv:
   # 判分辨率/编码/时长，码率 = Range 探测到的总长 × 8 / 时长。判定口径与下完整片
   # 后完全一致，却只花几 MB —— 避免 1~3GB 的整集下完才发现码率不达标而白丢。
   # moov 在文件尾部（非 faststart）时探测失败，此时放行走整片下载后再验，不误杀。
+  # 只对 total_size > mp4_sample_size×2 的文件预检：更小的文件采样等于整片下两遍。
   mp4_sample_size: 8388608
+  # 预检时长优先取上游 runtime_minutes（TMDB 元数据，可信的整片时长）。仅当它缺失
+  # 才回退到样本探测，且样本时长低于此值（秒）时视为"疑似样本自身时长而非整片时长"
+  # —— 用它当分母会让码率虚高几十倍、预检形同虚设，故判为不可信并放行整片下载。
+  mp4_min_trusted_duration: 600
   # ==== 画质筛选（单一码率曲线，与 MovieDownloader 完全一致）====
   # 【第 1 关 · 分辨率红线】 h ≥ min_resolution_height × leniency
   # 【第 2 关 · 码率门槛】   br ≥ bitrate_<codec> × (h / 1080)² × leniency

@@ -975,6 +975,9 @@ def mp4_env(sandbox, monkeypatch):
     monkeypatch.setattr(d, "MP4_CHUNK_SIZE", 4)
     monkeypatch.setattr(d, "MP4_CONCURRENCY", 2)
     monkeypatch.setattr(d, "SEG_RETRY_MAX", 1)
+    # 样本 4 字节：预检只对 total_size > MP4_SAMPLE_SIZE*2 的文件生效，
+    # 10 字节的测试数据正好越过该阈值。
+    monkeypatch.setattr(d, "MP4_SAMPLE_SIZE", 4)
     monkeypatch.setattr(d, "probe_resolution", lambda p: (1920, 1080))
     monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
     monkeypatch.setattr(d, "_probe_duration", lambda p: None)
@@ -1001,10 +1004,10 @@ def test_download_mp4_direct_chunks_and_headers(mp4_env, monkeypatch):
     with open(out, "rb") as fh:
         assert fh.read() == data
     ranges = sorted(r for _, r, _ in session.calls)
-    # bytes=0-0 探测总长；bytes=0-9 画质预检样本（MP4_SAMPLE_SIZE > 总长时取全片）；
-    # 其余是 MP4_CHUNK_SIZE=4 的正片分块。
+    # bytes=0-0 探测总长；bytes=0-3 画质预检样本（MP4_SAMPLE_SIZE=4）；
+    # 其余是 MP4_CHUNK_SIZE=4 的正片分块（0-3 与样本 range 相同，去重后可见）。
     assert ranges == [
-        "bytes=0-0", "bytes=0-3", "bytes=0-9", "bytes=4-7", "bytes=8-9",
+        "bytes=0-0", "bytes=0-3", "bytes=0-3", "bytes=4-7", "bytes=8-9",
     ]
     for _, _, headers in session.calls:
         assert headers["User-Agent"] == "okhttp/4.9.3"
@@ -1026,7 +1029,7 @@ def test_download_mp4_direct_overwrites_stale_file(mp4_env, monkeypatch):
         with open(out, "rb") as fh:
             assert fh.read() == data
         assert sorted(r for _, r, _ in session.calls) == [
-            "bytes=0-0", "bytes=0-3", "bytes=0-9", "bytes=4-7", "bytes=8-9"]
+            "bytes=0-0", "bytes=0-3", "bytes=0-3", "bytes=4-7", "bytes=8-9"]
 
 
 def test_download_mp4_direct_no_range_support_fails_fast(mp4_env, monkeypatch):
@@ -1135,27 +1138,29 @@ def test_download_mp4_direct_quality_prefilter(mp4_env, monkeypatch):
 
 def test_download_mp4_direct_bitrate_gate(mp4_env, monkeypatch):
     session = _install_range_session(monkeypatch, b"abcdefghij")
-    monkeypatch.setattr(d, "_probe_duration", lambda p: 100.0)
     monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 5000.0)
     node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
     with pytest.raises(RuntimeError, match="码率未达到") as exc:
-        d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
+        d._download_mp4_direct(
+            node, os.path.join(d.TEMP_DIR, "t.ts"), "x", runtime_minutes=45
+        )
     assert d._classify_failure(str(exc.value)) is False
     # 关键：码率不达标在「预检」阶段就淘汰，不该下载任何正片分块。
-    # 只应有 bytes=0-0（探总长）与 bytes=0-9（头部样本）两次请求。
-    assert sorted(r for _, r, _ in session.calls) == ["bytes=0-0", "bytes=0-9"]
+    # 只应有 bytes=0-0（探总长）与 bytes=0-3（头部样本）两次请求。
+    assert sorted(r for _, r, _ in session.calls) == ["bytes=0-0", "bytes=0-3"]
 
 
 def test_mp4_sample_prefilter_rejects_low_resolution(mp4_env, monkeypatch):
     """预检判分辨率不达标：整片一个分块都不下，省下 GB 级流量。"""
     session = _install_range_session(monkeypatch, b"abcdefghij")
     monkeypatch.setattr(d, "probe_resolution", lambda p: (640, 480))
-    monkeypatch.setattr(d, "_probe_duration", lambda p: 100.0)
     node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
     with pytest.raises(RuntimeError, match="低于红线") as exc:
-        d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
+        d._download_mp4_direct(
+            node, os.path.join(d.TEMP_DIR, "t.ts"), "x", runtime_minutes=45
+        )
     assert d._classify_failure(str(exc.value)) is False
-    assert sorted(r for _, r, _ in session.calls) == ["bytes=0-0", "bytes=0-9"]
+    assert sorted(r for _, r, _ in session.calls) == ["bytes=0-0", "bytes=0-3"]
 
 
 def test_mp4_sample_unprobeable_falls_through_to_full_download(mp4_env, monkeypatch):
@@ -1193,6 +1198,69 @@ def test_mp4_sample_file_is_always_removed(mp4_env, monkeypatch):
     assert not any(
         n.startswith("mp4sample_") for n in os.listdir(d.TEMP_DIR)
     )
+
+
+def test_mp4_sample_prefers_upstream_runtime_over_sample_duration(mp4_env, monkeypatch):
+    """码率必须用上游 runtime_minutes 算，不能用样本自身时长。
+
+    样本是被截断的文件，ffprobe 从残缺 moov 读出的可能是"样本时长"而非整片
+    时长。若用它做分母，bitrate 会虚高几十倍，让本该淘汰的低码率片通过预检、
+    预检形同虚设。这里让 _probe_duration 返回一个极小值，断言它未被采用。
+    """
+    _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "_probe_duration", lambda p: 0.01)  # 若被采用码率会爆表
+    os.makedirs(d.TEMP_DIR, exist_ok=True)
+    probed = d._mp4_probe_quality_by_sample(
+        "u", {}, 10, os.path.join(d.TEMP_DIR, "s.mp4"), "x", runtime_minutes=45
+    )
+    assert probed is not None
+    _, _, bitrate, _ = probed
+    # 用 runtime_minutes=45 -> 2700s：10 字节 × 8 / 2700 / 1000
+    assert bitrate == pytest.approx(10 * 8 / 2700 / 1000)
+
+
+def test_mp4_sample_rejects_suspicious_sample_duration(mp4_env, monkeypatch):
+    """无上游时长时，样本探测出的可疑短时长不可信 -> 返回 None 放行整片下载。
+
+    绝不用可疑值去淘汰片子（宁可多下也不误杀）。
+    """
+    _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "MP4_SAMPLE_SIZE", 4)
+    monkeypatch.setattr(d, "MP4_MIN_TRUSTED_DURATION", 600)
+    # 样本 4 字节 / 总长 10 字节 = 40% < 50%，且 5s < 600s -> 判不可信
+    monkeypatch.setattr(d, "_probe_duration", lambda p: 5.0)
+    os.makedirs(d.TEMP_DIR, exist_ok=True)
+    probed = d._mp4_probe_quality_by_sample(
+        "u", {}, 10, os.path.join(d.TEMP_DIR, "s.mp4"), "x", runtime_minutes=None
+    )
+    assert probed is None
+
+
+def test_mp4_sample_accepts_plausible_sample_duration(mp4_env, monkeypatch):
+    """样本时长足够长（像整片时长）时可以采用。"""
+    _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "MP4_SAMPLE_SIZE", 4)
+    monkeypatch.setattr(d, "MP4_MIN_TRUSTED_DURATION", 600)
+    monkeypatch.setattr(d, "_probe_duration", lambda p: 2700.0)
+    os.makedirs(d.TEMP_DIR, exist_ok=True)
+    probed = d._mp4_probe_quality_by_sample(
+        "u", {}, 10, os.path.join(d.TEMP_DIR, "s.mp4"), "x", runtime_minutes=None
+    )
+    assert probed is not None
+    assert probed[2] == pytest.approx(10 * 8 / 2700 / 1000)
+
+
+def test_mp4_skips_prefilter_for_small_files(mp4_env, monkeypatch):
+    """总长不足样本 2 倍时跳过预检：采样等于把整片下一遍，双倍流量零收益。"""
+    monkeypatch.setattr(d, "MP4_SAMPLE_SIZE", 8)
+    session = _install_range_session(monkeypatch, b"abcdefghij")  # 10 字节 < 16
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
+    d._download_mp4_direct(
+        node, os.path.join(d.TEMP_DIR, "t.ts"), "x", runtime_minutes=45
+    )
+    # 只有探测总长 + 正片分块，没有额外的样本请求
+    assert sorted(r for _, r, _ in session.calls) == [
+        "bytes=0-0", "bytes=0-3", "bytes=4-7", "bytes=8-9"]
 
 
 # ---------------------------------------------------------------- finalize / upload
@@ -1441,6 +1509,7 @@ def test_run_pipeline_degrades_when_upload_slots_exhausted(sandbox, monkeypatch)
     monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
     monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
     monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "S3_ENABLED", True)
     # 信号量容量 1 且预先占满 -> acquire 必然超时。
     monkeypatch.setattr(d, "upload_semaphore", __import__("threading").Semaphore(1))
     d.upload_semaphore.acquire()
@@ -1472,6 +1541,72 @@ def test_run_pipeline_degrades_when_upload_slots_exhausted(sandbox, monkeypatch)
     assert "降级为留本地待补传" in pend[0]["fail_reason"]
     success = _read_jsonl(d.SUCCESS_LOG)
     assert len(success) == 1 and success[0]["uploaded"] is False
+
+
+def test_degrade_writes_no_pending_when_s3_disabled(sandbox, monkeypatch):
+    """纯本地模式（s3.enabled=false）降级时不得写 pending。
+
+    本地模式的成品本来就不需要补传，塞进 pending 只会污染 reupload 的输入。
+    但仍要写 SUCCESS_LOG(uploaded=false) 以免下次运行重新下载。
+    """
+    entry = {"tmdbId": "8", "season": 1, "episode": 1, "urls": ["u"]}
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "S3_ENABLED", False)
+    monkeypatch.setattr(d, "upload_semaphore", __import__("threading").Semaphore(1))
+    d.upload_semaphore.acquire()
+    monkeypatch.setattr(d, "UPLOAD_SLOT_WAIT_TIMEOUT", 0.05)
+
+    final_path = str(sandbox / "downloads" / "tv_000001" / "8_S01E01.mp4")
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda e, ids: ("8_S01E01", True, {"cleanup_paths": []}),
+    )
+    monkeypatch.setattr(
+        d, "finalize_one_entry",
+        lambda info, ids: ("8_S01E01", True, {
+            "tmdbId": "8", "season": 1, "episode": 1, "title": "S",
+            "year": 2020, "final_path": final_path,
+        }),
+    )
+
+    d._run_pipeline()
+
+    assert not os.path.exists(d.UPLOAD_PENDING_LOG)
+    success = _read_jsonl(d.SUCCESS_LOG)
+    assert len(success) == 1 and success[0]["uploaded"] is False
+
+
+def test_degrade_success_log_is_deduped_by_key(sandbox, monkeypatch):
+    """降级写 SUCCESS_LOG 必须按集级 key 覆盖，保持"每集一条"。
+
+    若用追加写，同一集在降级后又被 reupload 补传成功，会残留两条记录，
+    违背 SUCCESS_LOG 的设计意图。
+    """
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    # 预置一条旧记录，模拟该集此前已被写过。
+    (sandbox / "success.jsonl").write_text(
+        json.dumps({
+            "tmdbId": "9", "season": 1, "episode": 1, "uploaded": True,
+            "s3_key": "old/key.mp4",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    d.update_success_log("9_S01E01", {
+        "tmdbId": "9", "season": 1, "episode": 1,
+        "final_path": "/tmp/x.mp4", "uploaded": False,
+    })
+    records = _read_jsonl(d.SUCCESS_LOG)
+    assert len(records) == 1
+    assert records[0]["uploaded"] is False
+    assert "s3_key" not in records[0]
 
 
 # ---------------------------------------------------------------- reupload

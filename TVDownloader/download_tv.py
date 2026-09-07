@@ -3,6 +3,7 @@
 
 import json
 import importlib
+import hashlib
 import os
 import math
 import random
@@ -126,6 +127,10 @@ MP4_CONCURRENCY = int(_CFG.get("mp4_concurrency", 8))
 # ffprobe 解析，判定结果与下完整片完全一致，却只花几 MB。8MB 足以覆盖绝大多数
 # faststart mp4 的 moov；moov 在尾部时探测失败，放行走整片下载后再验。
 MP4_SAMPLE_SIZE = int(_CFG.get("mp4_sample_size", 8 * 1024 * 1024))
+# 样本探测出的时长低于此值（秒）时视为"疑似样本自身时长"而非整片时长，预检放弃、
+# 放行整片下载后再验。正片单集通常 20 分钟以上，600s 是个宽松的下界。
+# 仅在上游 runtime_minutes 缺失、不得不用样本时长时才参与判断。
+MP4_MIN_TRUSTED_DURATION = float(_CFG.get("mp4_min_trusted_duration", 600))
 MIN_RESOLUTION_HEIGHT = int(_CFG.get("min_resolution_height", 1080))
 # 唯一宽松系数：同时放宽“分辨率红线”与“码率门槛”两关（合并原来的两个容差系数）。
 LENIENCY = float(_CFG.get("leniency", 0.8))
@@ -1703,6 +1708,12 @@ def _mp4_probe_quality_by_sample(
     会失败，此时返回 None 表示"无法预判"，由调用方放行走整片下载后再验——
     宁可多下也不误杀，与"尽可能提高成功率"一致。
 
+    时长取值顺序刻意把上游 runtime_minutes 排在样本探测之前：样本是被截断的
+    文件，ffprobe 从残缺 moov 里读出的可能是"样本自身时长"而非整片时长，一旦
+    如此，bitrate = total_size×8/duration 会虚高几十倍，让本该淘汰的低码率片
+    通过预检、预检形同虚设。runtime_minutes 来自 TMDB 元数据，是可信的整片
+    时长。样本探测仅作为 runtime_minutes 缺失时的回退，且必须通过合理性校验。
+
     返回 (resolution_str, height, bitrate_kbps, codec) 或 None。
     """
     sample_end = min(MP4_SAMPLE_SIZE, total_size) - 1
@@ -1727,12 +1738,28 @@ def _mp4_probe_quality_by_sample(
         height = actual_size[1]
         resolution = f"{actual_size[0]}x{actual_size[1]}"
 
-        # 时长优先用样本 moov 里的容器时长（是整片时长，不是样本时长）；
-        # 取不到再退回上游元数据 runtime_minutes。
-        duration = _probe_duration(sample_path)
-        if not duration or duration <= 0:
-            minutes = parse_int(runtime_minutes)
-            duration = minutes * 60 if minutes else None
+        duration = None
+        minutes = parse_int(runtime_minutes)
+        if minutes and minutes > 0:
+            duration = minutes * 60
+        else:
+            # 无上游时长时才退回样本探测，并做合理性校验：样本只占整片的
+            # sample_ratio，若 ffprobe 返回的是样本自身时长，该值会与
+            # "整片时长×sample_ratio" 同量级而远小于正常剧集时长。这里用
+            # 「样本时长必须显著大于按字节比例折算出的样本时长」来识别，
+            # 识别为不可信就返回 None 放行整片下载，绝不用可疑值去淘汰片子。
+            probed_duration = _probe_duration(sample_path)
+            sample_ratio = len(content) / total_size if total_size else 1.0
+            if probed_duration and probed_duration > 0:
+                if sample_ratio < 0.5 and probed_duration < MP4_MIN_TRUSTED_DURATION:
+                    print(
+                        f"  [{label}] 样本时长 {probed_duration:.0f}s 疑为样本自身"
+                        f"时长（样本仅占全片 {sample_ratio:.1%}），预检不可信，"
+                        f"下载整片后再验",
+                        flush=True,
+                    )
+                    return None
+                duration = probed_duration
         if not duration:
             return None
 
@@ -1779,27 +1806,35 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
     # 画质预检：先取头部样本判分辨率+码率，不达标立刻淘汰，省下整集（GB 级）
     # 的下载流量与下载槽位。判定口径与整片下完后的复检完全一致（同一套红线与
     # bitrate_threshold），所以预检通过的片复检必然也通过，不会重复淘汰。
-    sample_path = os.path.join(
-        os.path.dirname(output_path) or ".",
-        f"mp4sample_{safe_file_token(label)}.mp4",
-    )
-    probed = _mp4_probe_quality_by_sample(
-        url, headers, total_size, sample_path, label, runtime_minutes
-    )
-    if probed is not None:
-        pre_resolution, pre_height, pre_bitrate, pre_codec = probed
-        if not meets_resolution_redline(pre_height):
-            raise RuntimeError(
-                f"分辨率 {pre_resolution} 低于红线 {MIN_RESOLUTION_HEIGHT}"
-                f"（容差 {LENIENCY:.2f}），跳过"
-            )
-        pre_min_bitrate = bitrate_threshold(pre_height, pre_codec)
-        if pre_bitrate < pre_min_bitrate:
-            raise RuntimeError(
-                f"分辨率 {pre_resolution} 流（{pre_codec or 'unknown'}）"
-                f"码率未达到门槛：{pre_bitrate:.0f} kbps"
-                f" < {pre_min_bitrate:.0f} kbps"
-            )
+    #
+    # 仅对「显著大于样本」的文件预检：total_size <= MP4_SAMPLE_SIZE 时采样等于
+    # 把整片下一遍，之后正片再下一遍 —— 双倍流量却零收益，不如直接走正片下载
+    # 后的复检。阈值取样本的 2 倍，保证预检省下的流量至少是样本本身的一倍。
+    if total_size > MP4_SAMPLE_SIZE * 2:
+        # 样本文件名带 url 摘要：同一集的多个 mp4 节点虽是串行尝试，但摘要能
+        # 保证任何调用姿势下都不会两个节点写同一个临时文件。
+        sample_path = os.path.join(
+            os.path.dirname(output_path) or ".",
+            f"mp4sample_{safe_file_token(label)}_"
+            f"{hashlib.sha1(url.encode('utf-8')).hexdigest()[:8]}.mp4",
+        )
+        probed = _mp4_probe_quality_by_sample(
+            url, headers, total_size, sample_path, label, runtime_minutes
+        )
+        if probed is not None:
+            pre_resolution, pre_height, pre_bitrate, pre_codec = probed
+            if not meets_resolution_redline(pre_height):
+                raise RuntimeError(
+                    f"分辨率 {pre_resolution} 低于红线 {MIN_RESOLUTION_HEIGHT}"
+                    f"（容差 {LENIENCY:.2f}），跳过"
+                )
+            pre_min_bitrate = bitrate_threshold(pre_height, pre_codec)
+            if pre_bitrate < pre_min_bitrate:
+                raise RuntimeError(
+                    f"分辨率 {pre_resolution} 流（{pre_codec or 'unknown'}）"
+                    f"码率未达到门槛：{pre_bitrate:.0f} kbps"
+                    f" < {pre_min_bitrate:.0f} kbps"
+                )
 
     # 不做断点续传：节点失败时上层会删掉残留 ts，启动时也会清理 temp_*，
     # 残留文件无法证明与本次直链一致，存在即视为脏数据重下。
@@ -1962,11 +1997,9 @@ def process_one_entry(entry, processed_ids):
         # 分支都必须携带，否则某些源站会 403/428 直接判死，白白损失可用源。
         node_headers = node.get("headers") or None
         if node["type"] == "mp4":
-            # 直链预检的头部样本文件登记进 cleanup_paths：_download_mp4_direct
-            # 内部 finally 已删，这里是进程被杀等极端情况的兜底。
-            cleanup_paths.add(
-                os.path.join(TEMP_DIR, f"mp4sample_{safe_file_token(label)}.mp4")
-            )
+            # 注：直链预检的头部样本文件由 _mp4_probe_quality_by_sample 自身的
+            # finally 删除，文件名含 url 摘要故此处无法预知；进程被杀等极端情况
+            # 由启动时的 clean_temp_directory（前缀 mp4sample_）兜底清理。
             resolution, bitrate = _download_mp4_direct(
                 node, final_ts, label, runtime_minutes
             )
@@ -2746,28 +2779,39 @@ def _run_pipeline():
             # 不动，此时降级：不提交上传、成品留本地并写 pending，主循环继续
             # 推进下载与转封装，事后用 reupload 子命令补传。宁可暂时不传，
             # 也不让远端故障拖垮本地下载产能。
+            #
+            # S3_ENABLED=False 时上传任务只写日志、秒回，不可能积压；万一
+            # 仍走到这里也不能写 pending——纯本地模式下的成品无需补传，
+            # 塞进 pending 只会污染 reupload 的输入。故降级只对开启上传生效。
             if not upload_semaphore.acquire(timeout=UPLOAD_SLOT_WAIT_TIMEOUT):
                 degrade_reason = (
                     f"上传积压超过 {UPLOAD_SLOT_WAIT_TIMEOUT:g}s 未消化，"
                     f"本集降级为留本地待补传"
                 )
-                try:
-                    write_pending({
-                        "tmdbId": info.get("tmdbId"),
-                        "season": info.get("season"),
-                        "episode": info.get("episode"),
-                        "title": info.get("title", ""),
-                        "year": info.get("year"),
-                        "local_path": info.get("final_path"),
-                        "s3_key": "",
-                        "fail_reason": degrade_reason,
-                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-                except Exception as exc:
-                    print(f"⚠️ 降级写 pending 失败: {label}: {exc}", flush=True)
-                # 写 SUCCESS_LOG(uploaded=false) 防止下一轮/下次运行重新下载。
+                if S3_ENABLED:
+                    try:
+                        write_pending({
+                            "tmdbId": info.get("tmdbId"),
+                            "season": info.get("season"),
+                            "episode": info.get("episode"),
+                            "title": info.get("title", ""),
+                            "year": info.get("year"),
+                            "local_path": info.get("final_path"),
+                            "s3_key": "",
+                            "fail_reason": degrade_reason,
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                    except Exception as exc:
+                        print(f"⚠️ 降级写 pending 失败: {label}: {exc}", flush=True)
+                # 记 SUCCESS_LOG(uploaded=false) 防止下次运行重新下载。用
+                # update_success_log 按集级 key 覆盖写（而非 write_log 追加）：
+                # 后续 reupload 补传成功时也走同一函数覆盖同一条，保证
+                # SUCCESS_LOG "每集一条" 的设计意图不被破坏。
                 info["uploaded"] = False
-                write_log(SUCCESS_LOG, info)
+                try:
+                    update_success_log(record_episode_key(info) or label, info)
+                except Exception as exc:
+                    print(f"⚠️ 降级写 success 日志失败: {label}: {exc}", flush=True)
                 write_log(FAILED_LOG, {
                     **ident,
                     "urls": entry.get("urls", []),
