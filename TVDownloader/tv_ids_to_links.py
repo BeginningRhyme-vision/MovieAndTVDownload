@@ -219,7 +219,9 @@ def load_series_metadata():
 _SERIES_META = load_series_metadata()
 # 每集结果里的"身份字段"：由 process_episode 用入参权威写入，合并剧级元数据时
 # 必须保护、绝不允许被覆盖（下游据此做去重、拼文件名与 R2 对象键）。
-_IDENTITY_KEYS = frozenset({"urls", "tmdbId", "season", "episode", "title"})
+_IDENTITY_KEYS = frozenset({
+    "urls", "tmdbId", "season", "episode", "title", "fetched_at",
+})
 # tmdbId -> TMDB 剧名，由 main() 在季集展开后填充；源站不返回 title 时用它兜底
 _TMDB_NAMES = {}
 
@@ -783,6 +785,12 @@ def process_episode(tid, season, episode, providers=None):
                         "episode": int(episode),
                         # 源站 title 偶尔为空，回退 TMDB 剧名，再兜底空串（下游 download_tv/fetch_subtitles 按 str 使用）
                         "title": result_title or _TMDB_NAMES.get(str(tid)) or "",
+                        # 取流时刻（UTC 秒级时间戳）。results.jsonl 是追加写，同一集
+                        # 复扫/重跑会留下多行；下游据此挑真正最新的一条，而不是靠
+                        # "文件里最后出现"这种会被手工编辑破坏的位置假设。
+                        # 对 vidlink 这类带时效签名的直链尤为关键：拿到过期 url
+                        # 等于白跑一次下载。
+                        "fetched_at": int(time.time()),
                     }
                     # 合并剧级静态元数据，但**绝不覆盖上面的身份字段**：元数据来自
                     # tv_series.jsonl，是剧级的（一剧一条），若它哪天多出 season/
@@ -857,6 +865,24 @@ def _load_fail(fail_file):
                 except ValueError:
                     pass
     return dead_eps, dead_shows
+
+
+def _load_exhausted(fail_file):
+    """fail.txt 中已标记 retry-exhausted 的 (tid, season, episode) 集合。
+
+    仅用于写入前去重，避免同一集在多次运行中被反复追加、让文件无限膨胀。
+    """
+    exhausted = set()
+    if fail_file.exists():
+        with open(fail_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 4 and parts[3] == RETRY_EXHAUSTED_TAG:
+                    try:
+                        exhausted.add((parts[0], int(parts[1]), int(parts[2])))
+                    except ValueError:
+                        pass
+    return exhausted
 
 
 def load_processed(results_file, fail_file):
@@ -1159,11 +1185,19 @@ def main(argv=None):
         if round_no >= max_rounds:
             # 第 4 列标记：这些集只是“重试耗尽”而非真无源，load_processed 不会把它们当作已处理，
             # 下次运行会自动重跑；只是留痕方便排查本次运行的瞬时失败规模。
-            with open(fail_file, 'a', encoding='utf-8') as f:
-                for tid, s, e in retry_items:
-                    f.write(f"{tid}\t{s}\t{e}\t{RETRY_EXHAUSTED_TAG}\n")
+            # 按 (tid, s, e) 去重后再追加：同一集连续多次运行都耗尽时，若无脑
+            # 追加会让 fail.txt 无限膨胀（每轮一条），拖慢每次启动的 _load_fail，
+            # 也让漏斗统计把同一集重复计数。
+            existing_exhausted = _load_exhausted(fail_file)
+            fresh = [item for item in retry_items
+                     if (str(item[0]), int(item[1]), int(item[2]))
+                     not in existing_exhausted]
+            if fresh:
+                with open(fail_file, 'a', encoding='utf-8') as f:
+                    for tid, s, e in fresh:
+                        f.write(f"{tid}\t{s}\t{e}\t{RETRY_EXHAUSTED_TAG}\n")
             print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(retry_items)} 集瞬时失败记入 fail_file"
-                  f"（标记 {RETRY_EXHAUSTED_TAG}，下次运行自动重试）。")
+                  f"（标记 {RETRY_EXHAUSTED_TAG}，新增 {len(fresh)} 行，下次运行自动重试）。")
             break
 
         # 轮间退避：瞬时失败多半是代理/enc-dec/源站抖动，立刻重跑大概率撞同一堵墙。

@@ -1680,6 +1680,104 @@ def test_run_pipeline_preserves_input_order(sandbox, monkeypatch):
     assert order == ["5", "3", "9", "1"]
 
 
+def test_run_pipeline_duplicate_picks_newest_fetched_at(sandbox, monkeypatch):
+    """同集多行时按 fetched_at 取最新，而非文件里最后一条。
+
+    取流侧多轮重试会让"更早成功、后写入"的情况真实存在（例如某集第 1 轮
+    拿到 url 后写入，第 3 轮复扫又补写了一条更旧缓存）。vidlink 直链带时效
+    签名，用旧链接下载等于确定失败，所以时间戳必须压过文件位置。
+    """
+    lines = [
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["newest"],
+         "fetched_at": 2000},
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["older"],
+         "fetched_at": 1000},
+    ]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+
+    seen = []
+
+    def fake_process(entry, processed_ids):
+        seen.append(entry.get("urls"))
+        return "x", False, {"error": "低于红线", "retriable": False}
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    d._run_pipeline()
+    assert seen == [["newest"]]
+
+
+def test_run_pipeline_duplicate_stamped_beats_unstamped(sandbox, monkeypatch):
+    """有 fetched_at 的一定胜过无戳的旧格式行，即便无戳行排在后面。"""
+    lines = [
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["stamped"],
+         "fetched_at": 100},
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["legacy"]},
+    ]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+
+    seen = []
+
+    def fake_process(entry, processed_ids):
+        seen.append(entry.get("urls"))
+        return "x", False, {"error": "低于红线", "retriable": False}
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    d._run_pipeline()
+    assert seen == [["stamped"]]
+
+
+def test_run_pipeline_skips_processed_ids_at_read_time(sandbox, monkeypatch):
+    """已处理集在读入阶段就被滤掉，不进线程池。
+
+    第二次全量重跑时 success.jsonl 已有数万条，逐个提交再由
+    process_one_entry 跳过等于白白付出等量的调度与锁竞争开销。
+    """
+    lines = [
+        {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["a"]},
+        {"tmdbId": "2", "season": 1, "episode": 1, "urls": ["b"]},
+    ]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in lines),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: {"1_S01E01"})
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+
+    seen = []
+
+    def fake_process(entry, processed_ids):
+        seen.append(d.record_episode_key(entry))
+        return "x", False, {"error": "低于红线", "retriable": False}
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    d._run_pipeline()
+    assert seen == ["2_S01E01"]
+
+
 # ---------------------------------------------------------------- reupload
 def test_reupload_pending_flow(sandbox, monkeypatch, capsys):
     monkeypatch.setattr(d, "S3_ENABLED", True)

@@ -2600,12 +2600,14 @@ def _run_pipeline():
         print(f"错误: 找不到 {INPUT_JSONL}")
         return
 
-    # 读入取流结果。同一集可能因多次运行/复扫出现多行，保留**最后一次**出现的
-    # 那条：越晚写入的 url 越新，对 vidlink 这类带时效签名的直链尤其重要
-    # （保留首次出现会拿到早已过期的链接，白白浪费一次下载尝试）。
+    # 读入取流结果。同一集可能因复扫/重跑在文件里留下多行，取 fetched_at 最大
+    # 的那条：越新的 url 越可能仍然有效，对 vidlink 这类带时效签名的直链尤其
+    # 关键（拿到过期链接等于白跑一次下载）。旧版 results.jsonl 没有该字段，
+    # 此时回退到"文件中后出现者胜"——追加写下位置即时序，与旧行为一致。
     by_key = {}
     duplicate_input_count = 0
     invalid_input_count = 0
+    skipped_processed_count = 0
     with open(INPUT_JSONL, "r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, 1):
             line = line.strip()
@@ -2624,18 +2626,34 @@ def _run_pipeline():
                 # 在此直接计数跳过，避免残缺输入放大成等量的失败记录与日志噪声。
                 invalid_input_count += 1
                 continue
-            if normalized_id in by_key:
+            if normalized_id in processed_ids:
+                # 已成功处理过：与其提交进线程池再由 process_one_entry 逐个跳过
+                # （每集一次调度 + 一次锁竞争），不如读入阶段直接滤掉。第二次
+                # 全量重跑时 success.jsonl 已有数万条，这里能省下等量的空转。
+                skipped_processed_count += 1
+                continue
+            previous = by_key.get(normalized_id)
+            if previous is not None:
                 duplicate_input_count += 1
+                # 无 fetched_at 时视为 -1，保证有戳的一定胜出；两者都无戳则
+                # 后出现者胜（不 continue），维持旧的"文件位置即时序"语义。
+                new_ts = parse_int(entry.get("fetched_at"))
+                old_ts = parse_int(previous.get("fetched_at"))
+                if (new_ts if new_ts is not None else -1) < (
+                    old_ts if old_ts is not None else -1
+                ):
+                    continue
             by_key[normalized_id] = entry
 
-    # dict 保持插入顺序：同一集重复出现时 by_key[key] 已被后来者覆盖，
-    # 但键的位置仍是首次出现的位置，故整体顺序与输入文件一致。
+    # dict 保持插入顺序：同一集重复出现时值已被更新者覆盖，但键的位置仍是首次
+    # 出现的位置。即"值取最新、位置取最早"——顺序只影响下载先后，不影响正确性。
     entries = list(by_key.values())
 
     print(
-        f"共读取 {len(entries)} 个去重后的条目（集）；"
-        f"输入文件内跳过 {duplicate_input_count} 个重复集"
-        f"（同集保留最新一条）、{invalid_input_count} 个缺少身份字段的条目"
+        f"共读取 {len(entries)} 个待处理条目（集）；"
+        f"跳过 {skipped_processed_count} 个已处理集、"
+        f"{duplicate_input_count} 个重复集（同集取 fetched_at 最新的一条）、"
+        f"{invalid_input_count} 个缺少身份字段的条目"
     )
 
     ignored_errors = {

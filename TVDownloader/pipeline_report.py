@@ -24,7 +24,7 @@ import json
 import os
 import sys
 from collections import Counter
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import yaml
@@ -141,15 +141,22 @@ def load_expected(ids_file, cache_file, air_grace_days):
 
 
 def load_fail_txt(path):
-    """解析 fail.txt 的三种行格式，返回 (剧级死, 集级死, 重试耗尽)。"""
+    """解析 fail.txt 的三种行格式。
+
+    返回 (剧级死, 集级死, 重试耗尽集合, 重试耗尽原始行数)。原始行数与集合大小
+    的差值反映"同一集被多少次运行判为耗尽"——上游写入前已去重，若两者仍不等，
+    说明存在历史遗留的重复行。
+    """
     dead_shows, dead_eps, exhausted = set(), set(), set()
+    exhausted_rows = 0
     if not os.path.exists(path):
         _missing(path, "fail.txt")
-        return dead_shows, dead_eps, exhausted
+        return dead_shows, dead_eps, exhausted, exhausted_rows
     with open(path, "r", encoding="utf-8") as fh:
         for line in fh:
             parts = line.rstrip("\n").split("\t")
             if len(parts) == 4 and parts[3] == "retry-exhausted":
+                exhausted_rows += 1
                 try:
                     exhausted.add(
                         f"{parts[0]}_S{int(parts[1]):02d}E{int(parts[2]):02d}"
@@ -167,7 +174,7 @@ def load_fail_txt(path):
                 dead_eps.add(f"{tid}_S{int(season):02d}E{int(episode):02d}")
             except ValueError:
                 continue
-    return dead_shows, dead_eps, exhausted
+    return dead_shows, dead_eps, exhausted, exhausted_rows
 
 
 def _pct(part, whole):
@@ -208,15 +215,21 @@ def main():
     ids, expected, unaired, not_expanded = load_expected(
         ids_file, cache_file, air_grace_days
     )
-    dead_shows, dead_eps, exhausted = load_fail_txt(fail_file)
+    dead_shows, dead_eps, exhausted, exhausted_rows = load_fail_txt(fail_file)
 
     # 取流侧：results.jsonl 按集去重（同集多行只算一集）
     fetched, providers, types = set(), Counter(), Counter()
+    result_rows = 0
+    fetch_times = []
     for record in _iter_jsonl(results_file):
         key = _ep_key(record)
         if not key:
             continue
+        result_rows += 1
         fetched.add(key)
+        ts = record.get("fetched_at")
+        if isinstance(ts, int) and ts > 0:
+            fetch_times.append(ts)
         for node in record.get("urls") or []:
             if isinstance(node, dict):
                 providers[node.get("provider") or "unknown"] += 1
@@ -260,8 +273,34 @@ def main():
     print(f"\n【应下载】已播出的集：{total} 集")
 
     print(f"\n【1·取流】成功 {len(fetched)} 集（{_pct(len(fetched), total)}）")
+    if result_rows > len(fetched):
+        print(
+            f"  results.jsonl 原始有效行 {result_rows} 行 → 去重后 {len(fetched)} 集"
+            f"（{result_rows - len(fetched)} 行为同集重复取流，下游按 fetched_at 取最新）"
+        )
+    if fetch_times:
+        span_hours = (max(fetch_times) - min(fetch_times)) / 3600
+        print(
+            "  取流时间跨度："
+            f"{datetime.fromtimestamp(min(fetch_times)):%Y-%m-%d %H:%M}"
+            f" ~ {datetime.fromtimestamp(max(fetch_times)):%Y-%m-%d %H:%M}"
+            f"（{span_hours:.1f} 小时）"
+        )
+        no_ts = result_rows - len(fetch_times)
+        if no_ts > 0:
+            print(f"  ⚠️ {no_ts} 行缺 fetched_at（旧格式），下游对其回退按文件位置取后出现的一条")
+    elif result_rows:
+        print("  ⚠️ 全部行缺 fetched_at（上游为旧版本产出），下游去重回退按文件位置")
     print(f"  真无源判死：{len(dead_eps)} 集（{_pct(len(dead_eps), total)}）")
     print(f"  重试耗尽：{len(exhausted)} 集（{_pct(len(exhausted), total)}）")
+    if exhausted_rows > len(exhausted):
+        print(
+            f"    ⚠️ retry-exhausted 原始 {exhausted_rows} 行 → 去重后 {len(exhausted)} 集，"
+            "存在历史重复行（新版写入前已去重）"
+        )
+    overlap = exhausted & fetched
+    if overlap:
+        print(f"    其中 {len(overlap)} 集已在后续轮次取流成功，下游不受影响")
     missed = expected - fetched - dead_eps - exhausted
     if missed:
         print(f"  ❗ 既未成功也无失败记录（可能未跑到）：{len(missed)} 集")

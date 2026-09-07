@@ -567,6 +567,41 @@ def test_process_episode_meta_cannot_override_identity(monkeypatch):
     assert result["year"] == 2011 and result["runtime_minutes"] == 45
 
 
+def test_process_episode_stamps_fetched_at(monkeypatch):
+    """每条结果必须带取流时刻，且不可被剧级元数据覆盖。
+
+    results.jsonl 是追加写，同一集复扫会留下多行；下游 download_tv 靠该字段
+    挑真正最新的一条 url，而不是"文件里最后出现"这种会被手工编辑破坏的位置
+    假设。对 vidlink 这类带时效签名的直链，拿到过期 url 等于白跑一次下载。
+    """
+    _install_fake_session(monkeypatch, PAGE, [{"url": "u1"}])
+    monkeypatch.setattr(m, "_SERIES_META", {"7": {"fetched_at": 1, "year": 2020}})
+    monkeypatch.setattr(m.time, "time", lambda: 1730000000.9)
+    status, result = m.process_episode("7", 1, 1)
+    assert status == "ok"
+    assert result["fetched_at"] == 1730000000
+    assert result["year"] == 2020
+
+
+def test_load_exhausted_reads_only_tagged_rows(tmp_path):
+    """_load_exhausted 只认第 4 列为 retry-exhausted 的行。
+
+    集级真无源（3 列）与剧级 404（tid\\t-\\t-）不属于"重试耗尽"，若被误纳入
+    会让本次运行把它们当成已写过而漏记。
+    """
+    fail_file = tmp_path / "fail.txt"
+    fail_file.write_text(
+        "1\t1\t1\tretry-exhausted\n"
+        "2\t1\t2\n"
+        "3\t-\t-\n"
+        "4\tx\ty\tretry-exhausted\n"      # 非法数字，忽略
+        "\n",
+        encoding="utf-8",
+    )
+    assert m._load_exhausted(fail_file) == {("1", 1, 1)}
+    assert m._load_exhausted(tmp_path / "nope.txt") == set()
+
+
 def test_process_episode_ok_without_tmdbid_in_stream(monkeypatch):
     # 解密结果缺 tmdbId 不再是失败条件，只要有 url 即成功；title 无任何来源时兜底空串（下游按 str 用）
     _install_fake_session(monkeypatch, PAGE, [{"url": "u"}])
