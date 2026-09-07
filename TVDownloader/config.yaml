@@ -221,7 +221,10 @@ download_tv:
   convert_workers: 8
   segment_concurrency: 64  # 单集同时下载的分片数
   # 画质探测与分片重试
-  # 采样前 sample_count 段测码率并复用为正片开头（避免重复下载）。
+  # 每个候选流取“影片正中间”连续 sample_count 段测码率：片头常是 logo/黑场等
+  # 低动态画面、码率系统性偏低，会误杀压线的合格片。采样片单独成文件、测完即删、
+  # 不复用为正片（中间采样接不成连续前缀），正片仍从第 0 段完整下载。
+  # 候选流按声明高度降序试，一旦选中某流，声明高度更低的流直接跳过、不再采样。
   sample_count: 10
   seg_retry_max: 20
   seg_retry_delay: 1

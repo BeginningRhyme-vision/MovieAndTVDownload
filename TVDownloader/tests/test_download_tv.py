@@ -644,6 +644,132 @@ def test_process_one_entry_happy_path_builds_job(sandbox, monkeypatch):
     assert "55_S01E02" in d.processing_ids
 
 
+def _z1_env(monkeypatch, variants):
+    """多 variant 采样场景的公共桩：返回记录被采样流 url 的 list。"""
+    sampled = []
+    seg_urls = [f"https://cdn/s{i}.ts" for i in range(20)]
+
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None, headers=None: variants,
+    )
+
+    def fake_media(url, headers=None):
+        sampled.append(url)
+        return seg_urls, [4.0] * 20, None
+
+    monkeypatch.setattr(d, "parse_media_playlist", fake_media)
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    monkeypatch.setattr(d, "SAMPLE_COUNT", 4)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+    # 红线压到 360：否则 720/480 会在候选过滤阶段（声明高度低于红线）就被剔除，
+    # 根本进不了采样循环，测不出"选中后跳过更低流"这条新逻辑。
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 360)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
+
+    def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
+                      init_url=None, force_init=False, headers=None):
+        if end_idx is None:
+            end_idx = len(urls)
+        n = end_idx - start_idx
+        with open(out, "wb") as fh:
+            fh.write(b"x" * n)
+        return n * 1_000_000, [], 0   # 2000 kbps，稳过 1000 门槛
+
+    monkeypatch.setattr(d, "download_segments", fake_download)
+    return sampled
+
+
+def test_variant_sampling_stops_after_higher_stream_wins(sandbox, monkeypatch):
+    """选中 1080 后，声明高度更低的流不再采样。
+
+    候选已按声明高度降序排，且有声明分辨率的流直接采信声明值（不做 ffprobe），
+    择优又是"高度绝对优先"——更低的流即便采样也必然落选，那次"解析 media
+    playlist + 下载 N 个分片 + 两次 ffprobe"是纯浪费。一个 master 常有
+    1080/720/480/360 四档，白花的是三份采样流量。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    sampled = _z1_env(monkeypatch, [
+        ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        ("1280x720", "https://cdn/720.m3u8", 3000.0),
+        ("854x480", "https://cdn/480.m3u8", 1500.0),
+    ])
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    assert job["resolution"] == "1920x1080"
+    assert sampled == ["https://cdn/1080.m3u8"]
+
+
+def test_variant_sampling_still_compares_same_height(sandbox, monkeypatch):
+    """同声明高度的流必须全部采样——要比采样码率才能择优。"""
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    sampled = _z1_env(monkeypatch, [
+        ("1920x1080", "https://cdn/a.m3u8", 5000.0),
+        ("1920x1080", "https://cdn/b.m3u8", 4000.0),
+        ("1280x720", "https://cdn/c.m3u8", 3000.0),
+    ])
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, _job = d.process_one_entry(entry, set())
+    assert ok is True
+    # 两个 1080 都采样，720 被跳过
+    assert sampled == ["https://cdn/a.m3u8", "https://cdn/b.m3u8"]
+
+
+def test_variant_sampling_still_probes_undeclared(sandbox, monkeypatch):
+    """未声明分辨率的流不能跳过：真实高度可能更高，必须采样后 ffprobe。
+
+    master 无 RESOLUTION 属性时这类流被排在末尾（用 -1 排序），若按"声明高度
+    更低"一并跳过，就会把实际更清晰的流丢掉，直接违背画质择优目标。
+    """
+    # 未声明的那条实测为 2160p，应当胜出
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (3840, 2160))
+    sampled = _z1_env(monkeypatch, [
+        ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        (None, "https://cdn/unknown.m3u8", 4000.0),
+    ])
+    # 门槛按 (h/1080)² 缩放，2160p 需 4 倍基准；压低基准让桩数据能过关，
+    # 本用例要验的是采样顺序而非码率曲线。
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 100.0})
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    assert sampled == ["https://cdn/1080.m3u8", "https://cdn/unknown.m3u8"]
+    assert job["resolution"] == "3840x2160"
+
+
+def test_variant_sampling_continues_after_failure(sandbox, monkeypatch):
+    """最高档采样失败（未选中）时，后续较低流仍要采样。
+
+    跳过条件绑定 best_selected：只有真正选中过某流才生效。否则瞬时抖动让最高
+    档挂掉后，整集会因"无一入选"而白白失败，直接损失成功率。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    sampled = _z1_env(monkeypatch, [
+        ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        ("1280x720", "https://cdn/720.m3u8", 3000.0),
+    ])
+    seg_urls = [f"https://cdn/s{i}.ts" for i in range(20)]
+
+    def flaky_media(url, headers=None):
+        sampled.append(url)
+        if "1080" in url:
+            raise RuntimeError("采样抖动")
+        return seg_urls, [4.0] * 20, None
+
+    monkeypatch.setattr(d, "parse_media_playlist", flaky_media)
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    assert sampled == ["https://cdn/1080.m3u8", "https://cdn/720.m3u8"]
+    assert job["resolution"] == "1280x720"
+
+
 # ---------------------------------------------------------------- multi-source: url entries / mp4 direct
 def test_normalize_url_entry_str_and_dict():
     assert d._normalize_url_entry("  https://a/m.m3u8 ") == {

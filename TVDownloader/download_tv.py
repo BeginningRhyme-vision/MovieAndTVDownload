@@ -2069,6 +2069,17 @@ def process_one_entry(entry, processed_ids):
         best_selected = False
 
         for resolution, playlist_url, _declared_bandwidth, size in candidates:
+            # 候选已按声明高度降序排列。走到"声明高度严格低于已选中流"的候选时，
+            # 它即便采样也必然落选：有声明分辨率的流下面直接采信声明值（不做
+            # ffprobe），而择优是"高度绝对优先、同高度才比码率"，height <
+            # best_height 时 better 恒为 false。故这里跳过纯属浪费的采样。
+            # 只跳过"有声明高度且严格更低"的：同高度的仍要比码率，未声明分辨率
+            # 的（size is None，排在末尾）仍要采样后 ffprobe 探测真实高度。
+            # 一个 master 常有 1080/720/480/360 四档，1080 命中后可省下三次
+            # "解析 media playlist + 下载 10 个分片 + 两次 ffprobe"。
+            if size is not None and best_selected and size[1] < best_height:
+                print(f"  跳过流 {resolution}：声明高度低于已选中的 {best_resolution}")
+                continue
             print(f"  检测流 {resolution}: {playlist_url}")
             sample_path = os.path.join(
                 TEMP_DIR,
