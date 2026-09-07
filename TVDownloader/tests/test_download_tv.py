@@ -806,6 +806,131 @@ def test_mp4_probe_failure_stays_retriable():
         assert d.classify_reject_reason(msg) == "直链探测失败"
 
 
+# ---------------------------------------------------------------- retry shortcut
+@pytest.mark.parametrize("status,permanent", [
+    (401, True), (403, True), (404, True), (410, True), (416, True),
+    (429, False), (500, False), (502, False), (503, False), (504, False),
+])
+def test_is_permanent_http_failure_by_status(status, permanent):
+    """429/5xx 是限流/临时故障，退避后有机会成功，必须继续重试；
+    401/403/404/410/416 重试必然复现，应立刻短路去换下一个节点。"""
+    exc = d.requests.HTTPError("boom", response=_FakeResp(status))
+    assert d.is_permanent_http_failure(exc) is permanent
+
+
+def test_download_single_segment_skips_retry_on_permanent_status(sandbox, monkeypatch):
+    """分片层遇 404 立即上抛，不再走 20 次退避（否则白等十几分钟占死下载窗口）。"""
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 20)
+    sleeps = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(url)
+        raise d.requests.HTTPError("boom", response=_FakeResp(404))
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    with pytest.raises(RuntimeError, match="重试 20 次后仍失败"):
+        d.download_single_segment("u", 0, 20, 1)
+    assert len(calls) == 1 and sleeps == []
+
+
+def test_download_single_segment_still_retries_transient(sandbox, monkeypatch):
+    """瞬时错误（503）仍要重试满次数——这才是重试真正能救回来的场景。"""
+    sleeps = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(url)
+        raise d.requests.HTTPError("boom", response=_FakeResp(503))
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    with pytest.raises(RuntimeError):
+        d.download_single_segment("u", 0, 3, 1)
+    assert len(calls) == 3 and len(sleeps) == 2
+
+
+def test_request_with_retry_short_circuits_permanent_status(monkeypatch):
+    """playlist 层同样短路：404 不该重试 10 次（约 4 分钟）才换节点。"""
+    sleeps = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    calls = []
+
+    class _Session:
+        def request(self, method, url, **kwargs):
+            calls.append(url)
+            return _FakeResp(404)
+
+    monkeypatch.setattr(d, "get_session", lambda: _Session())
+    with pytest.raises(RuntimeError, match=d._HTTP_PERMANENT_MARKER) as exc:
+        d.request_with_retry("GET", "https://cdn/x.m3u8", retries=10)
+    assert len(calls) == 1 and sleeps == []
+    # 层内短路，但整集仍判可重试：403/404 可能是临时风控，判死会误杀。
+    assert d._classify_failure(str(exc.value)) is True
+    assert d.classify_reject_reason(str(exc.value)) == "确定性4xx"
+
+
+# ---------------------------------------------------------------- upload retry
+def test_upload_to_r2_skips_retry_on_permanent_error(sandbox, monkeypatch):
+    """凭证/权限/桶不存在属配置问题，重试 5 次只是白占反压槽位。"""
+    sleeps = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    attempts = []
+
+    class _Client:
+        def upload_file(self, path, bucket, key):
+            attempts.append(key)
+            exc = Exception("denied")
+            exc.response = {
+                "Error": {"Code": "AccessDenied"},
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            }
+            raise exc
+
+    monkeypatch.setattr(d, "get_s3_client", lambda: _Client())
+    ok, reason = d.upload_to_r2("/tmp/x.mp4", "k")
+    assert ok is False and "不重试" in reason
+    assert len(attempts) == 1 and sleeps == []
+
+
+def test_upload_to_r2_retries_transient_with_exponential_backoff(sandbox, monkeypatch):
+    """网络类错误仍重试，且退避是指数（3/6/12...）而非线性。"""
+    monkeypatch.setattr(d, "UPLOAD_RETRY_MAX", 4)
+    monkeypatch.setattr(d, "UPLOAD_RETRY_DELAY", 3)
+    monkeypatch.setattr(d.random, "uniform", lambda a, b: 0.0)
+    sleeps = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    attempts = []
+
+    class _Client:
+        def upload_file(self, path, bucket, key):
+            attempts.append(key)
+            raise OSError("connection reset")
+
+    monkeypatch.setattr(d, "get_s3_client", lambda: _Client())
+    ok, _ = d.upload_to_r2("/tmp/x.mp4", "k")
+    assert ok is False
+    assert len(attempts) == 4
+    assert sleeps == [3, 6, 12]
+
+
+# ---------------------------------------------------------------- orphan cleanup
+def test_scan_downloaded_removes_zero_byte_orphans(sandbox):
+    """0 字节 mp4 是移动中断留下的占位残骸：既不算已下载，也要清掉不占名额。"""
+    folder = sandbox / "downloads" / "tv_000001"
+    folder.mkdir(parents=True)
+    real = folder / "1_S01E01.mp4"
+    real.write_bytes(b"video")
+    orphan = folder / "2_S01E02.mp4"
+    orphan.write_bytes(b"")
+
+    ids, duplicates = d.scan_downloaded_mp4_ids()
+    assert ids == {"1_S01E01"} and duplicates == {}
+    assert real.exists()
+    assert not orphan.exists()
+
+
 class _FakeResp:
     def __init__(self, status, headers=None, content=b""):
         self.status_code = status
@@ -876,7 +1001,11 @@ def test_download_mp4_direct_chunks_and_headers(mp4_env, monkeypatch):
     with open(out, "rb") as fh:
         assert fh.read() == data
     ranges = sorted(r for _, r, _ in session.calls)
-    assert ranges == ["bytes=0-0", "bytes=0-3", "bytes=4-7", "bytes=8-9"]
+    # bytes=0-0 探测总长；bytes=0-9 画质预检样本（MP4_SAMPLE_SIZE > 总长时取全片）；
+    # 其余是 MP4_CHUNK_SIZE=4 的正片分块。
+    assert ranges == [
+        "bytes=0-0", "bytes=0-3", "bytes=0-9", "bytes=4-7", "bytes=8-9",
+    ]
     for _, _, headers in session.calls:
         assert headers["User-Agent"] == "okhttp/4.9.3"
         assert headers["Referer"] is None and headers["X-Requested-With"] is None
@@ -897,7 +1026,7 @@ def test_download_mp4_direct_overwrites_stale_file(mp4_env, monkeypatch):
         with open(out, "rb") as fh:
             assert fh.read() == data
         assert sorted(r for _, r, _ in session.calls) == [
-            "bytes=0-0", "bytes=0-3", "bytes=4-7", "bytes=8-9"]
+            "bytes=0-0", "bytes=0-3", "bytes=0-9", "bytes=4-7", "bytes=8-9"]
 
 
 def test_download_mp4_direct_no_range_support_fails_fast(mp4_env, monkeypatch):
@@ -1005,13 +1134,65 @@ def test_download_mp4_direct_quality_prefilter(mp4_env, monkeypatch):
 
 
 def test_download_mp4_direct_bitrate_gate(mp4_env, monkeypatch):
-    _install_range_session(monkeypatch, b"abcdefghij")
+    session = _install_range_session(monkeypatch, b"abcdefghij")
     monkeypatch.setattr(d, "_probe_duration", lambda p: 100.0)
     monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 5000.0)
     node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
     with pytest.raises(RuntimeError, match="码率未达到") as exc:
         d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
     assert d._classify_failure(str(exc.value)) is False
+    # 关键：码率不达标在「预检」阶段就淘汰，不该下载任何正片分块。
+    # 只应有 bytes=0-0（探总长）与 bytes=0-9（头部样本）两次请求。
+    assert sorted(r for _, r, _ in session.calls) == ["bytes=0-0", "bytes=0-9"]
+
+
+def test_mp4_sample_prefilter_rejects_low_resolution(mp4_env, monkeypatch):
+    """预检判分辨率不达标：整片一个分块都不下，省下 GB 级流量。"""
+    session = _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (640, 480))
+    monkeypatch.setattr(d, "_probe_duration", lambda p: 100.0)
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
+    with pytest.raises(RuntimeError, match="低于红线") as exc:
+        d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
+    assert d._classify_failure(str(exc.value)) is False
+    assert sorted(r for _, r, _ in session.calls) == ["bytes=0-0", "bytes=0-9"]
+
+
+def test_mp4_sample_unprobeable_falls_through_to_full_download(mp4_env, monkeypatch):
+    """moov 在文件尾部导致样本探测失败时必须放行整片下载，绝不误杀。
+
+    预检只是省流量的优化，探不出结果时应回退到"下完整片再验"的老路径，
+    否则会把本可下载成功的片错判为失败，与"尽可能提高成功率"相悖。
+    """
+    data = b"abcdefghij"
+    session = _install_range_session(monkeypatch, data)
+    calls = {"n": 0}
+
+    def flaky_probe(path):
+        # 第一次（样本）探测失败，第二次（整片）成功。
+        calls["n"] += 1
+        return None if calls["n"] == 1 else (1920, 1080)
+
+    monkeypatch.setattr(d, "probe_resolution", flaky_probe)
+    out = os.path.join(d.TEMP_DIR, "t.ts")
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
+    resolution, _ = d._download_mp4_direct(node, out, "x", runtime_minutes=1)
+    assert resolution == "1920x1080"
+    with open(out, "rb") as fh:
+        assert fh.read() == data
+    # 正片分块照常下载
+    assert "bytes=4-7" in [r for _, r, _ in session.calls]
+
+
+def test_mp4_sample_file_is_always_removed(mp4_env, monkeypatch):
+    """无论预检通过与否，样本文件都不得残留在 temp 目录。"""
+    _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "_probe_duration", lambda p: 100.0)
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
+    d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
+    assert not any(
+        n.startswith("mp4sample_") for n in os.listdir(d.TEMP_DIR)
+    )
 
 
 # ---------------------------------------------------------------- finalize / upload
@@ -1240,6 +1421,57 @@ def test_run_pipeline_retries_only_retriable_entries(sandbox, monkeypatch):
 
     # tmdbId=1 可重试 -> 跑满 3 轮；tmdbId=2 确定性失败 -> 只跑第一轮。
     assert attempts.count("1") == 3 and attempts.count("2") == 1
+
+
+def test_run_pipeline_degrades_when_upload_slots_exhausted(sandbox, monkeypatch):
+    """R2 长时间消化不动时不得冻结主循环：降级为留本地 + 写 pending，继续跑下载。
+
+    upload_semaphore 是在**主事件循环线程**里 acquire 的，若无限等待，下载完成的
+    future 也没人处理、转封装同步停摆，整条流水线冻结。这里把信号量占满模拟该
+    场景，断言：不提交上传、成品仍在本地、pending 有记录、SUCCESS_LOG 标
+    uploaded=false（防下次重新下载），且主循环正常收尾。
+    """
+    entry = {"tmdbId": "7", "season": 1, "episode": 1, "urls": ["u"]}
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        json.dumps(entry, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    # 信号量容量 1 且预先占满 -> acquire 必然超时。
+    monkeypatch.setattr(d, "upload_semaphore", __import__("threading").Semaphore(1))
+    d.upload_semaphore.acquire()
+    monkeypatch.setattr(d, "UPLOAD_SLOT_WAIT_TIMEOUT", 0.05)
+
+    final_path = str(sandbox / "downloads" / "tv_000001" / "7_S01E01.mp4")
+
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda e, ids: ("7_S01E01", True, {"cleanup_paths": []}),
+    )
+    monkeypatch.setattr(
+        d, "finalize_one_entry",
+        lambda info, ids: ("7_S01E01", True, {
+            "tmdbId": "7", "season": 1, "episode": 1, "title": "S",
+            "year": 2020, "final_path": final_path,
+        }),
+    )
+    monkeypatch.setattr(
+        d, "upload_one_entry",
+        lambda info: pytest.fail("槽位耗尽时不应提交上传"),
+    )
+
+    d._run_pipeline()
+
+    pend = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert len(pend) == 1
+    assert pend[0]["local_path"] == final_path
+    assert "降级为留本地待补传" in pend[0]["fail_reason"]
+    success = _read_jsonl(d.SUCCESS_LOG)
+    assert len(success) == 1 and success[0]["uploaded"] is False
 
 
 # ---------------------------------------------------------------- reupload

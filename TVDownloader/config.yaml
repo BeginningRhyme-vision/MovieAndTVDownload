@@ -216,7 +216,9 @@ download_tv:
   # 未完成 future 挂/摘 waiter，主循环退化成 O(N²)；分批后 wait 规模恒定。
   # 留空/不配时默认 max_workers × 2。
   download_queue_depth: 64
-  convert_workers: 16      # 独立的 FFmpeg 转封装线程数（与 upload_workers 对齐）
+  # 独立的 FFmpeg 转封装线程数。转封装是 `ffmpeg -c copy` 纯 IO 拷贝，并发过高
+  # 只会在同一块盘上互抢 IO，吞吐不升反降。
+  convert_workers: 8
   segment_concurrency: 64  # 单集同时下载的分片数
   # 画质探测与分片重试
   # 采样前 sample_count 段测码率并复用为正片开头（避免重复下载）。
@@ -244,6 +246,11 @@ download_tv:
   #   跑 mp4 直链且乱序严重时才会逼近）。内存紧张时优先调小 mp4_concurrency 或 mp4_chunk_size。
   mp4_chunk_size: 8388608   # 单块大小（字节），默认 8MB
   mp4_concurrency: 8        # 同一集内并发块数
+  # 画质预检样本大小（字节）：整片下载前先取头部这么多字节，用 ffprobe 读 moov
+  # 判分辨率/编码/时长，码率 = Range 探测到的总长 × 8 / 时长。判定口径与下完整片
+  # 后完全一致，却只花几 MB —— 避免 1~3GB 的整集下完才发现码率不达标而白丢。
+  # moov 在文件尾部（非 faststart）时探测失败，此时放行走整片下载后再验，不误杀。
+  mp4_sample_size: 8388608
   # ==== 画质筛选（单一码率曲线，与 MovieDownloader 完全一致）====
   # 【第 1 关 · 分辨率红线】 h ≥ min_resolution_height × leniency
   # 【第 2 关 · 码率门槛】   br ≥ bitrate_<codec> × (h / 1080)² × leniency
@@ -277,8 +284,14 @@ download_tv:
     secret_key: ""           # 环境变量 R2_SECRET_KEY
     upload_workers: 16       # 上传并发数
     max_pending_uploads: 64  # 反压阈值：在途+排队上传数达到此值就阻塞下载，防磁盘撑爆
-    upload_retry_max: 5      # 单文件上传最大重试次数
-    upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避）
+    upload_retry_max: 5      # 单文件上传最大重试次数（凭证/权限/桶不存在等确定性失败不重试）
+    upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避封顶 60s）
+    connect_timeout: 15      # boto3 连接超时（秒）：默认 60s 太长，R2 抖动时会顶满反压
+    read_timeout: 120        # boto3 读取超时（秒）
+    # 反压信号量最长等待（秒）。等满仍拿不到槽位说明 R2 长时间消化不动，此时降级为
+    # 「不上传、成品留本地 + 写 pending」，下载与转封装继续跑，事后用 reupload 补传。
+    # 若不设上限，R2 故障会让主事件循环无限期冻结、整条流水线停摆。
+    upload_slot_wait_timeout: 300
     delete_local_after_upload: true   # 上传成功后删除本地 mp4（全量必开）
   # ---- 磁盘水位监控（兜底）----
   disk_guard:

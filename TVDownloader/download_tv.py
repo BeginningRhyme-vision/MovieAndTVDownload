@@ -121,6 +121,11 @@ PLAYLIST_RETRY_FALLBACK = int(_CFG.get("playlist_retry_fallback", 3))
 # 块太小会放大请求次数（CDN 限速/风控），太大则单块失败重传代价高；8MB 是折中。
 MP4_CHUNK_SIZE = int(_CFG.get("mp4_chunk_size", 8 * 1024 * 1024))
 MP4_CONCURRENCY = int(_CFG.get("mp4_concurrency", 8))
+# mp4 直链画质预检的头部样本大小（字节）。mp4 的分辨率/编码/时长都在 moov box
+# 里，整片码率 = Range 探测到的 total_size × 8 / duration，所以只要样本能被
+# ffprobe 解析，判定结果与下完整片完全一致，却只花几 MB。8MB 足以覆盖绝大多数
+# faststart mp4 的 moov；moov 在尾部时探测失败，放行走整片下载后再验。
+MP4_SAMPLE_SIZE = int(_CFG.get("mp4_sample_size", 8 * 1024 * 1024))
 MIN_RESOLUTION_HEIGHT = int(_CFG.get("min_resolution_height", 1080))
 # 唯一宽松系数：同时放宽“分辨率红线”与“码率门槛”两关（合并原来的两个容差系数）。
 LENIENCY = float(_CFG.get("leniency", 0.8))
@@ -185,6 +190,14 @@ UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
 MAX_PENDING_UPLOADS = max(1, int(_S3_CFG.get("max_pending_uploads", 64)))
 UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
 UPLOAD_RETRY_DELAY = _S3_CFG.get("upload_retry_delay", 3)
+# boto3 连接/读取超时（秒）：botocore 默认 60s 太长，R2 抖动时会顶满反压。
+S3_CONNECT_TIMEOUT = float(_S3_CFG.get("connect_timeout", 15))
+S3_READ_TIMEOUT = float(_S3_CFG.get("read_timeout", 120))
+# 反压信号量的最长等待（秒）。超时说明 R2 长时间消化不动，此时**不再阻塞主
+# 循环**，改为「不提交上传、成品留本地 + 写 pending」的降级模式：下载与转封装
+# 继续跑，事后用 `python download_tv.py reupload` 补传。若不设上限，R2 故障会
+# 让主事件循环无限期冻结——连已下载完的 future 都没人处理，整条流水线停摆。
+UPLOAD_SLOT_WAIT_TIMEOUT = float(_S3_CFG.get("upload_slot_wait_timeout", 300))
 DELETE_LOCAL_AFTER_UPLOAD = bool(_S3_CFG.get("delete_local_after_upload", True))
 
 # ---- 磁盘水位监控（兜底）配置 ----
@@ -247,6 +260,11 @@ def get_s3_client():
                 config=BotoConfig(
                     signature_version="s3v4",
                     retries={"max_attempts": 1, "mode": "standard"},
+                    # 显式超时：botocore 默认 60s，R2 不可用时会把每次上传拖到
+                    # 分钟级，叠加 UPLOAD_RETRY_MAX 次重试后放大成十几分钟，
+                    # 进而顶满反压信号量、拖慢整条流水线。
+                    connect_timeout=S3_CONNECT_TIMEOUT,
+                    read_timeout=S3_READ_TIMEOUT,
                 ),
             )
     return _s3_client
@@ -339,6 +357,36 @@ def record_block_status(status):
         print(f"  [风控监控] HTTP {status} 累计出现 {count} 次")
 
 
+# 确定性 HTTP 状态码：同一条 url 重试必然复现同样结果，重试纯属浪费时间与槽位。
+#   401/403 鉴权失败或签名过期（源站不认这个请求，退避多久都一样）
+#   404/410  资源不存在/已删除
+#   416      Range 越界（探测到的总长与实际不符）
+# 注意 429/503 不在此列——它们是限流/临时不可用，退避后有很大概率成功，
+# 属于"必须重试"的一类，与本集合语义相反。
+_NO_RETRY_HTTP_STATUS = frozenset({401, 403, 404, 410, 416})
+# 上述状态码抛出的错误统一带此标记，供各重试层快速短路（不必解析 HTTP 文案，
+# 也不依赖 requests/urllib3 的具体措辞，跨层稳定）。
+_HTTP_PERMANENT_MARKER = "确定性HTTP失败"
+
+
+def _status_of(exc):
+    """从异常里取 HTTP 状态码；取不到返回 None。"""
+    return getattr(getattr(exc, "response", None), "status_code", None)
+
+
+def is_permanent_http_failure(exc_or_msg):
+    """判断一次失败是否为"重试也没用"的确定性 HTTP 失败。
+
+    统一给三个重试层（playlist 请求 / HLS 分片 / mp4 直链块）复用，避免同一类
+    404/403 在某一层被白重试 20 次（累计十几分钟退避），拖死整片下载窗口、
+    延误换下一个取流节点——换源越快，单位时间能试的源越多，总成功率越高。
+    """
+    status = _status_of(exc_or_msg)
+    if status is not None:
+        return status in _NO_RETRY_HTTP_STATUS
+    return _HTTP_PERMANENT_MARKER in str(exc_or_msg)
+
+
 # ---------- HTTP ----------
 def get_session():
     """每个线程复用自己的 requests.Session。"""
@@ -376,6 +424,10 @@ def request_with_retry(
 
     退避采用指数增长并封顶到 backoff_max，附加少量抖动，避免多线程同时重试；
     这样 playlist 解析等关键请求能扛过源站几十秒级的临时 5xx 抽风。
+
+    确定性 HTTP 失败（401/403/404/410/416）不重试：这类结果重试必然复现，
+    白等十几分钟退避只会拖慢换下一个取流节点。抛出的错误带确定性标记，
+    供上层继续短路。
     """
     session = get_session()
     kwargs.setdefault("timeout", 30)
@@ -399,9 +451,13 @@ def request_with_retry(
                 return response.content
         except (requests.RequestException, ConnectionError, TimeoutError) as exc:
             last_error = exc
-            status = getattr(getattr(exc, "response", None), "status_code", None)
+            status = _status_of(exc)
             if status in (403, 429, 503):
                 record_block_status(status)
+            if status in _NO_RETRY_HTTP_STATUS:
+                raise RuntimeError(
+                    f"请求失败({_HTTP_PERMANENT_MARKER} HTTP {status}): {url}; {exc}"
+                ) from exc
             if attempt == retries - 1:
                 break
             wait = min(backoff * (2**attempt), backoff_max)
@@ -507,9 +563,14 @@ def scan_downloaded_mp4_ids():
     文件名形如 `{tmdbId}_S01E03.mp4`，以集级 key 为单位。
     返回 (key 集合, 重复文件字典)。同一 key 出现在多个目录时只报告，
     不自动删除已有文件。
+
+    顺带清理 0 字节 mp4：那是 move_to_target_folder 落了占位文件后、移动完成前
+    进程被杀留下的孤儿，既不是有效成品也不该白占目录名额。只删大小为 0 的，
+    有内容的文件一律不动。
     """
     downloaded_ids = set()
     locations = {}
+    orphan_count = 0
 
     if not os.path.isdir(BASE_DIR):
         return downloaded_ids, {}
@@ -540,6 +601,9 @@ def scan_downloaded_mp4_ids():
                     continue
                 try:
                     if file_entry.stat(follow_symlinks=False).st_size <= 0:
+                        # 0 字节孤儿：占位后进程被杀留下的残骸，直接清掉。
+                        remove_file(file_entry.path)
+                        orphan_count += 1
                         continue
                 except OSError:
                     continue
@@ -552,6 +616,9 @@ def scan_downloaded_mp4_ids():
                     continue
                 downloaded_ids.add(key)
                 locations.setdefault(key, []).append(file_entry.path)
+
+    if orphan_count:
+        print(f"已清理 {orphan_count} 个 0 字节 mp4 孤儿（移动中断留下的占位文件）")
 
     duplicates = {
         key: paths for key, paths in locations.items() if len(paths) > 1
@@ -602,6 +669,13 @@ _PERMANENT_FAILURE_MARKERS = (
     "直链总长异常",               # 探测出的总长 <= 0
     "直链下载长度不符",           # 各块均成功但总长对不上，探测总长本身有误
 )
+
+# 注意：_HTTP_PERMANENT_MARKER（401/403/404/410/416）有意**不**列入上面的
+# 整集判死表。它只用于"层内短路"——让分片/块/playlist 请求不再空等退避、
+# 尽快换下一个取流节点。但整集是否重投要更乐观：403 很多时候是源站的临时
+# 风控（record_block_status 正是把 403 当风控信号在统计），冷却一轮后往往
+# 就能恢复；若在此判死会把可救回的片永久淘汰，与"尽可能提高成功率"相悖。
+# 真正需要判死的 mp4 直链场景已由上面的专用文案（需重新取流/直链块不可用）覆盖。
 
 # mp4 直链（vidlink 签名 url 带 sign&t 时效）返回 403/410 时的文案标记。
 # 注意：它同时也在 _PERMANENT_FAILURE_MARKERS 中——本脚本无法重新取流，
@@ -656,6 +730,9 @@ _REJECT_REASON_RULES = (
     ("直链块重试耗尽", ("直链块",)),
     ("直链探测失败", ("直链探测失败",)),
     ("源站5xx", ("HTTP Error 5", "500 Server Error", "502", "503", "504")),
+    # 确定性 4xx（401/403/404/410/416）：层内已短路不重试，统计上单列一类，
+    # 便于跑完后判断是源站风控（403 居多）还是链接真失效（404/410 居多）。
+    ("确定性4xx", (_HTTP_PERMANENT_MARKER,)),
     ("超时", ("timed out", "timeout", "超时")),
     ("SSL/连接错误", ("SSL", "Connection", "ConnectionError")),
 )
@@ -786,18 +863,45 @@ def build_s3_key(tmdb_id, season, episode, year=None):
     return "/".join(parts)
 
 
+def _is_permanent_upload_error(exc):
+    """判断上传失败是否"重试也没用"：凭证错误/桶不存在/权限不足等配置类问题。
+
+    这类失败重试 5 次只是白等 30s，而且每次都占着反压槽位、拖慢整条流水线。
+    网络类错误（超时/连接重置/5xx）仍然重试——那才是重试真正能救回来的场景。
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return False
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    code = str(response.get("Error", {}).get("Code", ""))
+    if status in (400, 401, 403, 404):
+        return True
+    return code in (
+        "InvalidAccessKeyId", "SignatureDoesNotMatch", "AccessDenied",
+        "NoSuchBucket", "InvalidBucketName",
+    )
+
+
 def upload_to_r2(local_path, s3_key):
-    """带指数退避重试地上传单个文件到 R2。成功返回 True，耗尽重试返回 (False, 原因)。"""
+    """带指数退避重试地上传单个文件到 R2。成功返回 (True, None)，失败返回 (False, 原因)。
+
+    确定性失败（凭证/权限/桶不存在）立即返回，不做无谓重试。
+    """
     client = get_s3_client()
     last_exc = None
     for attempt in range(1, UPLOAD_RETRY_MAX + 1):
         try:
             client.upload_file(local_path, S3_BUCKET, s3_key)
             return True, None
-        except Exception as exc:  # noqa: BLE001 - 网络/凭证/服务端多种异常统一重试
+        except Exception as exc:  # noqa: BLE001 - 网络/凭证/服务端多种异常统一处理
             last_exc = exc
+            if _is_permanent_upload_error(exc):
+                return False, f"确定性上传失败（不重试）: {exc}"
             if attempt < UPLOAD_RETRY_MAX:
-                time.sleep(UPLOAD_RETRY_DELAY * attempt)
+                # 指数退避 + 抖动，封顶 60s：与下载侧各重试层口径一致。
+                wait = min(UPLOAD_RETRY_DELAY * (2 ** (attempt - 1)), 60)
+                wait += random.uniform(0, min(1.0, wait * 0.2))
+                time.sleep(wait)
     return False, str(last_exc)
 
 
@@ -895,7 +999,7 @@ def clean_temp_directory():
         path = os.path.join(TEMP_DIR, name)
         if not os.path.isfile(path):
             continue
-        if name.startswith(("sample_", "temp_")) and name.endswith(
+        if name.startswith(("sample_", "temp_", "mp4sample_")) and name.endswith(
             (".ts", ".mp4")
         ):
             remove_file(path)
@@ -1193,6 +1297,12 @@ def validate_segment_content(content, url):
 
 
 def download_single_segment(url, index, retry_max, delay, headers=None):
+    """下载单个 HLS 分片，失败按指数退避重试 retry_max 次。
+
+    确定性失败（401/403/404/410/416，或源站返回 HTML/m3u8 而非视频数据）立即
+    上抛、不再退避重试：这类结果重下必然复现，白等十几分钟只会占死下载窗口、
+    延误换下一个取流节点。与 mp4 直链块层（_download_mp4_chunk）语义对齐。
+    """
     last_error = None
     for attempt in range(1, retry_max + 1):
         try:
@@ -1205,7 +1315,13 @@ def download_single_segment(url, index, retry_max, delay, headers=None):
             return content
         except Exception as exc:
             last_error = exc
-            if attempt == retry_max:
+            message = str(exc)
+            if (
+                attempt == retry_max
+                or is_permanent_http_failure(exc)
+                # 源站返回 HTML/m3u8：通常是无效源，重试无意义。
+                or "服务器返回的不是视频分片" in message
+            ):
                 break
 
             wait = min(delay * (2 ** (attempt - 1)), 60)
@@ -1549,6 +1665,9 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
             message = str(exc)
             if (
                 any(marker in message for marker in _MP4_CHUNK_NO_RETRY_MARKERS)
+                # 兜底：上面显式判过的 403/410/404/416 之外，若 raise_for_status
+                # 抛出其它确定性状态码（如 401），同样不必退避重试。
+                or is_permanent_http_failure(exc)
                 or attempt == SEG_RETRY_MAX
                 or (abort_event is not None and abort_event.is_set())
             ):
@@ -1568,6 +1687,65 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
     raise RuntimeError(
         f"直链块 {index + 1} 重试后仍失败: {last_error}"
     ) from last_error
+
+
+def _mp4_probe_quality_by_sample(
+    url, headers, total_size, sample_path, label, runtime_minutes
+):
+    """整片下载前先取头部样本验画质，避免整集（GB 级）白下白丢。
+
+    原理：mp4 的分辨率/编码/时长都写在 moov box 里，而整片码率
+    = total_size×8/duration —— total_size 已由 Range 探测拿到。故只要样本能被
+    ffprobe 解析出这三项，得出的判定结果与下完整片后再判**完全一致**，
+    却只花几 MB 流量。
+
+    仅当 moov 在文件头部（faststart）时样本可解析；moov 在尾部的文件 ffprobe
+    会失败，此时返回 None 表示"无法预判"，由调用方放行走整片下载后再验——
+    宁可多下也不误杀，与"尽可能提高成功率"一致。
+
+    返回 (resolution_str, height, bitrate_kbps, codec) 或 None。
+    """
+    sample_end = min(MP4_SAMPLE_SIZE, total_size) - 1
+    try:
+        content = _download_mp4_chunk(url, headers, 0, sample_end, 0)
+    except Exception as exc:
+        # 采样块自身失败（含确定性 4xx / 直链失效）直接上抛：整片下载必然同样失败，
+        # 没必要再浪费一次整片尝试。
+        raise RuntimeError(f"直链采样失败: {exc}") from exc
+
+    try:
+        with open(sample_path, "wb") as fh:
+            fh.write(content)
+        actual_size = probe_resolution(sample_path)
+        if not actual_size:
+            print(
+                f"  [{label}] 直链头部样本无法探测（moov 可能不在文件头），"
+                f"跳过预检、下载整片后再验",
+                flush=True,
+            )
+            return None
+        height = actual_size[1]
+        resolution = f"{actual_size[0]}x{actual_size[1]}"
+
+        # 时长优先用样本 moov 里的容器时长（是整片时长，不是样本时长）；
+        # 取不到再退回上游元数据 runtime_minutes。
+        duration = _probe_duration(sample_path)
+        if not duration or duration <= 0:
+            minutes = parse_int(runtime_minutes)
+            duration = minutes * 60 if minutes else None
+        if not duration:
+            return None
+
+        bitrate = total_size * 8 / duration / 1000
+        codec = probe_codec(sample_path)
+        print(
+            f"  [{label}] 直链预检 {resolution} 编码 {codec or 'unknown'}，"
+            f"码率 {bitrate:.0f} kbps（样本 {len(content)} 字节）",
+            flush=True,
+        )
+        return resolution, height, bitrate, codec
+    finally:
+        remove_file(sample_path)
 
 
 def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
@@ -1597,6 +1775,32 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
         raise RuntimeError(f"直链总长异常({total_size}): {url}")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    # 画质预检：先取头部样本判分辨率+码率，不达标立刻淘汰，省下整集（GB 级）
+    # 的下载流量与下载槽位。判定口径与整片下完后的复检完全一致（同一套红线与
+    # bitrate_threshold），所以预检通过的片复检必然也通过，不会重复淘汰。
+    sample_path = os.path.join(
+        os.path.dirname(output_path) or ".",
+        f"mp4sample_{safe_file_token(label)}.mp4",
+    )
+    probed = _mp4_probe_quality_by_sample(
+        url, headers, total_size, sample_path, label, runtime_minutes
+    )
+    if probed is not None:
+        pre_resolution, pre_height, pre_bitrate, pre_codec = probed
+        if not meets_resolution_redline(pre_height):
+            raise RuntimeError(
+                f"分辨率 {pre_resolution} 低于红线 {MIN_RESOLUTION_HEIGHT}"
+                f"（容差 {LENIENCY:.2f}），跳过"
+            )
+        pre_min_bitrate = bitrate_threshold(pre_height, pre_codec)
+        if pre_bitrate < pre_min_bitrate:
+            raise RuntimeError(
+                f"分辨率 {pre_resolution} 流（{pre_codec or 'unknown'}）"
+                f"码率未达到门槛：{pre_bitrate:.0f} kbps"
+                f" < {pre_min_bitrate:.0f} kbps"
+            )
+
     # 不做断点续传：节点失败时上层会删掉残留 ts，启动时也会清理 temp_*，
     # 残留文件无法证明与本次直链一致，存在即视为脏数据重下。
     remove_file(output_path)
@@ -1758,6 +1962,11 @@ def process_one_entry(entry, processed_ids):
         # 分支都必须携带，否则某些源站会 403/428 直接判死，白白损失可用源。
         node_headers = node.get("headers") or None
         if node["type"] == "mp4":
+            # 直链预检的头部样本文件登记进 cleanup_paths：_download_mp4_direct
+            # 内部 finally 已删，这里是进程被杀等极端情况的兜底。
+            cleanup_paths.add(
+                os.path.join(TEMP_DIR, f"mp4sample_{safe_file_token(label)}.mp4")
+            )
             resolution, bitrate = _download_mp4_direct(
                 node, final_ts, label, runtime_minutes
             )
@@ -2530,7 +2739,43 @@ def _run_pipeline():
             # 在途+排队的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载
             # 会在此阻塞主循环，从而钳制本地磁盘占用上限。release 由 future
             # 完成回调对称释放，保证无论上传成功/异常/取消都不泄漏信号量。
-            upload_semaphore.acquire()
+            #
+            # 但阻塞必须有上限：这里是**主事件循环线程**，无限等待会让整条
+            # 流水线冻结（下载完成的 future 也没人处理、转封装同步停摆）。
+            # 等满 UPLOAD_SLOT_WAIT_TIMEOUT 仍拿不到槽位，说明 R2 长时间消化
+            # 不动，此时降级：不提交上传、成品留本地并写 pending，主循环继续
+            # 推进下载与转封装，事后用 reupload 子命令补传。宁可暂时不传，
+            # 也不让远端故障拖垮本地下载产能。
+            if not upload_semaphore.acquire(timeout=UPLOAD_SLOT_WAIT_TIMEOUT):
+                degrade_reason = (
+                    f"上传积压超过 {UPLOAD_SLOT_WAIT_TIMEOUT:g}s 未消化，"
+                    f"本集降级为留本地待补传"
+                )
+                try:
+                    write_pending({
+                        "tmdbId": info.get("tmdbId"),
+                        "season": info.get("season"),
+                        "episode": info.get("episode"),
+                        "title": info.get("title", ""),
+                        "year": info.get("year"),
+                        "local_path": info.get("final_path"),
+                        "s3_key": "",
+                        "fail_reason": degrade_reason,
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                except Exception as exc:
+                    print(f"⚠️ 降级写 pending 失败: {label}: {exc}", flush=True)
+                # 写 SUCCESS_LOG(uploaded=false) 防止下一轮/下次运行重新下载。
+                info["uploaded"] = False
+                write_log(SUCCESS_LOG, info)
+                write_log(FAILED_LOG, {
+                    **ident,
+                    "urls": entry.get("urls", []),
+                    "error": degrade_reason,
+                    "stage": "upload",
+                })
+                print(f"⚠️ {label}: {degrade_reason}", flush=True)
+                return
             # acquire 与 submit 之间若 submit 抛异常（如线程池已 shutdown），
             # 已 acquire 的配额会永久泄漏、累积到上限致主循环死锁。故用 try 兜底：
             # submit 失败立即 release 保证信号量对称，并就地写 FAILED_LOG 后 return
