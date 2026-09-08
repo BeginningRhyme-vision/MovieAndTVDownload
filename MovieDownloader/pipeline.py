@@ -209,6 +209,111 @@ class FetchWorker:
             self.thread.join(timeout=0.1)
 
 
+class AsyncRefetcher:
+    """异步重取流：把"直链过期，换一条新的"交给常驻取流线程，主循环不阻塞。
+
+    替代 download_movies.refetch_entries 的**同步**调用（§10.21 B-6：那条路
+    由主事件循环线程跑，期间 wait(pending) 停摆可达数十分钟，只好加
+    AUTO_REFETCH_TIMEOUT 硬兜）。这里主循环只做两个瞬时动作：
+        dispatch(entries)  投递请求，立即返回
+        collect()          取走已完成的结果，没有就返回空
+
+    ⚠️ 结果**不走主队列**：主队列有哨兵语义，取流主任务一结束就被标记 done，
+    之后推进去的结果再也取不出来（已实测验证）。故用独立的 _done 队列。
+
+    落盘由 refetch_entries 的同款逻辑保证：新结果写进 INPUT_JSONL，
+    即使本次运行没赶上消费，下次启动也能按 fetched_at 择新直接用上。
+    """
+
+    def __init__(self, workers, stop_event):
+        self._in = queue.Queue()
+        self._done = queue.Queue()
+        self._stop = stop_event
+        self._workers = max(1, int(workers))
+        self._threads = []
+        # 在途计数（已投递、尚未产出结论）。dispatch 时 +1，worker 处理完 -1，
+        # 无论成功/失败/无果都要减——否则主循环会一直以为还有货没回来，
+        # 白等满 ASYNC_REFETCH_WAIT_SECONDS。
+        self._inflight = 0
+        self._lock = threading.Lock()
+        self.dispatched = 0
+        self.revived = 0
+
+    def start(self):
+        for i in range(self._workers):
+            t = threading.Thread(target=self._loop, name=f"refetch-{i}",
+                                 daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def dispatch(self, entries):
+        """主循环调用：投递重取请求。绝不阻塞（无界队列）。"""
+        for entry in entries:
+            with self._lock:
+                self._inflight += 1
+                self.dispatched += 1
+            self._in.put(entry)
+
+    def collect(self):
+        """主循环调用：取走目前已完成的重取结果。绝不阻塞。"""
+        out = []
+        while True:
+            try:
+                out.append(self._done.get_nowait())
+            except queue.Empty:
+                return out
+
+    def pending_count(self):
+        """还有多少条在途。主循环靠它决定"还要不要再等一会儿"。"""
+        with self._lock:
+            return self._inflight
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                entry = self._in.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            # 取出后无论走哪条分支，都必须把在途计数减掉，否则主循环会误以为
+            # 还有货没回来、白等满等待上限。故整体包在 try/finally 里。
+            try:
+                self._handle(entry)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  [重取异常] {entry.get('tmdbId')}: {exc}", flush=True)
+            finally:
+                with self._lock:
+                    self._inflight -= 1
+
+    def _handle(self, entry):
+        tmdb_id = entry.get("tmdbId")
+        if tmdb_id is None:
+            return
+        try:
+            status, result = fetcher.process_tmdb_id(tmdb_id)
+        except (Exception, SystemExit) as exc:
+            # 单片重取失败绝不能带塌整批；SystemExit 一并兜住
+            # （取流侧用它做配置校验），但不拦 KeyboardInterrupt。
+            print(f"  [重取失败] {tmdb_id}: {exc}", flush=True)
+            return
+        if status != "ok" or not result or not result.get("urls"):
+            # dead（源站确认无此片）与 retry（瞬时错误耗尽）都救不回来。
+            print(f"  [重取无果] {tmdb_id}: {status}", flush=True)
+            return
+        # 落盘，与取流侧行为一致（追加写，下游按 fetched_at 择新）。
+        # 即使本次运行没消费到，下次启动也能用上。
+        downloader.write_log(downloader.INPUT_JSONL, result)
+        # 逐键覆盖而非整体替换：entry 可能带有 result 没有的历史字段
+        # （title/year/runtime_minutes 等元数据）。
+        new_entry = dict(entry)
+        new_entry["urls"] = result["urls"]
+        new_entry["fetched_at"] = result.get("fetched_at")
+        self._done.put(new_entry)
+        with self._lock:
+            self.revived += 1
+        print(f"  [重取成功] {tmdb_id}: {len(result['urls'])} 个新节点",
+              flush=True)
+
+
 def main():
     argv = sys.argv[1:]
     if "--refetch-failed" in argv:
@@ -249,12 +354,28 @@ def main():
 
     downloader.ListEntrySource = source_factory
 
+    # 异步重取流：复用 download_movies.auto_refetch 的开关与并发数（用户拍板
+    # 不另设开关）。装上钩子后，下载侧的"直链过期"就不再走同步的
+    # refetch_entries，而是丢给这里的常驻线程，主循环一步都不阻塞。
+    refetcher = None
+    real_hook = downloader.async_refetch_hook
+    if downloader.AUTO_REFETCH_ENABLED:
+        refetcher = AsyncRefetcher(
+            downloader.AUTO_REFETCH_WORKERS, worker._stop
+        )
+        refetcher.start()
+        downloader.async_refetch_hook = refetcher
+        print(f"异步重取流已启用（{downloader.AUTO_REFETCH_WORKERS} 个重取线程，"
+              f"每部片最多 {downloader.AUTO_REFETCH_MAX_PER_MOVIE} 次）",
+              flush=True)
+
     started = time.time()
     worker.start()
     try:
         downloader.main()
     finally:
         downloader.ListEntrySource = real_list_source
+        downloader.async_refetch_hook = real_hook
         worker.shutdown()
 
     source = holder["source"]
@@ -264,6 +385,12 @@ def main():
     print(f"[pipeline] 结束：取流入队 {worker.enqueued} 部"
           + (f"（{worker.dropped} 部改走文件承接）" if worker.dropped else "")
           + f"，下载侧消费 {delivered} 部，总耗时 {elapsed / 60:.1f} 分钟")
+    if refetcher is not None and refetcher.dispatched:
+        stranded = refetcher.dispatched - refetcher.revived
+        print(f"[pipeline] 异步重取：投递 {refetcher.dispatched} 部，"
+              f"换到新直链 {refetcher.revived} 部"
+              + (f"（{stranded} 部未及回收，已落盘 results.jsonl，"
+                 f"下次运行自动使用）" if stranded > 0 else ""))
     if worker.error is not None:
         print(f"⚠️ 取流侧曾异常终止：{worker.error}")
         print("   已取到的片仍已下载；重跑本命令可继续未完成的部分。")

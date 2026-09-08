@@ -223,6 +223,13 @@ download_movies:
     # timeout × max_retries，足以拖住主循环几十分钟（与 upload_slot_wait_timeout
     # 防的是同一类问题）。超时即收下已完成的部分、放弃仍在跑的，留给下次运行。
     round_timeout_seconds: 600
+    # 【仅 pipeline.py】异步重取投出后，等待结果回来的上限（秒）。
+    # pipeline 模式下重取由常驻取流线程异步跑，主循环 dispatch 完立刻返回。
+    # 但投完必须等一等再判"还有没有片要重投"——否则会认为没有、直接收尾，
+    # 重取成功的新链接就没有任何轮次去消费它（端到端实测复现过）。
+    # 期间每秒收一次，在途清零即提前结束，不会白等满。
+    # 单独跑 download_movies.py 时本项无效（那条路走上面的同步重取）。
+    async_wait_seconds: 120
   # ---- 收尾自动补传 ----
   # 上传槽位等待超时（upload_slot_wait_timeout）会降级为"留本地 + 写 upload_pending"，
   # 这些成品不被任何后续轮次处理，只能靠人跑 reupload。主流程跑完时 R2 往往已恢复，

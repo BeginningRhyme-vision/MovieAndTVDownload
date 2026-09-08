@@ -265,3 +265,180 @@ def test_refetch_failed_flag_is_rejected(monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         p.main()
     assert "refetch-failed" in str(excinfo.value)
+
+
+# ------------------------------------------------- AsyncRefetcher
+
+def _make_refetcher(monkeypatch, tmp_path, outcomes, workers=2):
+    """建一个 AsyncRefetcher，把取流与落盘都换成假实现。"""
+    monkeypatch.setattr(
+        p.fetcher, "process_tmdb_id",
+        lambda tid, providers=None: outcomes[str(tid)]
+    )
+    written = []
+    monkeypatch.setattr(p.downloader, "INPUT_JSONL", str(tmp_path / "r.jsonl"))
+    monkeypatch.setattr(p.downloader, "write_log",
+                        lambda path, rec: written.append(rec))
+    stop = threading.Event()
+    r = p.AsyncRefetcher(workers, stop)
+    r.start()
+    return r, stop, written
+
+
+def test_dispatch_returns_immediately_and_does_not_block(monkeypatch, tmp_path):
+    """🔑 本方向的全部意义：主循环投递重取时**绝不能阻塞**。
+
+    同步的 refetch_entries 由主事件循环线程跑，期间 wait(pending) 停摆可达
+    数十分钟（§10.21 B-6）。dispatch 必须瞬时返回。
+    """
+    slow = threading.Event()
+
+    def slow_fetch(tid, providers=None):
+        slow.wait(timeout=5)  # 取流很慢
+        return "ok", {"tmdbId": tid, "urls": [{"url": "u", "type": "mp4"}]}
+
+    monkeypatch.setattr(p.fetcher, "process_tmdb_id", slow_fetch)
+    monkeypatch.setattr(p.downloader, "write_log", lambda path, rec: None)
+    stop = threading.Event()
+    r = p.AsyncRefetcher(2, stop)
+    r.start()
+    try:
+        started = time.time()
+        r.dispatch([{"tmdbId": str(i)} for i in range(10)])
+        elapsed = time.time() - started
+        assert elapsed < 0.5, f"dispatch 阻塞了 {elapsed:.2f}s"
+        # 结果还没好时 collect 也必须瞬时返回
+        started = time.time()
+        assert r.collect() == []
+        assert time.time() - started < 0.5
+    finally:
+        slow.set()
+        stop.set()
+
+
+def test_collect_returns_revived_entries_and_preserves_metadata(
+        monkeypatch, tmp_path):
+    """重取成功的片要能被收回，且保留 entry 上 result 没有的历史元数据。"""
+    outcomes = {
+        "1": ("ok", {"tmdbId": "1", "urls": [{"url": "new", "type": "mp4"}],
+                     "fetched_at": 999}),
+    }
+    r, stop, written = _make_refetcher(monkeypatch, tmp_path, outcomes)
+    try:
+        r.dispatch([{"tmdbId": "1", "title": "T", "year": 2020,
+                     "urls": [{"url": "old", "type": "mp4"}]}])
+        deadline = time.time() + 5
+        got = []
+        while time.time() < deadline and not got:
+            got = r.collect()
+            time.sleep(0.02)
+
+        assert len(got) == 1
+        entry = got[0]
+        assert entry["urls"] == [{"url": "new", "type": "mp4"}]
+        assert entry["fetched_at"] == 999
+        # 历史元数据必须保留（逐键覆盖而非整体替换）
+        assert entry["title"] == "T"
+        assert entry["year"] == 2020
+        # 必须落盘：本次没赶上消费时，靠它让下次运行用上新链接
+        assert len(written) == 1
+        assert r.revived == 1
+    finally:
+        stop.set()
+
+
+def test_dead_and_retry_outcomes_are_not_revived(monkeypatch, tmp_path):
+    """dead（真无源）与 retry（瞬时耗尽）都救不回来，不能当成新链接投出去。"""
+    outcomes = {"1": ("dead", None), "2": ("retry", None)}
+    r, stop, written = _make_refetcher(monkeypatch, tmp_path, outcomes)
+    try:
+        r.dispatch([{"tmdbId": "1"}, {"tmdbId": "2"}])
+        time.sleep(0.5)
+        assert r.collect() == []
+        assert written == []
+        assert r.revived == 0
+    finally:
+        stop.set()
+
+
+def test_refetch_worker_survives_system_exit_from_fetcher(monkeypatch, tmp_path):
+    """取流侧的 SystemExit（配置校验）不得杀掉重取线程，更不能带塌整批。"""
+    def boom(tid, providers=None):
+        if str(tid) == "1":
+            raise SystemExit("缺少代理凭证")
+        return "ok", {"tmdbId": tid, "urls": [{"url": "u", "type": "mp4"}]}
+
+    monkeypatch.setattr(p.fetcher, "process_tmdb_id", boom)
+    monkeypatch.setattr(p.downloader, "write_log", lambda path, rec: None)
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop)   # 单线程：保证两条走同一个 worker
+    r.start()
+    try:
+        r.dispatch([{"tmdbId": "1"}, {"tmdbId": "2"}])
+        deadline = time.time() + 5
+        got = []
+        while time.time() < deadline and not got:
+            got = r.collect()
+            time.sleep(0.02)
+        # 第一条抛 SystemExit，第二条仍要被正常处理
+        assert [e["tmdbId"] for e in got] == ["2"]
+    finally:
+        stop.set()
+
+
+def test_refetch_threads_exit_on_stop(monkeypatch, tmp_path):
+    """stop 事件必须能结束全部重取线程，否则进程退出时线程泄漏。"""
+    r, stop, _ = _make_refetcher(monkeypatch, tmp_path, {}, workers=3)
+    assert all(t.is_alive() for t in r._threads)
+
+    stop.set()
+    deadline = time.time() + 5
+    while time.time() < deadline and any(t.is_alive() for t in r._threads):
+        time.sleep(0.05)
+
+    assert not any(t.is_alive() for t in r._threads), "重取线程未退出"
+
+
+def test_pending_count_drops_to_zero_on_every_outcome(monkeypatch, tmp_path):
+    """🔴 在途计数必须在**所有**分支归零：成功/无果/异常都要减。
+
+    漏减会让主循环一直以为"还有货没回来"，白等满 ASYNC_REFETCH_WAIT_SECONDS
+    （120s）才继续——每一轮都白等两分钟。
+    """
+    def mixed(tid, providers=None):
+        if str(tid) == "ok":
+            return "ok", {"tmdbId": tid, "urls": [{"url": "u", "type": "mp4"}]}
+        if str(tid) == "dead":
+            return "dead", None
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(p.fetcher, "process_tmdb_id", mixed)
+    monkeypatch.setattr(p.downloader, "write_log", lambda path, rec: None)
+    stop = threading.Event()
+    r = p.AsyncRefetcher(2, stop)
+    r.start()
+    try:
+        r.dispatch([{"tmdbId": "ok"}, {"tmdbId": "dead"}, {"tmdbId": "boom"}])
+        assert r.pending_count() == 3
+
+        deadline = time.time() + 5
+        while time.time() < deadline and r.pending_count() > 0:
+            time.sleep(0.02)
+
+        assert r.pending_count() == 0, "有分支漏减在途计数"
+        assert r.revived == 1  # 只有 ok 那条救回来了
+    finally:
+        stop.set()
+
+
+def test_entry_without_tmdb_id_still_clears_inflight(monkeypatch, tmp_path):
+    """脏数据（缺 tmdbId）也要减在途计数，否则同样会卡住主循环的等待。"""
+    r, stop, _ = _make_refetcher(monkeypatch, tmp_path, {})
+    try:
+        r.dispatch([{"title": "no id"}])
+        deadline = time.time() + 5
+        while time.time() < deadline and r.pending_count() > 0:
+            time.sleep(0.02)
+        assert r.pending_count() == 0
+    finally:
+        stop.set()

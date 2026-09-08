@@ -703,6 +703,15 @@ def test_stream_idle_poll_is_positive():
     assert d.STREAM_IDLE_POLL_SECONDS > 0
 
 
+def test_async_refetch_hook_defaults_to_none():
+    """默认必须是 None —— 只跑下载时要走同步的 refetch_entries 老路。
+
+    钩子若被意外留成非 None，download_movies.py 单独运行时会去调一个
+    根本没有取流线程在服务的队列，过期片永远救不回来且毫无报错。
+    """
+    assert d.async_refetch_hook is None
+
+
 def test_streaming_source_does_not_busy_wait_when_producer_is_slow():
     """流式来源返回 wait 时，主循环必须让出 CPU，不能忙等。
 
