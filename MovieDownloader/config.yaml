@@ -8,7 +8,12 @@
 #   - 想改某个脚本的参数，只需改它所属段落，无需改动任何代码。
 #
 # 【接入进度】
-#   - 所有段落均已接入：对应脚本运行时会读取自己那一段。
+#   - fetch_movie_metadata / filter_to_ids / tmdb_ids_to_links / download_movies
+#     四段均已接入，对应脚本运行时会读取自己那一段。
+#   - fetch_subtitles 段为**预留**：该脚本目前只从 .env 读 SUBDL_API_KEY，
+#     不读本文件（见该段说明）。
+#   - filter_to_ids 的**筛选规则**不在本文件，而在同目录 filter_config.yaml；
+#     本文件的 filter_to_ids 段只管输入输出路径。
 # ============================================================================
 
 
@@ -44,6 +49,23 @@ fetch_movie_metadata:
 
 
 # ----------------------------------------------------------------------------
+# filter_to_ids.py —— 按条件从 movies.jsonl 挑片，生成取流用的 ids.txt
+# ----------------------------------------------------------------------------
+# 注意：**筛选规则本身不在这里**，而在同目录的 filter_config.yaml
+# （每个字段一个独立开关，项目多、注释长，单独成文件更好维护）。
+# 本段只管该脚本的输入输出路径。
+filter_to_ids:
+  # 输入：fetch_movie_metadata.py 的产物
+  input: "movies.jsonl"
+  # 筛选规则文件（各字段的 enabled 开关与阈值都在里面）
+  filter_config: "filter_config.yaml"
+  # 输出：每行一个 tmdb_id，供 tmdb_ids_to_links.py 消费（覆盖写）
+  output_ids: "ids.txt"
+  # 输出：通过筛选的电影明细，仅供人工复核，无下游消费者（覆盖写）
+  output_detail: "filtered.jsonl"
+
+
+# ----------------------------------------------------------------------------
 # tmdb_ids_to_links.py —— 由 tmdb_id 解析出可播放的 m3u8 地址
 # ----------------------------------------------------------------------------
 tmdb_ids_to_links:
@@ -55,8 +77,18 @@ tmdb_ids_to_links:
   metadata: "movies.jsonl"
   # 输出：解析成功的结果（含 m3u8 地址）
   output: "results.jsonl"
-  # 解析失败的 tmdb_id 记录
+  # 确认真无源的 tmdb_id 记录（每行一个）。**语义是"永久排除，绝不再抓"**：
+  # 只有走完白名单判死（唯一证据是源站明确表示无此片）+ dead_confirm 换 IP
+  # 二次确认的 ID 才会进来。它会被计入"已处理"，续跑时直接跳过。
+  # 也正因为语义纯净，它才能被当作"真 dead 样本"用于评估新增源的价值（见 §10.15）。
   fail_file: "fail.txt"
+  # 多轮捞回跑满 max_rounds 仍未成功、且**从未被判定为无源**的 tmdb_id。
+  # 这些是被超时/5xx/代理或 enc-dec 故障打下来的，不是真没源，因此：
+  #   - 不计入"已处理"，下次运行会自动重试；
+  #   - 与 fail_file 分开存放，避免一次长时间的基础设施故障把整批有源片永久判死，
+  #     也避免两类记录混在一起后再也分不出哪些是真 dead。
+  # 每次运行结束覆盖写（含清空），始终只反映最近一次运行的残留。
+  unresolved_file: "unresolved.txt"
   # 解密服务 API 根地址（负责各 provider 的 enc-* / dec-* 加解密）
   api: "https://enc-dec.app/api"
   # ---- 多源取流 ----
@@ -98,9 +130,10 @@ tmdb_ids_to_links:
   # ---- 多轮捞回：整批跑完后对“瞬时耗尽”的 ID 自动重跑，直到清零或达上限 ----
   # 进程内不定轮循环，替代旧的外部 retry_runner.sh：
   #   - 单 ID 在 process_tmdb_id 内换 IP 重试 max_retries 次仍失败(瞬时耗尽) → 下一轮重跑；
-  #   - 确认真无源 → 永久排除，绝不再抓；
+  #   - 确认真无源 → 写 fail_file，永久排除，绝不再抓；
   #   - output 直接就是全部轮次成功结果的合并（原 total_results.jsonl）。
   # max_rounds 为兜底上限（含第一轮），防极端情况死循环。
+  # 达上限仍未成功的 ID 写 unresolved_file，**不判死**，下次运行自动重试。
   max_rounds: 8
   # 轮间退避（秒）：第 n 轮后等待 round_backoff*n，上限 round_backoff_max。
   # 给 enc-dec / 代理 / 源站的短时故障留恢复窗口，避免多轮在几秒内烧光重试预算。
@@ -130,8 +163,7 @@ tmdb_ids_to_links:
 # ----------------------------------------------------------------------------
 download_movies:
   # 输入与日志
-  # 全量下载直接消费取流产物 results.jsonl（自带 year 等元数据，见 §8.8）；
-  # picked_by_year.jsonl 仅为按年份抽样的测试输入，全量不经过 pick_by_year。
+  # 直接消费取流产物 results.jsonl（自带 year/runtime_minutes 等元数据，见 §8.8）。
   input: "results.jsonl"
   success_log: "success.jsonl"
   failed_log: "failed.jsonl"

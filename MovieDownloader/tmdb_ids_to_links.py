@@ -48,6 +48,25 @@ def load_config():
 _CFG = load_config()
 _PROXY_CFG = _CFG.get("proxy", {}) or {}
 
+# 脚本所在目录（MovieDownloader/），作为所有相对路径的根。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def resolve_file(value, default_name):
+    """解析输入/输出/元数据等文件路径，统一锚定到脚本目录：
+    - 为空 -> 脚本目录下的 default_name；
+    - 相对路径 -> 以脚本目录为根拼接（不随进程当前工作目录漂移）；
+    - 绝对路径 -> 直接使用。
+
+    必须与 download_movies.py 的同名函数保持一致：两侧若基准不同，从非脚本目录
+    启动取流会把 results.jsonl 写到 CWD，而下载侧仍去脚本目录读——取流明明成功
+    却"没片可下"，且元数据照常加载、毫无报错，极难排查。
+    """
+    raw = value.strip() if isinstance(value, str) else value
+    if not raw:
+        raw = default_name
+    return _SCRIPT_DIR / raw
+
 
 def _proxy_secret(cfg_key, env_key):
     """代理凭据：优先取环境变量（同目录 .env），缺省时回退 config.yaml（便于本地调试）。"""
@@ -145,9 +164,7 @@ def load_movie_metadata():
       元数据表 tmdb_id -> 写进 results.jsonl 的静态字段；
       检索表   tmdb_id -> {title, year, imdb}，仅供 videasy 的 m4uhd 服务器按片名检索用，
                不写进结果（primary_title 不是 results.jsonl 契约的一部分）。"""
-    meta_path = Path(_CFG.get("metadata", "movies.jsonl"))
-    if not meta_path.is_absolute():
-        meta_path = Path(__file__).with_name(str(meta_path))
+    meta_path = resolve_file(_CFG.get("metadata"), "movies.jsonl")
     table = {}
     search = {}
     if not meta_path.exists():
@@ -647,6 +664,11 @@ def process_tmdb_id(tmdb_id, providers=None):
 
 
 def load_processed_ids(results_file, fail_file):
+    """已处理集合 = 取流成功过的（results）+ 确认真无源的（fail）。
+
+    刻意**不含** unresolved_file：那里面是"多轮跑满仍是瞬时错误"的 ID，
+    从未被判定为 NoSource，下次重跑必须自动重试（见 run_all 的写入处注释）。
+    """
     processed = set()
     if results_file.exists():
         with open(results_file, 'r', encoding='utf-8') as f:
@@ -737,12 +759,13 @@ def main(argv=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     providers = _resolve_providers(args.providers) if args.providers else list(ACTIVE_PROVIDERS)
 
-    ids_file = Path(_CFG.get("input", "ids.txt"))
-    results_file = Path(_CFG.get("output", "results.jsonl"))
-    fail_file = Path(_CFG.get("fail_file", "fail.txt"))
+    ids_file = resolve_file(_CFG.get("input"), "ids.txt")
+    results_file = resolve_file(_CFG.get("output"), "results.jsonl")
+    fail_file = resolve_file(_CFG.get("fail_file"), "fail.txt")
+    unresolved_file = resolve_file(_CFG.get("unresolved_file"), "unresolved.txt")
 
     if not ids_file.exists():
-        print("ids.txt not found!")
+        print(f"ids.txt not found: {ids_file}")
         return
 
     with open(ids_file, 'r', encoding='utf-8') as f:
@@ -765,6 +788,7 @@ def main(argv=None):
     # 故 output 执行完即为"原结果 + 捞回结果"的合并（原 total_results.jsonl）。
     pending = to_process
     round_no = 0
+    unresolved = []
     while pending:
         round_no += 1
         print(f"\n{'=' * 70}")
@@ -778,11 +802,9 @@ def main(argv=None):
             print("\n==> 瞬时失败已清零，所有有源 ID 已捞干净，正常结束。")
             break
         if round_no >= max_rounds:
-            # 达上限仍未捞回的，写入 fail_file 归档（视为难以捞回）
-            with open(fail_file, 'a', encoding='utf-8') as f:
-                for tid in retry_ids:
-                    f.write(f"{tid}\n")
-            print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(retry_ids)} 个瞬时失败 ID 归入 fail_file。")
+            unresolved = retry_ids
+            print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(retry_ids)} 个瞬时失败 ID "
+                  f"写入 {unresolved_file.name}（未判死，下次运行会自动重试）。")
             break
         pending = retry_ids
 
@@ -797,7 +819,30 @@ def main(argv=None):
             print(f"\n==> 等待 {wait}s 后开始下一轮")
         time.sleep(wait)
 
+    # 多轮跑满仍未捞回的 ID **绝不能写进 fail_file**：fail_file 的语义是"源站明确
+    # 说没有这片，永久排除"，为此判死链路做了白名单（只有 NoSource）加 dead_confirm
+    # 换 IP 二次确认。而这批 ID 一次都没被判过 NoSource，它们是被超时/5xx/代理故障
+    # 打下来的——一次持续 max_rounds 轮的 enc-dec 或代理故障就能把整批有源片永久
+    # 判死，且两类记录混在同一个文件里事后无法区分，还会污染"拿 fail.txt 当真 dead
+    # 样本"的分析（§10.15 的复验正是这么取样的）。
+    #
+    # 故单独落 unresolved_file，且不计入 load_processed_ids —— 下次运行自动重试。
+    # 无条件覆盖写（包括清空）：该文件描述的是"最近一次运行结束时仍未解决的 ID"，
+    # 若只在非空时才写，上次的残留会一直骗人说它们还没解决。
+    write_unresolved(unresolved_file, unresolved)
+
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
+
+
+def write_unresolved(unresolved_file, ids):
+    """覆盖写 unresolved.txt；ids 为空时写出空文件（清掉上次运行的残留）。"""
+    try:
+        with open(unresolved_file, 'w', encoding='utf-8') as f:
+            for tid in ids:
+                f.write(f"{tid}\n")
+    except OSError as exc:
+        # 这只是给人看的残留清单，写不进去不该让整轮取流的成果白费。
+        print(f"⚠️ 写 {unresolved_file} 失败（不影响已落盘的结果）: {exc}")
 
 
 if __name__ == "__main__":

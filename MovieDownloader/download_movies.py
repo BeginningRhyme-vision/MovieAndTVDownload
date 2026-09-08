@@ -2297,7 +2297,7 @@ def upload_one_entry(success_info):
         write_log(SUCCESS_LOG, success_info)
         write_pending({
             "tmdbId": tmdb_id,
-            "title": success_info.get("title", ""),
+            "title": success_info.get("title") or "",
             "year": success_info.get("year"),
             "local_path": local_path,
             "s3_key": s3_key,
@@ -2313,7 +2313,7 @@ def upload_one_entry(success_info):
         try:
             write_pending({
                 "tmdbId": tmdb_id,
-                "title": success_info.get("title", ""),
+                "title": success_info.get("title") or "",
                 "year": success_info.get("year"),
                 "local_path": local_path,
                 "s3_key": success_info.get("s3_key", ""),
@@ -2577,7 +2577,7 @@ def _run_pipeline():
                 # 下载成功：写独立的下载态状态文件（只记下载，不含转封装/上传）。
                 write_log(DOWNLOAD_OK_LOG, {
                     "tmdbId": tmdb_id,
-                    "title": entry.get("title", ""),
+                    "title": entry.get("title") or "",
                     "year": entry.get("year"),
                 })
                 # submit 若抛异常（如线程池已 shutdown），finalize 永不执行 →
@@ -2595,7 +2595,7 @@ def _run_pipeline():
                         remove_file(path)
                     write_log(FAILED_LOG, {
                         "tmdbId": tmdb_id,
-                        "title": entry.get("title", ""),
+                        "title": entry.get("title") or "",
                         "urls": entry.get("urls", []),
                         "error": f"转封装提交失败: {exc}",
                         "stage": "conversion",
@@ -2620,7 +2620,7 @@ def _run_pipeline():
             bucket[reason] = bucket.get(reason, 0) + 1
             write_log(FAILED_LOG, {
                 "tmdbId": tmdb_id,
-                "title": entry.get("title", ""),
+                "title": entry.get("title") or "",
                 "urls": entry.get("urls", []),
                 "error": error_msg,
                 "stage": "download",
@@ -2628,7 +2628,7 @@ def _run_pipeline():
             # 下载态状态文件：本轮下载失败逐条记录（含可否重试）。
             write_log(DOWNLOAD_FAIL_LOG, {
                 "tmdbId": tmdb_id,
-                "title": entry.get("title", ""),
+                "title": entry.get("title") or "",
                 "error": error_msg,
                 "retriable": retriable,
             })
@@ -2652,7 +2652,7 @@ def _run_pipeline():
             if not conversion_success:
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
-                    "title": entry.get("title", ""),
+                    "title": entry.get("title") or "",
                     "urls": entry.get("urls", []),
                     "error": info.get("error", "未知错误"),
                     "stage": "conversion",
@@ -2683,7 +2683,7 @@ def _run_pipeline():
                     try:
                         write_pending({
                             "tmdbId": tmdb_id,
-                            "title": info.get("title", ""),
+                            "title": info.get("title") or "",
                             "year": info.get("year"),
                             "local_path": info.get("final_path"),
                             "s3_key": "",
@@ -2703,7 +2703,7 @@ def _run_pipeline():
                     print(f"⚠️ 降级写 success 日志失败: {tmdb_id}: {exc}", flush=True)
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
-                    "title": entry.get("title", ""),
+                    "title": entry.get("title") or "",
                     "urls": entry.get("urls", []),
                     "error": degrade_reason,
                     "stage": "upload",
@@ -2722,7 +2722,7 @@ def _run_pipeline():
                 upload_semaphore.release()
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
-                    "title": entry.get("title", ""),
+                    "title": entry.get("title") or "",
                     "urls": entry.get("urls", []),
                     "error": f"上传提交失败: {exc}",
                     "stage": "upload",
@@ -2752,7 +2752,7 @@ def _run_pipeline():
                 # 便于统计上传阶段失败。
                 write_log(FAILED_LOG, {
                     "tmdbId": tmdb_id,
-                    "title": entry.get("title", ""),
+                    "title": entry.get("title") or "",
                     "urls": entry.get("urls", []),
                     "error": info.get("error", "未知错误"),
                     "stage": "upload",
@@ -2947,7 +2947,7 @@ def reupload_pending():
                 remove_file(local_path)
             update_success_log(tmdb_id, {
                 "tmdbId": tmdb_id,
-                "title": record.get("title", ""),
+                "title": record.get("title") or "",
                 "final_path": local_path,
                 "s3_key": s3_key,
                 "uploaded": True,

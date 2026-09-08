@@ -24,11 +24,34 @@ from typing import Optional
 
 import yaml
 
-# ========== 路径配置 ==========
-MOVIES = Path("movies.jsonl")
-CONFIG = Path("filter_config.yaml")
-OUTPUT_IDS = Path("ids.txt")
-OUTPUT_DETAIL = Path("filtered.jsonl")
+# ========== 路径配置（从 config.yaml 的 filter_to_ids 段读取）==========
+# 与 tmdb_ids_to_links.py / download_movies.py 一致：全部锚定脚本目录，
+# 不随进程当前工作目录漂移，避免从别处启动时读写到错误的文件。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _resolve(value, default_name: str) -> Path:
+    raw = value.strip() if isinstance(value, str) else value
+    return _SCRIPT_DIR / (raw or default_name)
+
+
+def _load_own_config() -> dict:
+    """读取 config.yaml 中本脚本对应的段落；缺失时返回空字典（走默认路径）。"""
+    path = _SCRIPT_DIR / "config.yaml"
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return data.get("filter_to_ids", {}) or {}
+
+
+_CFG = _load_own_config()
+
+MOVIES = _resolve(_CFG.get("input"), "movies.jsonl")
+# 筛选规则仍单独成文件：项目多、注释长，混进 config.yaml 会喧宾夺主。
+CONFIG = _resolve(_CFG.get("filter_config"), "filter_config.yaml")
+OUTPUT_IDS = _resolve(_CFG.get("output_ids"), "ids.txt")
+OUTPUT_DETAIL = _resolve(_CFG.get("output_detail"), "filtered.jsonl")
 
 
 # ========== 配置加载 ==========

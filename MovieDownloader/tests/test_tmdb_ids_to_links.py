@@ -383,3 +383,45 @@ def test_url_entry_shape_matches_downstream_contract():
     entry = m._url_entry("https://a/x.mp4", "vidlink", "mp4",
                          {"User-Agent": "okhttp/4.9.3"}, 1080, 123)
     assert set(entry) == {"url", "provider", "type", "headers", "quality", "size"}
+
+
+# ------------------------------------------------- fail.txt 与 unresolved.txt
+
+def test_unresolved_ids_are_not_treated_as_processed(tmp_path):
+    """多轮跑满的 ID 落在 unresolved.txt，绝不能被当成已处理而跳过。
+
+    load_processed_ids 只认 results（成功过）与 fail（确认真无源）两个来源；
+    unresolved 里的 ID 从未被判过 NoSource，下次运行必须自动重试。
+    """
+    results = tmp_path / "results.jsonl"
+    fail = tmp_path / "fail.txt"
+    unresolved = tmp_path / "unresolved.txt"
+
+    results.write_text('{"tmdbId": "11"}\n', encoding="utf-8")
+    fail.write_text("22\n", encoding="utf-8")
+    unresolved.write_text("33\n", encoding="utf-8")
+
+    processed = m.load_processed_ids(results, fail)
+    assert processed == {"11", "22"}
+    assert "33" not in processed
+
+
+def test_write_unresolved_overwrites_and_clears(tmp_path):
+    """该文件描述"最近一次运行结束时仍未解决的 ID"，故必须覆盖写、且能清空。
+
+    若只在非空时才写，上次运行的残留会一直留在文件里骗人说它们还没解决。
+    """
+    path = tmp_path / "unresolved.txt"
+
+    m.write_unresolved(path, ["7", "8"])
+    assert path.read_text(encoding="utf-8").split() == ["7", "8"]
+
+    # 本次全部捞回 -> 文件应被清空，而不是保留上次的 7/8
+    m.write_unresolved(path, [])
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_write_unresolved_failure_does_not_raise(tmp_path):
+    """写不进去只是丢一份给人看的清单，不该让整轮取流的成果白费。"""
+    # 传目录路径，open(..., 'w') 必然抛 IsADirectoryError（OSError 子类）
+    m.write_unresolved(tmp_path, ["1"])
