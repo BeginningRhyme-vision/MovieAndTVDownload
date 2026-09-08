@@ -217,6 +217,12 @@ download_movies:
     enabled: true
     max_per_movie: 2        # 单部片整次运行中最多就地重取几次（防"取流-过期-重取"空转）
     workers: 8              # 重取并发数。取流走代理且与下载争带宽，故远小于取流侧独立运行时
+    # 单轮重取的总耗时上限（秒）。重取由主事件循环线程同步执行，期间不再推进
+    # 转封装/上传：已下载完的成品会在 temp 里堆积、上传反压链条僵住。
+    # 全量重跑时一轮几百部过期很正常，而单片取流要跑 4 个 provider × 多 server ×
+    # timeout × max_retries，足以拖住主循环几十分钟（与 upload_slot_wait_timeout
+    # 防的是同一类问题）。超时即收下已完成的部分、放弃仍在跑的，留给下次运行。
+    round_timeout_seconds: 600
   # ---- 收尾自动补传 ----
   # 上传槽位等待超时（upload_slot_wait_timeout）会降级为"留本地 + 写 upload_pending"，
   # 这些成品不被任何后续轮次处理，只能靠人跑 reupload。主流程跑完时 R2 往往已恢复，

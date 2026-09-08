@@ -6,6 +6,7 @@ mp4 直链请求头、失败分类与被拒原因归类。全部为纯函数级�
 
 import json
 import os
+import time
 
 import pytest
 
@@ -644,3 +645,77 @@ def test_merge_next_batch_keeps_refetch_only_entries():
     """纯过期（不在 retriable 桶里）的片重取成功后也要被投出去。"""
     merged = d.merge_next_batch([], [{"tmdbId": "9", "urls": ["NEW"]}])
     assert [e["tmdbId"] for e in merged] == ["9"]
+
+
+def test_refetch_survives_system_exit_from_fetcher(sandbox, monkeypatch):
+    """取流模块用模块级 `raise SystemExit` 做配置校验，必须被兜住。
+
+    SystemExit 继承 BaseException，`except Exception` 拦不住。只配了 R2 凭证、
+    没配代理凭证的机器（只跑下载，完全合理）一旦遇到直链过期，整条流水线会被
+    这个 SystemExit 直接杀掉：pending 里的转封装/上传全丢、processing_ids 不
+    释放、temp 里的成品变孤儿。
+    """
+    import builtins
+    real_import = builtins.__import__
+
+    def exiting(name, *args, **kwargs):
+        if name == "tmdb_ids_to_links":
+            raise SystemExit("缺少代理凭证: PROXY_USER")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", exiting)
+    assert d.refetch_entries([{"tmdbId": "55", "urls": []}], {}) == []
+
+
+def test_refetch_survives_per_movie_system_exit(sandbox, monkeypatch):
+    """单片取流内部触发 SystemExit 也不能带塌整批。"""
+    class Exiting(_FakeFetcher):
+        def process_tmdb_id(self, tmdb_id):
+            if str(tmdb_id) == "1":
+                raise SystemExit("providers 为空")
+            return super().process_tmdb_id(tmdb_id)
+
+    fetcher = Exiting({"2": ("ok", {"tmdbId": "2", "urls": [{"url": "u2"}]})})
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    revived = d.refetch_entries(
+        [{"tmdbId": "1", "urls": []}, {"tmdbId": "2", "urls": []}], {}
+    )
+    assert [e["tmdbId"] for e in revived] == ["2"]
+
+
+def test_refetch_gives_up_at_the_round_timeout(sandbox, monkeypatch):
+    """重取不能无限期占住主事件循环线程。
+
+    refetch_entries 是同步调用，期间 wait(pending) 不再执行：已下载完的片无人
+    提交转封装、成品在 temp 里堆积、上传反压僵住——与 UPLOAD_SLOT_WAIT_TIMEOUT
+    防的是同一类问题。超时要收下已完成的部分并立刻放行主循环。
+    """
+    import threading
+    monkeypatch.setattr(d, "AUTO_REFETCH_TIMEOUT", 1)
+    monkeypatch.setattr(d, "AUTO_REFETCH_WORKERS", 2)
+    release = threading.Event()
+
+    class Hanging(_FakeFetcher):
+        def process_tmdb_id(self, tmdb_id):
+            if str(tmdb_id) == "slow":
+                release.wait(30)      # 远超 AUTO_REFETCH_TIMEOUT
+                return ("retry", None)
+            return super().process_tmdb_id(tmdb_id)
+
+    fetcher = Hanging({"fast": ("ok", {"tmdbId": "fast", "urls": [{"url": "u"}]})})
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    started = time.monotonic()
+    try:
+        revived = d.refetch_entries(
+            [{"tmdbId": "fast", "urls": []}, {"tmdbId": "slow", "urls": []}], {}
+        )
+    finally:
+        release.set()   # 放掉挂住的桩线程，避免拖慢整个测试进程
+    elapsed = time.monotonic() - started
+
+    # 快的那部照常收下，慢的被放弃
+    assert [e["tmdbId"] for e in revived] == ["fast"]
+    # 必须在超时附近返回，而不是等满 30s
+    assert elapsed < 10

@@ -96,6 +96,16 @@ AUTO_REFETCH_ENABLED = bool(_REFETCH_CFG.get("enabled", True))
 AUTO_REFETCH_MAX_PER_MOVIE = max(1, int(_REFETCH_CFG.get("max_per_movie", 2)))
 # 重取的并发数。取流是纯网络 IO 且走代理，与下载争带宽，故默认远小于取流侧独立运行时。
 AUTO_REFETCH_WORKERS = max(1, int(_REFETCH_CFG.get("workers", 8)))
+# 单轮重取的总耗时上限（秒）。refetch_entries 由**主事件循环线程**同步调用，
+# 期间 wait(pending) 不再被执行：已下载完的片无人提交转封装、成品在 temp 里
+# 持续堆积（已交接给转封装阶段，不受任何 finally 清理）、上传反压链条僵住。
+# 这与 UPLOAD_SLOT_WAIT_TIMEOUT 防的是同一类问题。
+# 全量重跑时一轮几百部过期很正常，而单片取流要跑 4 个 provider × 多 server ×
+# 12s 超时 × max_retries，几百部足以拖住主循环几十分钟。超时即收下已完成的部分、
+# 放弃仍在跑的，未救回的片留给下次运行（它们不是真淘汰）。
+AUTO_REFETCH_TIMEOUT = max(
+    30, int(_REFETCH_CFG.get("round_timeout_seconds", 600))
+)
 
 # ---- 收尾自动补传 ----
 # 上传槽位等待超时后会降级为"留本地 + 写 upload_pending.jsonl"，这些成品不会被
@@ -798,9 +808,18 @@ def refetch_entries(entries, refetch_counts):
     """
     # 延迟导入：取流侧模块 import 时会读 config、要求代理凭证并建 Session，
     # 放在模块级会让"只想跑下载"的场景平白多出这些依赖与副作用。
+    #
+    # ⚠️ 必须连 SystemExit 一起捕获：tmdb_ids_to_links 在**模块级**用
+    # `raise SystemExit` 做配置校验（缺 PROXY_USER/PROXY_PASSWORD、providers
+    # 非法等）。SystemExit 继承 BaseException，`except Exception` 拦不住它。
+    # 只配了 R2 凭证、没配代理凭证的机器（只跑下载，完全合理）一旦遇到直链过期，
+    # 整条流水线会被这个 SystemExit 直接杀掉：pending 里的转封装/上传全丢、
+    # processing_ids 不释放、temp 里的成品变孤儿。
+    # 但**不能笼统捕获 BaseException**——KeyboardInterrupt 必须原样逃逸，
+    # Ctrl+C 就该中止整个流程。
     try:
         import tmdb_ids_to_links as fetcher
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         print(f"⚠️ 无法加载取流模块，跳过就地重取流: {exc}", flush=True)
         return []
 
@@ -829,34 +848,54 @@ def refetch_entries(entries, refetch_counts):
             executor.submit(fetcher.process_tmdb_id, entry["tmdbId"]): entry
             for entry in pending
         }
-        for future in as_completed(future_to_entry):
-            entry = future_to_entry[future]
-            tmdb_id = str(entry["tmdbId"])
-            refetch_counts[tmdb_id] = refetch_counts.get(tmdb_id, 0) + 1
-            try:
-                status, result = future.result()
-            except Exception as exc:
-                print(f"  [重取失败] {tmdb_id}: {exc}", flush=True)
-                continue
-            if status != "ok" or not result or not result.get("urls"):
-                # dead（源站确认无此片）与 retry（瞬时错误耗尽）都不再重投本轮：
-                # 前者救不回来，后者留给下次运行——本轮已无新链接可用。
-                print(f"  [重取无果] {tmdb_id}: {status}", flush=True)
-                continue
-            # 落盘新结果，与取流侧行为一致（追加写，下游按 fetched_at 择新）。
-            write_log(INPUT_JSONL, result)
-            # 用新 urls 覆盖 entry 的取流字段，其余元数据（title/year/runtime）保留：
-            # result 里同名字段来自 movies.jsonl 静态表，与 entry 一致，覆盖无害；
-            # 但 entry 可能带有 result 没有的历史字段，故用 update 而非整体替换。
-            new_entry = dict(entry)
-            new_entry["urls"] = result["urls"]
-            new_entry["fetched_at"] = result.get("fetched_at")
-            revived.append(new_entry)
-            print(f"  [重取成功] {tmdb_id}: {len(result['urls'])} 个新节点", flush=True)
+        # 带总超时地收集结果：as_completed 的 timeout 是**整体**预算，超时会抛
+        # TimeoutError 中断迭代。此时已完成的部分照常收下，仍在跑的直接放弃——
+        # 主循环不能为了捞回而僵在这里几十分钟（见 AUTO_REFETCH_TIMEOUT）。
+        try:
+            for future in as_completed(
+                future_to_entry, timeout=AUTO_REFETCH_TIMEOUT
+            ):
+                entry = future_to_entry[future]
+                tmdb_id = str(entry["tmdbId"])
+                refetch_counts[tmdb_id] = refetch_counts.get(tmdb_id, 0) + 1
+                try:
+                    status, result = future.result()
+                except (Exception, SystemExit) as exc:
+                    # 同 import 处：process_tmdb_id 内部也可能触发模块级的
+                    # SystemExit 式校验。单片重取失败绝不能带塌整批。
+                    print(f"  [重取失败] {tmdb_id}: {exc}", flush=True)
+                    continue
+                if status != "ok" or not result or not result.get("urls"):
+                    # dead（源站确认无此片）与 retry（瞬时错误耗尽）都不再重投本轮：
+                    # 前者救不回来，后者留给下次运行——本轮已无新链接可用。
+                    print(f"  [重取无果] {tmdb_id}: {status}", flush=True)
+                    continue
+                # 落盘新结果，与取流侧行为一致（追加写，下游按 fetched_at 择新）。
+                write_log(INPUT_JSONL, result)
+                # 用新 urls 覆盖 entry 的取流字段，其余元数据（title/year/runtime）
+                # 保留：entry 可能带有 result 没有的历史字段，故逐键覆盖而非整体替换。
+                new_entry = dict(entry)
+                new_entry["urls"] = result["urls"]
+                new_entry["fetched_at"] = result.get("fetched_at")
+                revived.append(new_entry)
+                print(
+                    f"  [重取成功] {tmdb_id}: {len(result['urls'])} 个新节点",
+                    flush=True,
+                )
+        except TimeoutError:
+            unfinished = sum(1 for f in future_to_entry if not f.done())
+            print(
+                f"⚠️ 重取已达 {AUTO_REFETCH_TIMEOUT}s 上限，放弃仍在跑的 "
+                f"{unfinished} 部（不是真淘汰，下次运行会再试），"
+                f"主循环继续推进下载。",
+                flush=True,
+            )
     except BaseException:
         executor.shutdown(wait=False, cancel_futures=True)
         raise
-    executor.shutdown(wait=True)
+    # 超时放弃的 future 不等它跑完：wait=False 让主循环立刻回到 wait(pending)，
+    # 已提交的取流请求在后台线程里自然收尾。
+    executor.shutdown(wait=False, cancel_futures=True)
 
     print(f"[自动重取流] 完成：{len(revived)}/{len(pending)} 部拿到新直链", flush=True)
     return revived
@@ -2661,9 +2700,10 @@ def main():
         print("\n===== 收尾自动补传 =====", flush=True)
         try:
             reupload_pending()
-        except Exception as exc:
+        except (Exception, SystemExit) as exc:
             # 补传失败不影响主流程的成功结论：成品仍留在本地且 pending 记录还在，
-            # 随时可以手动 reupload。
+            # 随时可以手动 reupload。SystemExit 一并兜住（避免收尾动作把已经跑完
+            # 的整次运行判成失败退出），但放过 KeyboardInterrupt。
             print(f"⚠️ 自动补传异常，成品仍留本地待手动 reupload: {exc}", flush=True)
 
 
@@ -3069,9 +3109,11 @@ def _run_pipeline():
             if AUTO_REFETCH_ENABLED and round_failed_expired and has_more_rounds:
                 try:
                     revived = refetch_entries(round_failed_expired, refetch_counts)
-                except Exception as exc:
+                except (Exception, SystemExit) as exc:
                     # 重取是尽力而为的捞回，绝不能让它崩掉整条流水线：
                     # 失败就当作没救回，本轮其余结论照常生效。
+                    # 连 SystemExit 一起兜（取流侧模块级校验用的就是它），
+                    # 但放过 KeyboardInterrupt——Ctrl+C 该中止整个流程。
                     print(f"⚠️ 就地重取流异常，已跳过本轮重取: {exc}", flush=True)
                     revived = []
 
