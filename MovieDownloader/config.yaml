@@ -212,12 +212,21 @@ download_movies:
   start_folder_index: 1
   # 并发控制
   max_workers: 32          # 同时下载的影片数
-  convert_workers: 16      # 独立的 FFmpeg 转封装线程数（与 upload_workers 对齐）
+  # 主循环同时持有的「下载 future」上限（分批投递深度）。必须 > max_workers，
+  # 否则下载池喂不满。一次性把整轮几十万部全投进 pending 会让 wait() 每次对全部
+  # 未完成 future 挂/摘 waiter，主循环退化成 O(N²)；分批后 wait 规模恒定。
+  # 留空/不配时默认 max_workers × 2。
+  download_queue_depth: 64
+  # 独立的 FFmpeg 转封装线程数。转封装是 `ffmpeg -c copy` 纯 IO 拷贝，并发过高
+  # 只会在同一块盘上互抢 IO，吞吐不升反降。
+  convert_workers: 8
   segment_concurrency: 64  # 单部影片同时下载的分片数
   # 画质探测与分片重试
   # 从影片"正中间"连续取 sample_count 段测码率，采样片测完即删、不复用为正片开头
   # （片头常是 logo/黑场/字幕卡等低动态画面，码率系统性偏低，会误杀压线的合格片）。
   # 代价是入选片多下这 sample_count 段，换取判定不被片头拉偏。
+  # 跳过规则：候选按声明高度降序试，一旦某流入选，后续「已声明分辨率且严格低于
+  # 已选中高度」的流不再采样（必然落选）。未声明分辨率的流仍会采样后 ffprobe。
   sample_count: 10
   seg_retry_max: 20
   seg_retry_delay: 1
@@ -329,6 +338,8 @@ download_movies:
     max_pending_uploads: 64  # 反压阈值：在途+排队上传数达到此值就阻塞下载，防磁盘撑爆
     upload_retry_max: 5      # 单文件上传最大重试次数
     upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避）
+    connect_timeout: 15      # boto3 连接超时（秒）：默认 60s 太长，R2 抖动时会顶满反压
+    read_timeout: 120        # boto3 读取超时（秒）
     # 等待上传槽位的上限（秒）。信号量 acquire 由主事件循环线程执行，绝不能无限期等：
     # R2 长时间消化不动时，下载完成的 future 无人处理、转封装不再提交、已下好的
     # 成品在 temp 里持续堆积（它们已交接给转封装阶段，不会被任何 finally 清理），

@@ -91,8 +91,18 @@ START_FOLDER_INDEX = _CFG.get("start_folder_index", 1)
 
 # 下载线程池固定保持的影片下载数。
 MAX_WORKERS = _CFG.get("max_workers", 32)
+# 主循环同时持有的"下载 future"上限（分批投递深度）。
+# 一次性把整轮几十万部全 submit 进 pending，会让 wait(FIRST_COMPLETED) 每次都对
+# 全部未完成 future 挂/摘 waiter，主循环退化成 O(N²)。分批后 wait 规模恒定在
+# 槽位量级。必须 > max_workers，否则下载池喂不满、并发上不去。
+DOWNLOAD_QUEUE_DEPTH = max(
+    int(MAX_WORKERS) + 1,
+    int(_CFG.get("download_queue_depth", int(MAX_WORKERS) * 2)),
+)
 # 独立的 FFmpeg 转封装/移动线程数，不占用上面的下载槽位。
-CONVERT_WORKERS = _CFG.get("convert_workers", 16)
+# 转封装是 `ffmpeg -c copy` 纯 IO 拷贝，并发过高只会在同一块盘上互抢 IO，
+# 吞吐不升反降，故取值明显低于 max_workers。
+CONVERT_WORKERS = _CFG.get("convert_workers", 8)
 # 单部影片同时下载的分片数。
 SEGMENT_CONCURRENCY = _CFG.get("segment_concurrency", 64)
 TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
@@ -185,6 +195,10 @@ UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
 MAX_PENDING_UPLOADS = _S3_CFG.get("max_pending_uploads", 64)
 UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
 UPLOAD_RETRY_DELAY = _S3_CFG.get("upload_retry_delay", 3)
+# boto3 连接/读取超时（秒）。botocore 默认 60s 连接超时太长：R2 抖动时上传
+# worker 全被顶住，反压信号量迅速耗尽，进而触发主循环的 300s 槽位等待降级。
+S3_CONNECT_TIMEOUT = float(_S3_CFG.get("connect_timeout", 15))
+S3_READ_TIMEOUT = float(_S3_CFG.get("read_timeout", 120))
 # 等待上传槽位的上限（秒）。超时即降级为"留本地 + 写 pending"，绝不无限期等：
 # acquire 由主事件循环线程调用，一旦挂住，下载完成的 future 无人处理、转封装
 # 不再提交、已下好的 final_ts 在 temp 里持续堆积（它们已交接给转封装阶段，
@@ -252,6 +266,8 @@ def get_s3_client():
                 config=BotoConfig(
                     signature_version="s3v4",
                     retries={"max_attempts": 1, "mode": "standard"},
+                    connect_timeout=S3_CONNECT_TIMEOUT,
+                    read_timeout=S3_READ_TIMEOUT,
                 ),
             )
     return _s3_client
@@ -504,9 +520,14 @@ def scan_downloaded_mp4_ids():
 
     返回 (ID 集合, 重复文件字典)。同一 ID 出现在多个目录时只报告，
     不自动删除已有文件。
+
+    顺带清理 0 字节 mp4：那是 move_to_target_folder 落了占位文件后、移动完成前
+    进程被杀留下的孤儿，既不是有效成品也不该白占目录名额。只删大小为 0 的，
+    有内容的文件一律不动。
     """
     downloaded_ids = set()
     locations = {}
+    orphan_count = 0
 
     if not os.path.isdir(BASE_DIR):
         return downloaded_ids, {}
@@ -537,6 +558,9 @@ def scan_downloaded_mp4_ids():
                     continue
                 try:
                     if file_entry.stat(follow_symlinks=False).st_size <= 0:
+                        # 0 字节孤儿：占位后进程被杀留下的残骸，直接清掉。
+                        remove_file(file_entry.path)
+                        orphan_count += 1
                         continue
                 except OSError:
                     continue
@@ -548,6 +572,9 @@ def scan_downloaded_mp4_ids():
                     continue
                 downloaded_ids.add(tmdb_id)
                 locations.setdefault(tmdb_id, []).append(file_entry.path)
+
+    if orphan_count:
+        print(f"已清理 {orphan_count} 个 0 字节 mp4 孤儿（移动中断留下的占位文件）")
 
     duplicates = {
         tmdb_id: paths for tmdb_id, paths in locations.items() if len(paths) > 1
@@ -899,11 +926,15 @@ def clean_temp_directory():
 
 def move_to_target_folder(temp_mp4, tmdb_id):
     """
-    在同一把锁内选择目录并移动文件，防止高并发时目录容量超限。
+    先在锁内选定落点目录并占位，再在锁外执行移动，防止高并发时目录容量超限。
     shutil.move 同时支持跨文件系统移动。
 
     用模块级游标 _current_folder_index 缓存"当前正在填的目录号"，从它起找而非
     每次从 START 全量重扫已满目录，把大批量下的 O(N²) listdir 降为 ~O(N)。
+
+    移动本身放在锁外：base_dir 与 temp_dir 跨盘时 shutil.move 是 copy+delete，
+    一部片要几十秒；若在锁内做，所有转封装 worker 会被这把全局锁完全串行化。
+    锁内已用 0 字节占位文件把目标名额定死，故锁外移动不会导致目录超容量。
     """
     global _current_folder_index
     with folder_lock:
@@ -922,19 +953,26 @@ def move_to_target_folder(temp_mp4, tmdb_id):
             if mp4_count < MAX_VIDEOS_PER_FOLDER or os.path.exists(final_path):
                 # 缓存住当前落点目录：下次从这里起找，跳过前面已满目录。
                 _current_folder_index = index
-                remove_file(final_path)
-                print(f"  [{tmdb_id}] 正在移动到: {final_path}", flush=True)
-                # 跨文件系统时 shutil.move 是 copy+del，若 copy 中途失败
-                # （目标盘写满/IO 错误）会在 final_path 留下半成品 mp4：它不在
-                # cleanup_paths、去重表也无登记，会成孤儿并白占目录名额。故失败
-                # 时先清掉半成品再抛出，交由上层按转封装失败处理。
-                try:
-                    shutil.move(temp_mp4, final_path)
-                except Exception:
-                    remove_file(final_path)
-                    raise
-                return final_path
+                # 占位：立即以空文件占住该名额，这样并发的其它 worker 在锁内
+                # 计数时就能看到它，不会把同一目录算成未满而超容量。空文件的
+                # 大小为 0，扫描去重（scan_downloaded_mp4_ids 只认非空 mp4）
+                # 也不会把它误判为已下载成品。
+                with open(final_path, "wb"):
+                    pass
+                break
             index += 1
+
+    print(f"  [{tmdb_id}] 正在移动到: {final_path}", flush=True)
+    # 锁外移动：失败时清掉占位/半成品，交由上层按转封装失败处理。
+    # 跨文件系统时 shutil.move 是 copy+del，若 copy 中途失败（目标盘写满/IO
+    # 错误）会在 final_path 留下半成品 mp4：它不在 cleanup_paths、去重表也无
+    # 登记，会成孤儿并白占目录名额。
+    try:
+        shutil.move(temp_mp4, final_path)
+    except Exception:
+        remove_file(final_path)
+        raise
+    return final_path
 
 
 # ---------- M3U8 解析 ----------
@@ -1956,6 +1994,17 @@ def process_one_entry(entry, processed_ids):
         best_selected = False
 
         for resolution, playlist_url, _declared_bandwidth, size in candidates:
+            # 候选已按声明高度降序排列。走到"声明高度严格低于已选中流"的候选时，
+            # 它即便采样也必然落选（择优是高度绝对优先），故这里跳过纯属浪费的采样。
+            # 三个合取项缺一不可：
+            #   size is not None —— 未声明分辨率的流排在末尾，真实高度未知，
+            #     必须采样后 ffprobe，跳过会丢画质；
+            #   best_selected —— 只有真正选中过某流才生效，否则最高档瞬时抖动
+            #     挂掉后整片会因"无一入选"白白失败，直接损失成功率；
+            #   严格小于 —— 同高度的仍要采样比码率。
+            if size is not None and best_selected and size[1] < best_height:
+                print(f"  跳过流 {resolution}：声明高度低于已选中的 {best_resolution}")
+                continue
             print(f"  检测流 {resolution}: {playlist_url}")
             sample_path = os.path.join(
                 TEMP_DIR,
@@ -2787,29 +2836,45 @@ def _run_pipeline():
                     flush=True,
                 )
 
-            # 注入本轮下载 future，并单独跟踪“本轮下载 future”集合。
+            # 分批投递：不再一次性把整轮全部影片 submit 进 pending。同时存在的
+            # 下载 future 上限为 DOWNLOAD_QUEUE_DEPTH，wait() 每次挂/摘 waiter
+            # 的规模从 O(整轮片数) 降到 O(槽位数)——全量重跑几十万部时，一次性
+            # 全投会让主循环退化成 O(N²) 空转，把 CPU 耗在 waiter 管理上。
+            # 语义完全不变：本轮每一部仍会被逐一投递，且全部有结论后才进下一轮；
+            # 附带收益是磁盘占用更平滑（未投递的片不占 temp）。
+            next_submit = 0
             round_download_futures = set()
-            for entry in current_batch:
-                f = download_executor.submit(
-                    process_one_entry, entry, processed_ids
-                )
-                download_future_to_entry[f] = entry
-                stage_of[f] = "download"
-                pending.add(f)
-                round_download_futures.add(f)
+
+            def submit_downloads():
+                nonlocal next_submit
+                while (
+                    len(round_download_futures) < DOWNLOAD_QUEUE_DEPTH
+                    and next_submit < len(current_batch)
+                ):
+                    entry = current_batch[next_submit]
+                    next_submit += 1
+                    f = download_executor.submit(
+                        process_one_entry, entry, processed_ids
+                    )
+                    download_future_to_entry[f] = entry
+                    stage_of[f] = "download"
+                    pending.add(f)
+                    round_download_futures.add(f)
 
             round_failed_retriable = []
+            submit_downloads()
 
             # 关键：只等“本轮下载 future”全部离开 download 阶段即算本轮下载完成，
             # 不等 pending 全空。上一轮遗留的转封装/上传在同一循环里并行推进，
             # 但不阻塞本轮判定——这正是方案 A 的并行精髓。
-            remaining_downloads = set(round_download_futures)
-            while remaining_downloads:
+            # 循环条件涵盖“还有在途下载”或“还有未投递的片”，二者皆空才收尾；
+            # 此时 pending 必非空（submit_downloads 已在上一轮末尾补满），
+            # 不会出现 wait 空集合的忙等。
+            while round_download_futures or next_submit < len(current_batch):
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
                 for future in done:
                     pending.discard(future)
-                    if future in remaining_downloads:
-                        remaining_downloads.discard(future)
+                    round_download_futures.discard(future)
                     # 单个 future 处理若抛异常（如日志写盘 OSError/磁盘满、
                     # 状态字典错位 KeyError），只记录并跳过，绝不让异常逃逸出
                     # 主循环——否则同批其余 future 全丢、整条流水线崩溃、在途
@@ -2819,6 +2884,8 @@ def _run_pipeline():
                         handle_done_future(future, round_failed_retriable)
                     except Exception as exc:
                         print(f"⚠️ future 处理异常，已跳过该条: {exc}", flush=True)
+                # 腾出槽位后立即补投，保持下载池始终满载。
+                submit_downloads()
 
             # 本轮下载全部有结论，决定是否再来一轮。
             if not round_failed_retriable:

@@ -4,9 +4,27 @@
 mp4 直链请求头、失败分类与被拒原因归类。全部为纯函数级测试，不联网。
 """
 
+import os
+
 import pytest
 
 import download_movies as d
+
+
+@pytest.fixture
+def sandbox(tmp_path, monkeypatch):
+    """把模块级路径全部指到 tmp_path，并重置共享状态。"""
+    monkeypatch.setattr(d, "BASE_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setattr(d, "TEMP_DIR", str(tmp_path / "temp"))
+    monkeypatch.setattr(d, "SUCCESS_LOG", str(tmp_path / "success.jsonl"))
+    monkeypatch.setattr(d, "FAILED_LOG", str(tmp_path / "failed.jsonl"))
+    monkeypatch.setattr(d, "UPLOAD_PENDING_LOG", str(tmp_path / "pending.jsonl"))
+    monkeypatch.setattr(d, "FOLDER_PREFIX", "movie_")
+    monkeypatch.setattr(d, "START_FOLDER_INDEX", 1)
+    monkeypatch.setattr(d, "_current_folder_index", 1)
+    monkeypatch.setattr(d, "processing_ids", set())
+    os.makedirs(d.TEMP_DIR, exist_ok=True)
+    return tmp_path
 
 
 # -------------------------------------------------------------- urls 条目归一
@@ -210,3 +228,216 @@ def test_entries_without_timestamp_keep_the_first():
 def test_entries_missing_tmdb_id_are_dropped():
     rows = [{"tmdbId": None, "urls": ["x"]}, {"urls": ["y"]}, {"tmdbId": "7", "urls": ["z"]}]
     assert list(_pick_latest(rows)) == ["7"]
+
+
+# ---------------------------------------------- 候选流采样提前终止（画质择优）
+
+def _sampling_env(monkeypatch, variants):
+    """多 variant 采样场景的公共桩：返回记录被采样流 url 的 list。"""
+    sampled = []
+    seg_urls = [f"https://cdn/s{i}.ts" for i in range(20)]
+
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None, headers=None: variants,
+    )
+
+    def fake_media(url, headers=None):
+        sampled.append(url)
+        return seg_urls, [4.0] * 20, None
+
+    monkeypatch.setattr(d, "parse_media_playlist", fake_media)
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    monkeypatch.setattr(d, "SAMPLE_COUNT", 4)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+    # 红线压到 360：否则 720/480 会在候选过滤阶段（声明高度低于红线）就被剔除，
+    # 根本进不了采样循环，测不出"选中后跳过更低流"这条逻辑。
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 360)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
+
+    def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
+                      init_url=None, force_init=False, headers=None):
+        if end_idx is None:
+            end_idx = len(urls)
+        n = end_idx - start_idx
+        with open(out, "wb") as fh:
+            fh.write(b"x" * n)
+        return n * 1_000_000, [], 0   # 2000 kbps，稳过 1000 门槛
+
+    monkeypatch.setattr(d, "download_segments", fake_download)
+    return sampled
+
+
+def test_variant_sampling_stops_after_higher_stream_wins(sandbox, monkeypatch):
+    """选中 1080 后，声明高度更低的流不再采样。
+
+    候选已按声明高度降序排，且有声明分辨率的流直接采信声明值（不做 ffprobe），
+    择优又是"高度绝对优先"——更低的流即便采样也必然落选，那次"解析 media
+    playlist + 下载 N 个分片 + 两次 ffprobe"是纯浪费。一个 master 常有
+    1080/720/480/360 四档，白花的是三份采样流量。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    sampled = _sampling_env(monkeypatch, [
+        ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        ("1280x720", "https://cdn/720.m3u8", 3000.0),
+        ("854x480", "https://cdn/480.m3u8", 1500.0),
+    ])
+
+    entry = {"tmdbId": "55", "urls": ["u"]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    assert job["resolution"] == "1920x1080"
+    assert sampled == ["https://cdn/1080.m3u8"]
+
+
+def test_variant_sampling_still_compares_same_height(sandbox, monkeypatch):
+    """同声明高度的流必须全部采样——要比采样码率才能择优。"""
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    sampled = _sampling_env(monkeypatch, [
+        ("1920x1080", "https://cdn/a.m3u8", 5000.0),
+        ("1920x1080", "https://cdn/b.m3u8", 4000.0),
+        ("1280x720", "https://cdn/c.m3u8", 3000.0),
+    ])
+
+    entry = {"tmdbId": "55", "urls": ["u"]}
+    _, ok, _job = d.process_one_entry(entry, set())
+    assert ok is True
+    # 两个 1080 都采样，720 被跳过
+    assert sampled == ["https://cdn/a.m3u8", "https://cdn/b.m3u8"]
+
+
+def test_variant_sampling_still_probes_undeclared(sandbox, monkeypatch):
+    """未声明分辨率的流不能跳过：真实高度可能更高，必须采样后 ffprobe。
+
+    master 无 RESOLUTION 属性时这类流被排在末尾（用 -1 排序），若按"声明高度
+    更低"一并跳过，就会把实际更清晰的流丢掉，直接违背画质择优目标。
+    """
+    # 未声明的那条实测为 2160p，应当胜出
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (3840, 2160))
+    sampled = _sampling_env(monkeypatch, [
+        ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        (None, "https://cdn/unknown.m3u8", 4000.0),
+    ])
+    # 门槛按 (h/1080)² 缩放，2160p 需 4 倍基准；压低基准让桩数据能过关，
+    # 本用例要验的是采样顺序而非码率曲线。
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 100.0})
+
+    entry = {"tmdbId": "55", "urls": ["u"]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    assert sampled == ["https://cdn/1080.m3u8", "https://cdn/unknown.m3u8"]
+    assert job["resolution"] == "3840x2160"
+
+
+def test_variant_sampling_continues_after_failure(sandbox, monkeypatch):
+    """最高档采样失败（未选中）时，后续较低流仍要采样。
+
+    跳过条件绑定 best_selected：只有真正选中过某流才生效。否则瞬时抖动让最高
+    档挂掉后，整片会因"无一入选"而白白失败，直接损失成功率。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    sampled = _sampling_env(monkeypatch, [
+        ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        ("1280x720", "https://cdn/720.m3u8", 3000.0),
+    ])
+    seg_urls = [f"https://cdn/s{i}.ts" for i in range(20)]
+
+    def flaky_media(url, headers=None):
+        sampled.append(url)
+        if "1080" in url:
+            raise RuntimeError("采样抖动")
+        return seg_urls, [4.0] * 20, None
+
+    monkeypatch.setattr(d, "parse_media_playlist", flaky_media)
+
+    entry = {"tmdbId": "55", "urls": ["u"]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    assert sampled == ["https://cdn/1080.m3u8", "https://cdn/720.m3u8"]
+    assert job["resolution"] == "1280x720"
+
+
+# ------------------------------------------------------ 落点目录：占位 + 锁外移动
+
+def test_move_places_holder_inside_lock_then_moves_outside(sandbox, monkeypatch):
+    """移动必须在锁外执行，锁内只落 0 字节占位定名额。
+
+    base_dir 与 temp_dir 跨盘时 shutil.move 是 copy+delete，一部片几十秒；
+    若在锁内做，所有转封装 worker 会被这把全局锁完全串行化。
+    """
+    seen = {}
+
+    def fake_move(src, dst):
+        # 移动进行时锁必须是空闲的（可被别的线程拿到）；同时占位文件已存在。
+        seen["lock_free"] = d.folder_lock.acquire(blocking=False)
+        if seen["lock_free"]:
+            d.folder_lock.release()
+        seen["holder_exists"] = os.path.exists(dst)
+        seen["holder_size"] = os.path.getsize(dst)
+        os.replace(src, dst)
+
+    monkeypatch.setattr(d.shutil, "move", fake_move)
+    src = os.path.join(d.TEMP_DIR, "temp_55.mp4")
+    with open(src, "wb") as fh:
+        fh.write(b"data")
+
+    final_path = d.move_to_target_folder(src, "55")
+    assert seen["lock_free"] is True
+    assert seen["holder_exists"] is True and seen["holder_size"] == 0
+    assert os.path.getsize(final_path) == 4
+
+
+def test_holder_counts_toward_folder_capacity(sandbox, monkeypatch):
+    """占位文件必须被目录容量计数算进去，否则并发下同一目录会超容量。"""
+    monkeypatch.setattr(d, "MAX_VIDEOS_PER_FOLDER", 1)
+    # 第一次移动卡在锁外（模拟慢速跨盘拷贝未完成），此时只有占位文件在目录里。
+    monkeypatch.setattr(d.shutil, "move", lambda src, dst: None)
+    src = os.path.join(d.TEMP_DIR, "temp_1.mp4")
+    open(src, "wb").close()
+    first = d.move_to_target_folder(src, "1")
+
+    # 第二部片必须落到下一个目录，而不是与占位文件挤在同一个已满目录里。
+    second = d.move_to_target_folder(src, "2")
+    assert os.path.dirname(first) != os.path.dirname(second)
+
+
+def test_failed_move_removes_holder(sandbox, monkeypatch):
+    """移动失败要清掉占位/半成品，否则它既非成品又白占目录名额。"""
+    def boom(src, dst):
+        with open(dst, "wb") as fh:
+            fh.write(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(d.shutil, "move", boom)
+    src = os.path.join(d.TEMP_DIR, "temp_55.mp4")
+    open(src, "wb").close()
+
+    with pytest.raises(OSError):
+        d.move_to_target_folder(src, "55")
+
+    folder = os.path.join(d.BASE_DIR, "movie_000001")
+    assert os.listdir(folder) == []
+
+
+# ---------------------------------------------------------- 0 字节孤儿清理
+
+def test_scan_removes_zero_byte_orphans(sandbox):
+    """0 字节 mp4 是占位后进程被杀留下的残骸：既要清掉，也绝不能算已下载。
+
+    若只跳过不删，它会永久占住目录名额；若算作已下载，该片会被永久跳过、
+    再也不会被重新下载。
+    """
+    folder = os.path.join(d.BASE_DIR, "movie_000001")
+    os.makedirs(folder)
+    orphan = os.path.join(folder, "11.mp4")
+    open(orphan, "wb").close()
+    real = os.path.join(folder, "22.mp4")
+    with open(real, "wb") as fh:
+        fh.write(b"x")
+
+    ids, dups = d.scan_downloaded_mp4_ids()
+    assert ids == {"22"}
+    assert dups == {}
+    assert not os.path.exists(orphan)
+    assert os.path.exists(real)
