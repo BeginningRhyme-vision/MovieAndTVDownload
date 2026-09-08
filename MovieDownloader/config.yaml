@@ -163,7 +163,9 @@ download_movies:
   convert_workers: 16      # 独立的 FFmpeg 转封装线程数（与 upload_workers 对齐）
   segment_concurrency: 64  # 单部影片同时下载的分片数
   # 画质探测与分片重试
-  # 采样前 sample_count 段测码率并复用为正片开头（避免重复下载）。
+  # 从影片"正中间"连续取 sample_count 段测码率，采样片测完即删、不复用为正片开头
+  # （片头常是 logo/黑场/字幕卡等低动态画面，码率系统性偏低，会误杀压线的合格片）。
+  # 代价是入选片多下这 sample_count 段，换取判定不被片头拉偏。
   sample_count: 10
   seg_retry_max: 20
   seg_retry_delay: 1
@@ -275,6 +277,12 @@ download_movies:
     max_pending_uploads: 64  # 反压阈值：在途+排队上传数达到此值就阻塞下载，防磁盘撑爆
     upload_retry_max: 5      # 单文件上传最大重试次数
     upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避）
+    # 等待上传槽位的上限（秒）。信号量 acquire 由主事件循环线程执行，绝不能无限期等：
+    # R2 长时间消化不动时，下载完成的 future 无人处理、转封装不再提交、已下好的
+    # 成品在 temp 里持续堆积（它们已交接给转封装阶段，不会被任何 finally 清理），
+    # 整条流水线连同磁盘一起被远端故障拖垮。超时即降级为「留本地 + 写 pending」，
+    # 主循环继续推进下载与转封装，事后用 reupload 子命令补传。
+    upload_slot_wait_timeout: 300
     delete_local_after_upload: true   # 上传成功后删除本地 mp4（全量必开，否则磁盘累积撑爆）
   # ---- 磁盘水位监控（兜底）----
   # 反压按"上传数量"封顶，兜不住大文件/上传持续失败堆积/enabled=false 等场景。

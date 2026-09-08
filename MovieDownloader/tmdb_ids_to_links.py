@@ -607,7 +607,10 @@ def process_tmdb_id(tmdb_id, providers=None):
                     result = {
                         "urls": urls,
                         "tmdbId": tmdb_id,
-                        "title": result_title,
+                        # 只有 vidlink/videasy 命中时源站不返回片名，result_title
+                        # 会是 None。兜底成空串，保证契约里 title 恒为 str——
+                        # 否则 None 会一路透传到 success.jsonl 与日志里打成 "None"。
+                        "title": result_title or "",
                         # 取流时刻（秒级时间戳）。results.jsonl 是追加写，同一片多轮重试会留下
                         # 多行；下游据此挑真正最新的一条。对 vidlink 这类带时效签名的直链尤为
                         # 关键：拿到过期 url 等于白跑一次下载。

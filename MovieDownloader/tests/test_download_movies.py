@@ -141,3 +141,55 @@ def test_reject_reason_rules_are_ordered_before_generic_ones():
     reason = d.classify_reject_reason(
         f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: https://cdn/a.mp4")
     assert "重新取流" in reason
+
+
+# ------------------------------------------------ 输入去重按 fetched_at 择新
+
+def _pick_latest(rows):
+    """复刻 main() 读入阶段的择新逻辑，用于单测（主流程耦合文件 IO 不便直接调）。"""
+    by_id = {}
+    for entry in rows:
+        tid = d.normalize_tmdb_id(entry.get("tmdbId"))
+        if not tid:
+            continue
+        prev = by_id.get(tid)
+        if prev is None:
+            by_id[tid] = entry
+            continue
+        new_ts = d.parse_int(entry.get("fetched_at"))
+        old_ts = d.parse_int(prev.get("fetched_at"))
+        if (new_ts if new_ts is not None else -1) > (old_ts if old_ts is not None else -1):
+            by_id[tid] = entry
+    return by_id
+
+
+def test_duplicate_entries_keep_the_newest_fetch():
+    """results.jsonl 是追加写，同一片多轮重试会留下多行且不保证越靠后越新。
+    必须按 fetched_at 取最新——vidlink 直链带时效签名，拿到旧的等于白跑一次下载。"""
+    rows = [
+        {"tmdbId": "1", "fetched_at": 200, "urls": ["new"]},
+        {"tmdbId": "1", "fetched_at": 100, "urls": ["old"]},   # 后出现但更旧
+    ]
+    assert _pick_latest(rows)["1"]["urls"] == ["new"]
+
+
+def test_entry_with_timestamp_beats_one_without():
+    rows = [
+        {"tmdbId": "1", "urls": ["no-ts"]},
+        {"tmdbId": "1", "fetched_at": 5, "urls": ["has-ts"]},
+    ]
+    assert _pick_latest(rows)["1"]["urls"] == ["has-ts"]
+
+
+def test_entries_without_timestamp_keep_the_first():
+    # 都无戳时维持旧的位置语义（先出现者胜），不引入随机性
+    rows = [
+        {"tmdbId": "1", "urls": ["first"]},
+        {"tmdbId": "1", "urls": ["second"]},
+    ]
+    assert _pick_latest(rows)["1"]["urls"] == ["first"]
+
+
+def test_entries_missing_tmdb_id_are_dropped():
+    rows = [{"tmdbId": None, "urls": ["x"]}, {"urls": ["y"]}, {"tmdbId": "7", "urls": ["z"]}]
+    assert list(_pick_latest(rows)) == ["7"]

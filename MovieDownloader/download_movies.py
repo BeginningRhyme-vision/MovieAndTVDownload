@@ -185,6 +185,11 @@ UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
 MAX_PENDING_UPLOADS = _S3_CFG.get("max_pending_uploads", 64)
 UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
 UPLOAD_RETRY_DELAY = _S3_CFG.get("upload_retry_delay", 3)
+# 等待上传槽位的上限（秒）。超时即降级为"留本地 + 写 pending"，绝不无限期等：
+# acquire 由主事件循环线程调用，一旦挂住，下载完成的 future 无人处理、转封装
+# 不再提交、已下好的 final_ts 在 temp 里持续堆积（它们已交接给转封装阶段，
+# 不会被任何 finally 清理），整条流水线连同磁盘一起被远端故障拖垮。
+UPLOAD_SLOT_WAIT_TIMEOUT = float(_S3_CFG.get("upload_slot_wait_timeout", 300))
 DELETE_LOCAL_AFTER_UPLOAD = bool(_S3_CFG.get("delete_local_after_upload", True))
 
 # ---- 磁盘水位监控（兜底）配置 ----
@@ -1747,27 +1752,37 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
                     next_submit += 1
 
             refill()
-            while future_to_index:
-                done, _ = wait(future_to_index.keys(), return_when=FIRST_COMPLETED)
-                for future in done:
-                    index = future_to_index.pop(future)
-                    try:
-                        done_buffer[index] = future.result()
-                    except Exception as exc:
-                        if failure is None:
-                            failure = exc
-                while write_cursor < len(chunks) and write_cursor in done_buffer:
-                    output_file.write(done_buffer.pop(write_cursor))
-                    write_cursor += 1
-                if failure is not None:
-                    # 置位中止信号 + 取消未启动块：在跑的块会在下次重试点立即
-                    # 退出，整片失败能在秒级归还下载槽位并换下一个取流节点。
-                    # 残留文件由上层节点循环清理。
-                    abort_event.set()
-                    for future in list(future_to_index):
-                        future.cancel()
-                    break
-                refill()
+            try:
+                while future_to_index:
+                    done, _ = wait(future_to_index.keys(), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        index = future_to_index.pop(future)
+                        try:
+                            done_buffer[index] = future.result()
+                        except Exception as exc:
+                            if failure is None:
+                                failure = exc
+                    while write_cursor < len(chunks) and write_cursor in done_buffer:
+                        output_file.write(done_buffer.pop(write_cursor))
+                        write_cursor += 1
+                    if failure is not None:
+                        # 置位中止信号 + 取消未启动块：在跑的块会在下次重试点立即
+                        # 退出，整片失败能在秒级归还下载槽位并换下一个取流节点。
+                        # 残留文件由上层节点循环清理。
+                        abort_event.set()
+                        for future in list(future_to_index):
+                            future.cancel()
+                        break
+                    refill()
+            except BaseException:
+                # 写盘失败（磁盘满/IO 错误）或 Ctrl+C 时，异常会直接穿出本块。
+                # 若不在这里置位中止信号，with ThreadPoolExecutor 退出时的
+                # shutdown(wait=True) 会干等所有在途块跑满退避（每块最坏
+                # SEG_RETRY_MAX 次 × 数十秒 ≈ 十几分钟）才肯放行。
+                abort_event.set()
+                for future in list(future_to_index):
+                    future.cancel()
+                raise
         output_file.flush()
 
     if failure is not None:
@@ -1814,7 +1829,9 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
 def process_one_entry(entry, processed_ids):
     tmdb_id = entry.get("tmdbId")
     normalized_id = normalize_tmdb_id(tmdb_id)
-    title = entry.get("title", "")
+    # 旧 results.jsonl 里 title 可能是 null（键存在值为 None，此时 .get 的默认值
+    # 不生效），会一路透传进 success.jsonl 并在日志里打成 "None"。统一兜底成 str。
+    title = entry.get("title") or ""
     # urls 元素兼容 str（历史 vidup m3u8）与 dict（多源：m3u8/mp4 + headers）。
     urls = [
         node for node in (
@@ -1836,13 +1853,6 @@ def process_one_entry(entry, processed_ids):
             print(f"跳过当前运行中的重复条目: {tmdb_id}")
             return tmdb_id, False, {"error": "duplicate entry currently processing"}
         processing_ids.add(normalized_id)
-
-    # 磁盘水位兜底：仅在此处（尚未开始任何下载动作前）阻塞。磁盘吃紧时新片
-    # 在闸门前等待，不会占用 temp/带宽；已在跑的下载不受影响。
-    wait_for_disk_gate()
-
-    print(f"\n开始处理: {tmdb_id} - {title}")
-    os.makedirs(TEMP_DIR, exist_ok=True)
 
     handed_off_to_conversion = False
     cleanup_paths = set()
@@ -2139,6 +2149,20 @@ def process_one_entry(entry, processed_ids):
         return conversion_job
 
     try:
+        # ID 锁一旦持有，任何可能抛异常的动作都必须在 try 内，否则会绕过 finally
+        # 的 discard，让该 ID 永久停在"处理中"。后果是静默丢片：下一轮重投会命中
+        # "duplicate entry currently processing"，而该文案在 ignored_errors 里被
+        # 直接跳过——既不写 FAILED_LOG 也不再重试，这部片就此消失。
+        # os.makedirs 会因权限/ENOSPC 抛 OSError，print 会因 stdout 断管抛
+        # BrokenPipeError，都不是理论风险。
+        #
+        # 磁盘水位兜底：仅在此处（尚未开始任何下载动作前）阻塞。磁盘吃紧时新片
+        # 在闸门前等待，不会占用 temp/带宽；已在跑的下载不受影响。
+        wait_for_disk_gate()
+
+        print(f"\n开始处理: {tmdb_id} - {title}")
+        os.makedirs(TEMP_DIR, exist_ok=True)
+
         # 方案C：依次尝试各取流节点，任一节点下完即成功；全部失败才判失败。
         conversion_job = None
         last_exc = None
@@ -2447,7 +2471,8 @@ def _run_pipeline():
         return
 
     entries = []
-    input_ids = set()
+    entry_by_id = {}
+    invalid_input_count = 0
     duplicate_input_count = 0
     with open(INPUT_JSONL, "r", encoding="utf-8") as file:
         for line_number, line in enumerate(file, 1):
@@ -2461,16 +2486,34 @@ def _run_pipeline():
                 continue
 
             normalized_id = normalize_tmdb_id(entry.get("tmdbId"))
-            if normalized_id and normalized_id in input_ids:
-                duplicate_input_count += 1
+            if not normalized_id:
+                # 缺身份字段的行读入即跳过：留着也只会在 process_one_entry 里
+                # 判"缺少 tmdbId 或 urls"，把一条残缺输入放大成一条 FAILED_LOG。
+                invalid_input_count += 1
                 continue
-            if normalized_id:
-                input_ids.add(normalized_id)
-            entries.append(entry)
+            previous = entry_by_id.get(normalized_id)
+            if previous is None:
+                entry_by_id[normalized_id] = entry
+                continue
+            duplicate_input_count += 1
+            # results.jsonl 是追加写：同一片经多轮重试/复扫会留下多行，且
+            # **不保证越靠后越新**。必须按 fetched_at 取真正最新的一条——
+            # vidlink 的 mp4 直链带时效签名，拿到旧的等于白跑一次下载。
+            # 无戳时回退 -1（有戳的一定胜出；都无戳则保留先出现者，维持旧行为）。
+            # 括号不能省：`a or -1 > b` 会按 `a or (-1 > b)` 结合，恒真。
+            new_ts = parse_int(entry.get("fetched_at"))
+            old_ts = parse_int(previous.get("fetched_at"))
+            if (new_ts if new_ts is not None else -1) > (
+                old_ts if old_ts is not None else -1
+            ):
+                entry_by_id[normalized_id] = entry
+
+    entries = list(entry_by_id.values())
 
     print(
         f"共读取 {len(entries)} 个去重后的条目；"
-        f"输入文件内跳过 {duplicate_input_count} 个重复 ID"
+        f"输入文件内跳过 {duplicate_input_count} 个重复 ID（按 fetched_at 取最新）"
+        + (f"；跳过 {invalid_input_count} 个缺 tmdbId 的行" if invalid_input_count else "")
     )
 
     ignored_errors = {
@@ -2621,7 +2664,52 @@ def _run_pipeline():
             # 在途+排队的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载
             # 会在此阻塞主循环，从而钳制本地磁盘占用上限。release 由 future
             # 完成回调对称释放，保证无论上传成功/异常/取消都不泄漏信号量。
-            upload_semaphore.acquire()
+            #
+            # 但绝不能无限期等：本函数由主事件循环线程调用，等满
+            # UPLOAD_SLOT_WAIT_TIMEOUT 仍拿不到槽位，说明 R2 长时间消化不动，
+            # 此时降级——不提交上传、成品留本地并写 pending，主循环继续推进
+            # 下载与转封装，事后用 reupload 子命令补传。宁可暂时不传，也不让
+            # 远端故障拖垮本地下载产能。
+            #
+            # S3_ENABLED=False 时上传任务只写日志、秒回，不可能积压；万一
+            # 仍走到这里也不能写 pending——纯本地模式下的成品无需补传，
+            # 塞进 pending 只会污染 reupload 的输入。故降级只对开启上传生效。
+            if not upload_semaphore.acquire(timeout=UPLOAD_SLOT_WAIT_TIMEOUT):
+                degrade_reason = (
+                    f"上传积压超过 {UPLOAD_SLOT_WAIT_TIMEOUT:g}s 未消化，"
+                    f"本片降级为留本地待补传"
+                )
+                if S3_ENABLED:
+                    try:
+                        write_pending({
+                            "tmdbId": tmdb_id,
+                            "title": info.get("title", ""),
+                            "year": info.get("year"),
+                            "local_path": info.get("final_path"),
+                            "s3_key": "",
+                            "fail_reason": degrade_reason,
+                            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                    except Exception as exc:
+                        print(f"⚠️ 降级写 pending 失败: {tmdb_id}: {exc}", flush=True)
+                # 记 SUCCESS_LOG(uploaded=false) 防止下次运行重新下载。用
+                # update_success_log 按 tmdbId 覆盖写（而非 write_log 追加）：
+                # 后续 reupload 补传成功时也走同一函数覆盖同一条，保证
+                # SUCCESS_LOG "每片一条" 的设计意图不被破坏。
+                info["uploaded"] = False
+                try:
+                    update_success_log(tmdb_id, info)
+                except Exception as exc:
+                    print(f"⚠️ 降级写 success 日志失败: {tmdb_id}: {exc}", flush=True)
+                write_log(FAILED_LOG, {
+                    "tmdbId": tmdb_id,
+                    "title": entry.get("title", ""),
+                    "urls": entry.get("urls", []),
+                    "error": degrade_reason,
+                    "stage": "upload",
+                })
+                print(f"⚠️ {tmdb_id}: {degrade_reason}", flush=True)
+                return
             # acquire 与 submit 之间若 submit 抛异常（如线程池已 shutdown），
             # 已 acquire 的配额会永久泄漏、累积到上限致主循环死锁。故用 try 兜底：
             # submit 失败立即 release 保证信号量对称，并就地写 FAILED_LOG 后 return
