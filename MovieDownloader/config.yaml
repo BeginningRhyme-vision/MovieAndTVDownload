@@ -160,6 +160,16 @@ tmdb_ids_to_links:
   # 某轮"待重跑"占比 ≥90% 且数量 ≥50 时判定为基础设施故障，直接等满上限。
   round_backoff: 30
   round_backoff_max: 300
+  # ---- 最终捞回（跑满 max_rounds 后的加时赛）----
+  # 常规轮退避最长 round_backoff_max（300s），扛得住分钟级抖动；但"代理套餐额度
+  # 耗尽""enc-dec 长时间维护"这类故障要几十分钟才恢复，整批会被打成 unresolved
+  # 等下次运行——而下次运行要人来发起。加时赛用长冷却再试几轮，自动把它们捞回。
+  # 加时赛里判死的 ID 照常写 fail_file（同样走白名单 + dead_confirm，同等可信）。
+  # enabled: false 时行为与旧版一致（跑满即写 unresolved.txt）。
+  final_retry:
+    enabled: true
+    rounds: 2               # 加时赛轮数（与 max_rounds 分开计）
+    cooldown_seconds: 1800  # 每轮加时赛前的冷却（秒）。短于此等于再烧一次常规轮
   # 单个 HTTP 请求超时（秒）。启用 Session 连接复用后握手更快。
   # 分阶段实测：正常各阶段中位 0.5~3.7s、单请求 P90≈15s、取流循环 max≈13s，
   # 20s 给卡死请求留太久空耗线程；降到 12s 可让长尾/卡死请求早 3~8s 放弃，
@@ -193,6 +203,27 @@ download_movies:
     enabled: true           # false=只跑一轮（等价旧行为）
     max_rounds: 3           # 最大下载轮次（含第一轮）
     cooldown_seconds: 300   # 轮次之间的冷却等待（秒）
+  # ---- 轮次间就地重取流（直链过期自愈）----
+  # vidlink 给的是带时效签名的 mp4 直链。取流到下载之间隔得久了，直链会 403/410
+  # 过期；重投同一条 url 必然再挂，故按确定性失败处理、不进下一轮。
+  # 开启本项后，每轮结束时就地调用取流侧 provider 换一批新 url 再重投，等价于人工跑
+  # `tmdb_ids_to_links.py --refetch-failed` 后重跑本脚本，只是发生在同一次运行内。
+  #   - 新 urls 会追加写入 input(results.jsonl)，下次运行按 fetched_at 自动择新；
+  #   - 只对"需重新取流"这一类失败生效，画质不达标等确定性失败不会白烧取流配额；
+  #   - 末轮不重取（拿到新链接也没有轮次去用了）。
+  # enabled: false 时行为与旧版一致（只在收尾打印提示，等人工处理）。
+  # 手动入口始终保留：python tmdb_ids_to_links.py --refetch-failed
+  auto_refetch:
+    enabled: true
+    max_per_movie: 2        # 单部片整次运行中最多就地重取几次（防"取流-过期-重取"空转）
+    workers: 8              # 重取并发数。取流走代理且与下载争带宽，故远小于取流侧独立运行时
+  # ---- 收尾自动补传 ----
+  # 上传槽位等待超时（upload_slot_wait_timeout）会降级为"留本地 + 写 upload_pending"，
+  # 这些成品不被任何后续轮次处理，只能靠人跑 reupload。主流程跑完时 R2 往往已恢复，
+  # 自动补一次能省掉这次人工介入。主流程异常退出时不自动补传（状态未知，交人工判断）。
+  # 手动入口始终保留：python download_movies.py reupload
+  auto_reupload:
+    enabled: true
   # 两个独立于 success.jsonl/failed.jsonl 的下载态状态文件，全程可查当前下载进度：
   #   download_ok_log   —— 累计追加，每部“下载”成功一条（不含转封装/上传）
   #   download_fail_log —— 每轮开头清空重写，只记本轮“下载”失败的影片

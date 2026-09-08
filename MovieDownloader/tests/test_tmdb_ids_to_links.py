@@ -427,6 +427,72 @@ def test_write_unresolved_failure_does_not_raise(tmp_path):
     m.write_unresolved(tmp_path, ["1"])
 
 
+# ------------------------------------------------- 最终捞回（加时赛）
+
+def _stub_final_retry(monkeypatch, batches):
+    """把 run_batch 桩成"按顺序返回预设结果"，并记录每轮入参与冷却时长。"""
+    calls = []
+    slept = []
+    queue = list(batches)
+
+    def fake_run_batch(ids, results_file, fail_file, max_workers, providers=None):
+        calls.append(list(ids))
+        return queue.pop(0)
+
+    monkeypatch.setattr(m, "run_batch", fake_run_batch)
+    monkeypatch.setattr(m.time, "sleep", lambda s: slept.append(s))
+    return calls, slept
+
+
+def test_final_retry_recovers_ids_after_long_cooldown(monkeypatch):
+    """加时赛把"只是恢复得慢"的 ID 捞回来，无需人工发起下次运行。
+
+    常规轮退避最长 300s，扛不住"代理额度耗尽 / enc-dec 维护"这类几十分钟级故障；
+    整批被打成 unresolved 后要等人重跑，正是要消除的人工环节。
+    """
+    monkeypatch.setattr(m, "FINAL_RETRY_ENABLED", True)
+    monkeypatch.setattr(m, "FINAL_RETRY_ROUNDS", 2)
+    monkeypatch.setattr(m, "FINAL_RETRY_COOLDOWN", 1800)
+    calls, slept = _stub_final_retry(monkeypatch, [[]])
+
+    left, rounds = m._final_retry(["7", "8"], "r.jsonl", "f.txt", 4, ["vidup"])
+
+    assert left == []
+    # 轮数要回传：否则收尾打印的"共跑 N 轮"会漏掉加时赛
+    assert rounds == 1
+    assert calls == [["7", "8"]]
+    # 冷却必须发生在重跑之前：常规轮刚跑完，故障源大概率还没恢复
+    assert slept == [1800]
+
+
+def test_final_retry_runs_all_rounds_then_gives_up(monkeypatch):
+    """加时赛也有上限：跑满 rounds 仍失败就交还给 unresolved.txt。"""
+    monkeypatch.setattr(m, "FINAL_RETRY_ENABLED", True)
+    monkeypatch.setattr(m, "FINAL_RETRY_ROUNDS", 2)
+    monkeypatch.setattr(m, "FINAL_RETRY_COOLDOWN", 60)
+    calls, slept = _stub_final_retry(monkeypatch, [["8"], ["8"]])
+
+    left, rounds = m._final_retry(["7", "8"], "r.jsonl", "f.txt", 4, ["vidup"])
+
+    assert left == ["8"]
+    assert rounds == 2
+    # 第二轮只重跑上一轮的残留，不重跑已成功的 7
+    assert calls == [["7", "8"], ["8"]]
+    assert slept == [60, 60]
+
+
+def test_final_retry_disabled_returns_input_untouched(monkeypatch):
+    """关掉加时赛必须完全回到旧行为，一次 run_batch 都不能多跑。"""
+    monkeypatch.setattr(m, "FINAL_RETRY_ENABLED", False)
+    calls, slept = _stub_final_retry(monkeypatch, [[]])
+
+    left, rounds = m._final_retry(["7"], "r.jsonl", "f.txt", 4, ["vidup"])
+
+    assert left == ["7"]
+    assert rounds == 0
+    assert calls == [] and slept == []
+
+
 # ------------------------------------------------- --refetch-failed 闭环修复
 
 def _write_failed_log(path, rows):

@@ -128,6 +128,19 @@ OUTAGE_MIN_ITEMS = 50
 # NoSource 判死前换 IP 再完整探一次，两次都无源才写 fail.txt（防 CDN/代理抖动误判永久丢片）
 DEAD_CONFIRM = bool(_CFG.get("dead_confirm", True))
 
+# ---- 最终捞回（跑满 max_rounds 后的加时赛）----
+# 常规多轮的退避最长 round_backoff_max（默认 300s），扛得住几分钟级抖动；但代理
+# 套餐额度耗尽、enc-dec 长时间维护这类故障要更久才恢复，此时整批会被打成
+# unresolved 等下次运行——而"下次运行"要人来发起。故跑满轮次后再做一轮长冷却重试，
+# 把这类"只是恢复得慢"的片捞回来。关闭时行为与旧版一致（直接写 unresolved.txt）。
+_FINAL_CFG = _CFG.get("final_retry", {}) or {}
+FINAL_RETRY_ENABLED = bool(_FINAL_CFG.get("enabled", True))
+# 加时赛轮数。与常规轮次分开计数，语义也不同：常规轮打的是瞬时抖动，
+# 这里打的是"需要几十分钟才恢复"的基础设施故障。
+FINAL_RETRY_ROUNDS = max(1, int(_FINAL_CFG.get("rounds", 2)))
+# 加时赛的冷却（秒）。默认 30 分钟——短于此基本等于再烧一次常规轮，没有意义。
+FINAL_RETRY_COOLDOWN = max(0, int(_FINAL_CFG.get("cooldown_seconds", 1800)))
+
 # ⚠️ 必须与 download_movies.py 的 `_NEEDS_REFETCH_MARKER` **逐字一致**。
 # 下载侧遇 vidlink 签名直链过期（403/410）时把这段文案写进 failed.jsonl 的 error 字段，
 # 本脚本的 --refetch-failed 据此挑出要重取的 id。两边是靠字符串约定耦合的（跨进程、
@@ -911,8 +924,18 @@ def main(argv=None):
             print("\n==> 瞬时失败已清零，所有有源 ID 已捞干净，正常结束。")
             break
         if round_no >= max_rounds:
-            unresolved = retry_ids
-            print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(retry_ids)} 个瞬时失败 ID "
+            # 常规轮次已跑满。这些 ID 从未被判过 NoSource，是被超时/5xx/代理故障
+            # 打下来的。常规轮的退避最长 round_backoff_max（默认 300s），若故障源
+            # 是"代理额度耗尽"或"enc-dec 维护"这类几十分钟级的，整批会在这里被放弃、
+            # 等人发起下次运行。加时赛用长冷却再试几轮，把它们自动捞回来。
+            unresolved, extra_rounds = _final_retry(
+                retry_ids, results_file, fail_file, max_workers, providers
+            )
+            round_no += extra_rounds
+            if not unresolved:
+                print("\n==> 最终捞回成功清零，无残留未解决 ID。")
+                break
+            print(f"\n==> 已达最大轮数 {max_rounds}，剩余 {len(unresolved)} 个瞬时失败 ID "
                   f"写入 {unresolved_file.name}（未判死，下次运行会自动重试）。")
             break
         pending = retry_ids
@@ -951,6 +974,44 @@ def main(argv=None):
         write_unresolved(unresolved_file, unresolved)
 
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
+
+
+def _final_retry(retry_ids, results_file, fail_file, max_workers, providers):
+    """常规轮次跑满后的加时赛：长冷却再试几轮。
+
+    返回 (仍未解决的 ID 列表, 实际跑了几轮)。轮数要回传给调用方，否则收尾打印的
+    "共跑 N 轮"会漏掉加时赛，看日志会以为跑完 max_rounds 就结束了。
+
+    与常规多轮的区别只在**冷却时长**：常规轮退避最长 round_backoff_max（默认
+    300s），打的是分钟级抖动；加时赛默认冷却 30 分钟，打的是"代理额度耗尽 /
+    enc-dec 维护"这类需要更久才恢复的基础设施故障。
+
+    不开启（FINAL_RETRY_ENABLED=False）时原样返回入参、轮数记 0，行为与旧版一致。
+
+    注意：加时赛里判死的 ID 照常写 fail_file——它同样走完白名单判死 +
+    dead_confirm 二次确认，与常规轮的判死同等可信。
+    """
+    if not FINAL_RETRY_ENABLED or not retry_ids:
+        return retry_ids, 0
+
+    pending = retry_ids
+    for extra_round in range(1, FINAL_RETRY_ROUNDS + 1):
+        print(f"\n{'=' * 70}")
+        print(
+            f"==> 最终捞回 {extra_round}/{FINAL_RETRY_ROUNDS} | "
+            f"待处理 {len(pending)} 个 ID | 先冷却 {FINAL_RETRY_COOLDOWN}s"
+        )
+        print(f"{'=' * 70}")
+        # 冷却放在跑之前：常规轮刚跑完，故障源大概率还没恢复，立刻重跑只是白烧配额。
+        if FINAL_RETRY_COOLDOWN > 0:
+            time.sleep(FINAL_RETRY_COOLDOWN)
+
+        pending = run_batch(
+            pending, results_file, fail_file, max_workers, providers=providers
+        )
+        if not pending:
+            return [], extra_round
+    return pending, FINAL_RETRY_ROUNDS
 
 
 def write_unresolved(unresolved_file, ids):

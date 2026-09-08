@@ -4,6 +4,7 @@
 mp4 直链请求头、失败分类与被拒原因归类。全部为纯函数级测试，不联网。
 """
 
+import json
 import os
 
 import pytest
@@ -16,6 +17,7 @@ def sandbox(tmp_path, monkeypatch):
     """把模块级路径全部指到 tmp_path，并重置共享状态。"""
     monkeypatch.setattr(d, "BASE_DIR", str(tmp_path / "downloads"))
     monkeypatch.setattr(d, "TEMP_DIR", str(tmp_path / "temp"))
+    monkeypatch.setattr(d, "INPUT_JSONL", str(tmp_path / "results.jsonl"))
     monkeypatch.setattr(d, "SUCCESS_LOG", str(tmp_path / "success.jsonl"))
     monkeypatch.setattr(d, "FAILED_LOG", str(tmp_path / "failed.jsonl"))
     monkeypatch.setattr(d, "UPLOAD_PENDING_LOG", str(tmp_path / "pending.jsonl"))
@@ -441,3 +443,204 @@ def test_scan_removes_zero_byte_orphans(sandbox):
     assert dups == {}
     assert not os.path.exists(orphan)
     assert os.path.exists(real)
+
+
+# ------------------------------------------------ 就地重取流（直链过期自愈）
+
+def test_needs_refetch_only_matches_expired_direct_links():
+    """只有"签名过期"才值得重取流。
+
+    画质不达标、结构不支持这类确定性失败重取也是同样结果；404 直链不存在则本就
+    不该救。把它们放进来只会白烧取流配额。
+    """
+    assert d.needs_refetch(f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: u")
+    assert not d.needs_refetch("分辨率 640x360 低于红线")
+    assert not d.needs_refetch("直链块不可用")
+    assert not d.needs_refetch("")
+    assert not d.needs_refetch(None)
+
+
+class _FakeFetcher:
+    """冒充 tmdb_ids_to_links 模块，按 tmdbId 返回预设的取流结果。"""
+
+    def __init__(self, results):
+        self.results = results
+        self.seen = []
+
+    def process_tmdb_id(self, tmdb_id):
+        self.seen.append(str(tmdb_id))
+        return self.results[str(tmdb_id)]
+
+
+def _install_fake_fetcher(monkeypatch, fetcher):
+    import sys
+    monkeypatch.setitem(sys.modules, "tmdb_ids_to_links", fetcher)
+
+
+def test_refetch_replaces_urls_and_persists_new_result(sandbox, monkeypatch):
+    """重取成功要做两件事：换掉 entry 的 urls，并把新结果落盘。
+
+    落盘是关键——本次运行若中途被打断，下次启动能按 fetched_at 择新直接用上新
+    链接，这次重取就不算白做。
+    """
+    fetcher = _FakeFetcher({
+        "55": ("ok", {
+            "tmdbId": "55", "urls": [{"url": "https://new/f.mp4"}],
+            "fetched_at": 999,
+        }),
+    })
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    entry = {"tmdbId": "55", "title": "T", "year": 2020,
+             "urls": [{"url": "https://old/f.mp4"}]}
+    revived = d.refetch_entries([entry], {})
+
+    assert len(revived) == 1
+    assert revived[0]["urls"] == [{"url": "https://new/f.mp4"}]
+    assert revived[0]["fetched_at"] == 999
+    # 非取流字段必须保留：下游要用 title/year 拼 R2 键
+    assert revived[0]["title"] == "T" and revived[0]["year"] == 2020
+    # 原 entry 不被就地修改（重投的是新对象）
+    assert entry["urls"] == [{"url": "https://old/f.mp4"}]
+    # 新结果已追加进 results.jsonl
+    with open(d.INPUT_JSONL, encoding="utf-8") as fh:
+        assert json.loads(fh.readline())["urls"] == [{"url": "https://new/f.mp4"}]
+
+
+def test_refetch_skips_movies_over_the_per_movie_cap(sandbox, monkeypatch):
+    """重取次数用尽的片不再重取，防"取流-过期-重取"无限空转。"""
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_MOVIE", 2)
+    fetcher = _FakeFetcher({"55": ("ok", {"tmdbId": "55", "urls": [{"url": "u"}]})})
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    entry = {"tmdbId": "55", "urls": []}
+    assert d.refetch_entries([entry], {"55": 2}) == []
+    assert fetcher.seen == []   # 一次取流都不该发生
+
+
+def test_refetch_counts_attempts_even_when_fetch_fails(sandbox, monkeypatch):
+    """失败也要计数，否则"每部最多 N 次"的上限形同虚设、可能无限重试。"""
+    fetcher = _FakeFetcher({"55": ("dead", None)})
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    counts = {}
+    assert d.refetch_entries([{"tmdbId": "55", "urls": []}], counts) == []
+    assert counts == {"55": 1}
+
+
+def test_refetch_survives_fetcher_exceptions(sandbox, monkeypatch):
+    """单部片重取抛异常不能带塌整批：重取是尽力而为的捞回。"""
+    class Boom(_FakeFetcher):
+        def process_tmdb_id(self, tmdb_id):
+            if str(tmdb_id) == "1":
+                raise RuntimeError("proxy died")
+            return super().process_tmdb_id(tmdb_id)
+
+    fetcher = Boom({"2": ("ok", {"tmdbId": "2", "urls": [{"url": "u2"}]})})
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    revived = d.refetch_entries(
+        [{"tmdbId": "1", "urls": []}, {"tmdbId": "2", "urls": []}], {}
+    )
+    assert [e["tmdbId"] for e in revived] == ["2"]
+
+
+def test_refetch_returns_empty_when_fetcher_unavailable(sandbox, monkeypatch):
+    """取流模块导入失败（缺代理凭证等）只跳过重取，绝不能崩掉下载流水线。"""
+    import builtins
+    real_import = builtins.__import__
+
+    def blocked(name, *args, **kwargs):
+        if name == "tmdb_ids_to_links":
+            raise ImportError("no proxy credentials")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    assert d.refetch_entries([{"tmdbId": "55", "urls": []}], {}) == []
+
+
+def test_mixed_node_failure_is_both_retriable_and_refetchable(sandbox, monkeypatch):
+    """m3u8 节点 5xx + mp4 节点直链过期：既要重投，也要换新直链。
+
+    any_retriable 是乐观口径——任一节点可重试整片就 retriable=True。多源下
+    "vidup m3u8 挂 5xx + vidlink mp4 签名过期"是常态（5xx 占可重试失败约八成）。
+    若两条重投路径互斥，这类片只会被重投而永远不换新直链，那个 mp4 节点在剩余
+    所有轮次里都是废的，白白损失一个可用源。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+
+    def boom_master(url, retries=None, headers=None):
+        raise RuntimeError(f"请求失败(HTTP Error 503): {url}")
+
+    def expired_mp4(node, output_path, label, runtime_minutes=None):
+        raise RuntimeError(
+            f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: {node['url']}"
+        )
+
+    monkeypatch.setattr(d, "parse_master_playlist", boom_master)
+    monkeypatch.setattr(d, "_download_mp4_direct", expired_mp4)
+
+    entry = {"tmdbId": "55", "title": "T", "urls": [
+        {"url": "https://a/m.m3u8", "provider": "vidup", "type": "m3u8",
+         "headers": {}, "quality": None, "size": None},
+        {"url": "https://a/x.mp4", "provider": "vidlink", "type": "mp4",
+         "headers": {}, "quality": None, "size": None},
+    ]}
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+
+    # 关键：把真实失败信息喂给分桶决策，两个桶必须同时命中。
+    should_retry, should_refetch = d.plan_retry_buckets(
+        info["retriable"], info["error"]
+    )
+    assert should_retry is True
+    assert should_refetch is True
+
+
+@pytest.mark.parametrize("retriable,error,expected", [
+    # 纯瞬时失败：只重投，不该白烧取流配额
+    (True, "请求失败(HTTP Error 503)", (True, False)),
+    # 纯直链过期：不重投（重投拿到的是同一条 url），只换新链接
+    (False, f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}", (False, True)),
+    # 混合：两者都要
+    (True, f"节点1 503；节点2 {d._NEEDS_REFETCH_MARKER}", (True, True)),
+    # 真判死：画质不达标，两个桶都不进
+    (False, "分辨率 640x360 低于红线", (False, False)),
+    (False, "码率未达到门槛", (False, False)),
+    # 404 直链不存在：确定性失败，重取也救不回
+    (False, "直链块不可用", (False, False)),
+])
+def test_retry_bucket_routing(retriable, error, expected):
+    """判死的不进重试轮次，非判死的进——逐类锁死路由结果。"""
+    assert d.plan_retry_buckets(retriable, error) == expected
+
+
+def test_refetch_bucket_respects_the_kill_switch(monkeypatch):
+    """auto_refetch 关掉后，过期直链不再进重取桶（完全回到旧行为）。"""
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", False)
+    assert d.plan_retry_buckets(
+        False, f"直链已失效，{d._NEEDS_REFETCH_MARKER}"
+    ) == (False, False)
+
+
+def test_merge_next_batch_prefers_the_refetched_entry():
+    """同一部片同时进两个桶时，必须用重取后的新 entry，且只投一份。
+
+    投两份会让第二份在 process_one_entry 的 processing_ids 检查里被判"重复条目"
+    丢弃，白占一个下载槽位；用旧 entry 则那个 mp4 节点整轮继续是废的。
+    """
+    retriable = [{"tmdbId": "55", "urls": ["OLD"]}, {"tmdbId": "66", "urls": ["x"]}]
+    revived = [{"tmdbId": "55", "urls": ["NEW"]}]
+
+    merged = d.merge_next_batch(retriable, revived)
+
+    assert len(merged) == 2
+    by_id = {e["tmdbId"]: e for e in merged}
+    assert by_id["55"]["urls"] == ["NEW"]
+    assert by_id["66"]["urls"] == ["x"]
+
+
+def test_merge_next_batch_keeps_refetch_only_entries():
+    """纯过期（不在 retriable 桶里）的片重取成功后也要被投出去。"""
+    merged = d.merge_next_batch([], [{"tmdbId": "9", "urls": ["NEW"]}])
+    assert [e["tmdbId"] for e in merged] == ["9"]
