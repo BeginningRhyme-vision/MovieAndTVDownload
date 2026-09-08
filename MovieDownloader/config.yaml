@@ -26,9 +26,21 @@ fetch_movie_metadata:
   tmdb_api_key: ""
 
   # 只保留哪些 IMDB 条目类型（title.basics 的 titleType 列）。
-  # 常见值：movie / tvSeries / short / tvMovie ...；这里默认只要电影
+  # IMDB 实际有 11 种：movie / short / video / videoGame / tvSeries / tvMiniSeries
+  # / tvSpecial / tvShort / tvEpisode / tvMovie / tvPilot。
+  #
+  # tvMovie（电视电影）：单文件、无季集结构，TMDB Find 把它归到 movie_results
+  # 而非 tv_results，所以 TVDownloader 有意排除它、由本子任务接收
+  # （本脚本取的正是 movie_results 桶，天然吃得下）。此前两边都没收，它掉在缝里。
+  #
+  # ⚠️ 若日后启用 filter_config.yaml 的 title_type 筛选（默认 enabled: false），
+  # 必须把 tvMovie 一并加进它的 allow 列表，否则这里收进来的又会被那边筛掉。
+  #
+  # 增量说明：progress.txt 只记已处理的 imdb_id，新增类型的条目下次运行会自动
+  # 补跑，无需清空进度或重跑已完成的部分。
   keep_types:
     - movie
+    - tvMovie
 
   # 调用 TMDB API 的并发线程数。TMDB 软上限约 50 req/s，配合 sleep 控制整体 QPS
   max_workers: 16

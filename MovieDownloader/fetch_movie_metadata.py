@@ -7,6 +7,8 @@ import csv
 import gzip
 import json
 import os
+import re
+import sys
 import time
 import logging
 import requests
@@ -83,6 +85,9 @@ _SESSION.mount("https://", requests.adapters.HTTPAdapter(
     pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS * 2,
 ))
 tmdb.REQUESTS_SESSION = _SESSION
+# tmdbsimple 默认 REQUESTS_TIMEOUT=None（无超时）：一个卡住的连接会永久占死一个
+# worker，跑到最后可能整池线程全挂在半开连接上、进度停滞却不报错。
+tmdb.REQUESTS_TIMEOUT = (10, 30)
 
 BASE_URL = "https://datasets.imdbws.com/"
 DATASETS = {
@@ -357,27 +362,109 @@ def load_names_dict() -> dict:
 
 
 # ========== TMDB ID ==========
+class TMDBLookupError(RuntimeError):
+    """TMDB 请求在重试耗尽后仍失败（网络/限速/服务端错误）。
+
+    与"TMDB 里确实查不到这部片"（get_tmdb_id 返回 None）**严格区分**：
+    后者可以 mark_done 永久跳过，前者绝不能——否则一次几分钟的 TMDB 故障
+    就会把那段时间内的所有条目静默写进 progress.txt，重跑永久跳过，
+    而日志上只表现为"无TMDB"计数偏高，极难察觉。
+    """
+
+
+class TMDBAuthError(TMDBLookupError):
+    """TMDB 返回 401/403：API Key 无效或被封。
+
+    这是全局性错误，重试和继续跑都没有意义（否则 44 万条会各自重试 3 次跑到底）。
+    job 层不吞掉它，由 main 捕获后立即退出。
+    """
+
+
+_API_KEY_RE = re.compile(r"api_key=[^&\s]+")
+
+
+def _redact(e: BaseException) -> str:
+    """tmdbsimple 抛出的 requests.HTTPError 消息里带完整请求 URL（含 api_key= 查询
+    参数），原样写进 fetch.log 就等于把密钥落盘。日志/异常消息一律经此脱敏。"""
+    return _API_KEY_RE.sub("api_key=***", f"{type(e).__name__}: {e}")
+
+
+def _http_status(e: BaseException):
+    """从 requests.HTTPError 取状态码；非 HTTP 错误（超时、连接失败）返回 None。
+
+    取代旧的 `"429" in str(e)` 字符串判定——那会把 tt0429493 这类**id 里含 429**
+    的条目误判成限速，白等 10 秒还吞掉真正的错误信息。
+    """
+    return getattr(getattr(e, "response", None), "status_code", None)
+
+
+def _retry_after(e: BaseException, default: int = 10, cap: int = 60) -> int:
+    """429 时优先尊重服务端 Retry-After（秒），解析失败或缺失用 default，并设上限。"""
+    headers = getattr(getattr(e, "response", None), "headers", None) or {}
+    try:
+        return max(1, min(int(headers.get("Retry-After", default)), cap))
+    except (TypeError, ValueError):
+        return default
+
+
 def get_tmdb_id(imdb_id: str, retry: int = 3):
-    for attempt in range(retry):
+    """返回 TMDB movie id；TMDB 确实没有这部片时返回 None。
+
+    请求持续失败抛 TMDBLookupError（调用方据此**不 mark_done**），
+    401/403 抛 TMDBAuthError（不重试，全局终止）。
+
+    429 限速**不消耗重试次数**——限速是外部节奏问题，不是本条目的问题；
+    但设 rate_limit_hits 上限，防 TMDB 长时间限速时线程无限空转。
+    """
+    last_err = None
+    rate_limit_hits = 0
+    attempt = 0
+    while attempt < retry:
         try:
             result = tmdb.Find(imdb_id).info(external_source="imdb_id")
-            movies = result.get("movie_results", [])
+            movies = result.get("movie_results") or []
             return movies[0]["id"] if movies else None
         except Exception as e:
-            if "429" in str(e):
-                log.warning("限速，等待 10s")
-                time.sleep(10)
-            else:
-                log.warning(f"{imdb_id} 第{attempt + 1}次失败: {e}")
+            last_err = e
+            status = _http_status(e)
+            if status in (401, 403):
+                raise TMDBAuthError(
+                    f"TMDB 拒绝访问（HTTP {status}），请检查 TMDB_API_KEY"
+                ) from None
+            if status == 429:
+                rate_limit_hits += 1
+                if rate_limit_hits > 6:
+                    break
+                delay = _retry_after(e)
+                log.warning(f"限速，等待 {delay}s")
+                time.sleep(delay)
+                continue
+            attempt += 1
+            log.warning(f"{imdb_id} 第{attempt}次失败: {_redact(e)}")
+            if attempt < retry:
                 time.sleep(2 ** attempt)
-    return None
+    raise TMDBLookupError(f"TMDB 查询失败（已重试）: {_redact(last_err)}")
 
 
 # ========== 处理单条 ==========
+def _num(value, cast):
+    """把 pandas 取出的数值安全转成 Python 原生类型；缺失/NaN 一律 None。
+
+    不能只判 `is None`：pandas 缺失值是 NaN（float），`int(NaN)` 直接抛
+    ValueError，`float(NaN)` 则会让 json.dumps 写出裸 `NaN` 字面量——那不是
+    合法 JSON，下游 json.loads 解析整行失败，等于静默丢掉这条记录。
+    """
+    if value is None or pd.isna(value):
+        return None
+    return cast(value)
+
+
 def process(imdb_id: str, basics, ratings, crew, names_dict):
     tmdb_id = get_tmdb_id(imdb_id)
     time.sleep(SLEEP)
     if tmdb_id is None:
+        # 只有"TMDB 确实没有这部片"才走到这里（查询失败会抛 TMDBLookupError）。
+        # 这是永久性结论，可以 mark_done 跳过。
         mark_done(imdb_id)
         return None
 
@@ -395,12 +482,12 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
         "primary_title": row.get("primaryTitle"),
         "original_title": row.get("originalTitle"),
         "is_adult": row.get("isAdult"),
-        "start_year": None if pd.isna(row.get("startYear")) else int(row["startYear"]),
-        "end_year": None if pd.isna(row.get("endYear")) else int(row["endYear"]),
-        "runtime_minutes": None if pd.isna(row.get("runtimeMinutes")) else int(row["runtimeMinutes"]),
+        "start_year": _num(row.get("startYear"), int),
+        "end_year": _num(row.get("endYear"), int),
+        "runtime_minutes": _num(row.get("runtimeMinutes"), int),
         "genres": row.get("genres", []),
-        "rating": None if rat is None else float(rat["averageRating"]),
-        "votes": None if rat is None else int(rat["numVotes"]),
+        "rating": None if rat is None else _num(rat["averageRating"], float),
+        "votes": None if rat is None else _num(rat["numVotes"], int),
         "directors": directors,
         "writers": writers,
         "cast_crew": query_principals(imdb_id, names_dict),
@@ -442,14 +529,20 @@ def main():
         try:
             result = process(imdb_id, basics, ratings, crew, names_dict)
             return "ok" if result else "skip"
+        except TMDBAuthError:
+            # 唯一放行的异常：API Key 无效/被封是全局性问题，吞掉它只会让剩下
+            # 几十万条各自重试 3 次、把整轮跑成空转。交给 main 立即终止。
+            raise
         except Exception as e:
-            # 注意：这里不能 mark_done。异常代表本条“未成功处理”，
+            # 注意：这里不能 mark_done。异常代表本条"未成功处理"，
             # 若标记为已完成，重跑时会跳过它，造成静默丢数据。
             # 不标记则下次运行会自动重试该 imdb_id。
-            log.error(f"{imdb_id} 异常（将于下次运行重试）: {e}")
+            # 消息经 _redact：异常里可能带含 api_key= 的完整 URL。
+            log.error(f"{imdb_id} 异常（将于下次运行重试）: {_redact(e)}")
             return "error"
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    try:
         futures = {executor.submit(job, iid): iid for iid in pending}
         for i, fut in enumerate(as_completed(futures), 1):
             s = fut.result()
@@ -461,10 +554,26 @@ def main():
                 error += 1
             if i % 200 == 0:
                 log.info(f"进度 {i:,}/{total:,} | 写入:{success} 无TMDB:{skipped} 失败:{error}")
+    except BaseException:
+        # Ctrl+C 或 TMDBAuthError：取消尚未开始的任务立即退出。
+        # 用 with ThreadPoolExecutor 的话，退出时会等全部排队任务跑完
+        # （几十万条要跑到底才肯放行），Ctrl+C 形同虚设。
+        executor.shutdown(wait=False, cancel_futures=True)
+        log.info(f"提前退出 | 写入:{success} 无TMDB:{skipped} 失败:{error}")
+        raise
+    executor.shutdown(wait=True)
 
     log.info(f"全部完成！写入:{success} 无TMDB:{skipped} 失败:{error}")
     log.info(f"输出: {OUTPUT.resolve()}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except TMDBAuthError as exc:
+        # 单独退出码 + 一行清晰提示，不打 traceback：这是配置问题不是程序缺陷，
+        # 也便于 cron/systemd 区分"密钥要换了"与其它故障。
+        log.error(str(exc))
+        sys.exit(2)
