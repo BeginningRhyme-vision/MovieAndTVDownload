@@ -89,6 +89,14 @@ tmdb_ids_to_links:
   #     也避免两类记录混在一起后再也分不出哪些是真 dead。
   # 每次运行结束覆盖写（含清空），始终只反映最近一次运行的残留。
   unresolved_file: "unresolved.txt"
+  # ---- 闭环修复：重取下载侧判定“直链已失效”的影片 ----
+  # vidlink 出的是带时效签名的 mp4 直链，过期后下载侧拿到 403/410，判死并写进
+  # download_movies.failed_log。但那些 id 当初取流是成功的、已在 results.jsonl 里，
+  # 本脚本的“已处理即跳过”会让它们永远拿不到新链接——这条闭环原本是断的。
+  #   python tmdb_ids_to_links.py --refetch-failed
+  # 该命令扫 failed_log 挑出带“需重新取流”标记的 id 强制重取（绕过已处理判断），
+  # 结果追加写入 results.jsonl，下载侧按 fetched_at 择新自动选用，无需清理旧行。
+  # 注意：光重跑主命令没用，那些 id 会被当作已处理跳过。
   # 解密服务 API 根地址（负责各 provider 的 enc-* / dec-* 加解密）
   api: "https://enc-dec.app/api"
   # ---- 多源取流 ----

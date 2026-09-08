@@ -591,6 +591,11 @@ _PERMANENT_FAILURE_MARKERS = (
     # 本脚本读的是固化的 results.jsonl，没有重新取流的能力，多轮重投拿到的
     # 还是同一条 url，白烧带宽与下载槽位。这类失败要靠重跑 tmdb_ids_to_links.py
     # 换一条新直链来修复，故在此判死、只留 failed.jsonl 供上游重新取流。
+    #
+    # 闭环怎么走：`python tmdb_ids_to_links.py --refetch-failed` 会扫本文件写的
+    # failed.jsonl，挑出带 _NEEDS_REFETCH_MARKER 的 tmdbId 强制重取（绕过
+    # "已在 results.jsonl 即跳过"），新结果追加落盘，本脚本按 fetched_at 择新
+    # 自动选用。注意光重跑主命令没用——那些 id 已在 results.jsonl 里会被跳过。
     "需重新取流",                 # 403/410 签名直链已过期
     "直链块不可用",               # 404 直链不存在 / 416 Range 越界
     "直链不支持 Range",           # 服务端不支持 Range 分块
@@ -609,6 +614,9 @@ _PERMANENT_FAILURE_MARKERS = (
 # mp4 直链（vidlink 签名 url 带 sign&t 时效）返回 403/410 时的文案标记。
 # 注意：它同时也在 _PERMANENT_FAILURE_MARKERS 中——本脚本无法重新取流，
 # 重试同一条过期 url 必然再挂，判死后交由上游重跑取流修复。
+# ⚠️ 该字符串是**跨文件契约**：tmdb_ids_to_links.py 的 NEEDS_REFETCH_MARKER 必须
+# 与它逐字相同，`--refetch-failed` 靠匹配这段文案从 failed.jsonl 里挑重取对象。
+# 改这里必须同步改那边，否则闭环静默断开（重取永远挑不出 id 且不报错）。
 _NEEDS_REFETCH_MARKER = "需重新取流"
 
 # mp4 直链单块下载中“重试也没用”的文案：命中即不再走块级退避重试，直接上抛。

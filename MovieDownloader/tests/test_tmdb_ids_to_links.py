@@ -425,3 +425,70 @@ def test_write_unresolved_failure_does_not_raise(tmp_path):
     """写不进去只是丢一份给人看的清单，不该让整轮取流的成果白费。"""
     # 传目录路径，open(..., 'w') 必然抛 IsADirectoryError（OSError 子类）
     m.write_unresolved(tmp_path, ["1"])
+
+
+# ------------------------------------------------- --refetch-failed 闭环修复
+
+def _write_failed_log(path, rows):
+    path.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+        encoding="utf-8",
+    )
+
+
+def test_refetch_picks_only_needs_refetch_entries(tmp_path):
+    """只挑"需重新取流"的片：其它下载失败（画质不达标等）与取流无关，重取纯属浪费。"""
+    failed = tmp_path / "failed.jsonl"
+    fail = tmp_path / "fail.txt"
+    _write_failed_log(failed, [
+        {"tmdbId": "11", "error": f"直链已失效（HTTP 403），{m.NEEDS_REFETCH_MARKER}: u"},
+        {"tmdbId": "22", "error": "分辨率 640x360 低于红线 1080，跳过"},
+        {"tmdbId": "33", "error": "缺片率过高：缺 50/100 片"},
+        {"tmdbId": "44", "error": f"直链已失效（HTTP 410），{m.NEEDS_REFETCH_MARKER}: u"},
+    ])
+    assert m.load_refetch_ids(failed, fail) == ["11", "44"]
+
+
+def test_refetch_skips_confirmed_dead(tmp_path):
+    """已确认真无源的不重取：那是白名单判死 + dead_confirm 二次确认的结论，
+    不该被一条下载失败记录推翻。"""
+    failed = tmp_path / "failed.jsonl"
+    fail = tmp_path / "fail.txt"
+    _write_failed_log(failed, [
+        {"tmdbId": "11", "error": f"{m.NEEDS_REFETCH_MARKER}: u"},
+        {"tmdbId": "99", "error": f"{m.NEEDS_REFETCH_MARKER}: u"},
+    ])
+    fail.write_text("99\n", encoding="utf-8")
+    assert m.load_refetch_ids(failed, fail) == ["11"]
+
+
+def test_refetch_dedupes_and_tolerates_bad_lines(tmp_path):
+    """failed.jsonl 是追加写，同一片多轮重投会留多行；坏行不能让整个模式崩掉。"""
+    failed = tmp_path / "failed.jsonl"
+    fail = tmp_path / "fail.txt"
+    failed.write_text(
+        json.dumps({"tmdbId": "11", "error": m.NEEDS_REFETCH_MARKER}) + "\n"
+        + "{ 这行不是合法 JSON\n"
+        + "\n"
+        + json.dumps({"error": m.NEEDS_REFETCH_MARKER}) + "\n"     # 缺 tmdbId
+        + json.dumps({"tmdbId": 11, "error": m.NEEDS_REFETCH_MARKER}) + "\n"  # int 重复
+        + json.dumps({"tmdbId": "12", "error": m.NEEDS_REFETCH_MARKER}) + "\n",
+        encoding="utf-8",
+    )
+    assert m.load_refetch_ids(failed, fail) == ["11", "12"]
+
+
+def test_refetch_missing_failed_log_is_empty(tmp_path):
+    """还没跑过下载时 failed.jsonl 不存在，应安静返回空而不是报错。"""
+    assert m.load_refetch_ids(tmp_path / "nope.jsonl", tmp_path / "fail.txt") == []
+
+
+def test_refetch_marker_matches_downloader_constant():
+    """🔒 跨文件字符串契约：两侧靠这段文案耦合，改一边不改另一边会让闭环静默断开
+    （--refetch-failed 永远挑不出 id，且不报任何错）。"""
+    import download_movies as d
+    assert m.NEEDS_REFETCH_MARKER == d._NEEDS_REFETCH_MARKER
+    # 下载侧确实会把该文案写进错误消息（锁死抛错处的措辞）
+    assert m.NEEDS_REFETCH_MARKER in (
+        f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: https://x/y.mp4"
+    )

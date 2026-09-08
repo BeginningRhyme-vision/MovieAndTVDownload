@@ -35,17 +35,23 @@ def _load_dotenv(path):
 _load_dotenv(str(Path(__file__).with_name(".env")))
 
 
-def load_config():
-    """读取同目录 config.yaml 中本脚本对应的配置段；缺失时返回空字典。"""
+def load_config(section="tmdb_ids_to_links"):
+    """读取同目录 config.yaml 中指定脚本的配置段；缺失时返回空字典。
+
+    section 参数是为 --refetch-failed 准备的：它要读下载侧的 failed_log 路径，
+    那个键属于 download_movies 段。只读一个路径，不值得为此 import 整个
+    download_movies（那会连带触发 .env 解析、S3 配置、目录创建等副作用）。
+    """
     cfg_path = Path(__file__).with_name("config.yaml")
     if not cfg_path.exists():
         return {}
     with open(cfg_path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
-    return data.get("tmdb_ids_to_links", {}) or {}
+    return data.get(section, {}) or {}
 
 
 _CFG = load_config()
+_DOWNLOAD_CFG = load_config("download_movies")
 _PROXY_CFG = _CFG.get("proxy", {}) or {}
 
 # 脚本所在目录（MovieDownloader/），作为所有相对路径的根。
@@ -121,6 +127,13 @@ OUTAGE_RETRY_RATIO = 0.9
 OUTAGE_MIN_ITEMS = 50
 # NoSource 判死前换 IP 再完整探一次，两次都无源才写 fail.txt（防 CDN/代理抖动误判永久丢片）
 DEAD_CONFIRM = bool(_CFG.get("dead_confirm", True))
+
+# ⚠️ 必须与 download_movies.py 的 `_NEEDS_REFETCH_MARKER` **逐字一致**。
+# 下载侧遇 vidlink 签名直链过期（403/410）时把这段文案写进 failed.jsonl 的 error 字段，
+# 本脚本的 --refetch-failed 据此挑出要重取的 id。两边是靠字符串约定耦合的（跨进程、
+# 跨文件，没有共享常量），改一边必须同步改另一边，否则闭环会静默断开——
+# 表现是 --refetch-failed 永远挑不出任何 id，且不报任何错。有回归用例锁死这一点。
+NEEDS_REFETCH_MARKER = "需重新取流"
 
 
 # 代理开关：设为 True 时启用下方代理，False 则直连
@@ -663,6 +676,57 @@ def process_tmdb_id(tmdb_id, providers=None):
                 return "retry", None
 
 
+def load_refetch_ids(failed_log, fail_file):
+    """--refetch-failed 用：从下载侧的 failed.jsonl 里挑出"需重新取流"的 tmdb_id。
+
+    背景（闭环缺口）：vidlink 出的是带时效签名的 mp4 直链，过期后下载侧拿到
+    403/410，抛带"需重新取流"标记的错误并判死，注释里写着"交由上游重跑取流修复"。
+    但本脚本的 load_processed_ids 把 results.jsonl 里的 id 都算已处理——这片当初
+    取流是成功的、躺在 results.jsonl 里，重跑时会被直接跳过，那条过期 url 永远
+    不会被刷新。两侧各自都合理，合在一起链就断了，谁都没在负责修。
+
+    本函数就是把这条链接上：只认下载侧写的 _NEEDS_REFETCH_MARKER 文案，
+    绕过 processed 判断强制重取。因为 results.jsonl 是追加写、下载侧按
+    fetched_at 择新（见 §10.16 C），**这里不需要删改任何历史行**——
+    重新取一条更新的追加进去，下载侧自然会挑到新的那条。
+
+    已在 fail_file 里的（确认真无源）会被排除：那是走完白名单判死 + dead_confirm
+    二次确认的结论，不该被一条下载失败记录推翻。
+    """
+    dead = set()
+    if fail_file.exists():
+        with open(fail_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                tid = line.strip()
+                if tid:
+                    dead.add(tid)
+
+    ids = []
+    seen = set()
+    if not failed_log.exists():
+        return ids
+    with open(failed_log, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if NEEDS_REFETCH_MARKER not in str(obj.get("error", "")):
+                continue
+            tid = obj.get("tmdbId")
+            if tid is None:
+                continue
+            tid = str(tid).strip()
+            if not tid or tid in seen or tid in dead:
+                continue
+            seen.add(tid)
+            ids.append(tid)
+    return ids
+
+
 def load_processed_ids(results_file, fail_file):
     """已处理集合 = 取流成功过的（results）+ 确认真无源的（fail）。
 
@@ -752,6 +816,10 @@ def _parse_args(argv):
     ap.add_argument("--providers",
                     help=f"逗号分隔的取流源，覆盖 config.yaml；可选：{', '.join(PROVIDERS)}"
                          f"（默认 {', '.join(ACTIVE_PROVIDERS)}）")
+    ap.add_argument("--refetch-failed", action="store_true",
+                    help="只重取下载侧标记为“需重新取流”的影片（vidlink 签名直链过期）。"
+                         "绕过“已在 results.jsonl 即跳过”的判断，结果追加写入，"
+                         "下载侧按 fetched_at 自动选用新的那条。")
     return ap.parse_args(argv)
 
 
@@ -764,21 +832,39 @@ def main(argv=None):
     fail_file = resolve_file(_CFG.get("fail_file"), "fail.txt")
     unresolved_file = resolve_file(_CFG.get("unresolved_file"), "unresolved.txt")
 
-    if not ids_file.exists():
-        print(f"ids.txt not found: {ids_file}")
-        return
-
-    with open(ids_file, 'r', encoding='utf-8') as f:
-        ids = [line.strip() for line in f if line.strip()]
-
-    processed = load_processed_ids(results_file, fail_file)
-    to_process = [tid for tid in ids if tid not in processed]
     print(f"取流源: {', '.join(providers)}")
-    print(f"Total IDs: {len(ids)}, Already processed: {len(processed)}, To process: {len(to_process)}")
 
-    if not to_process:
-        print("All IDs processed.")
-        return
+    if args.refetch_failed:
+        # 闭环修复模式：只处理下载侧判定"直链已失效、需重新取流"的片。
+        # 这些 id 必然已在 results.jsonl 里（当初取流成功过），所以**刻意不做
+        # processed 过滤**——否则会被全部跳过，正是这个缺口本身。
+        #
+        # 注：本模式下若某片这次探出真无源，仍会照常写进 fail.txt。这是**对的**——
+        # 它同样走完了白名单判死 + dead_confirm 二次确认，与全量模式下的判死
+        # 同等可信（源站确实可能在两次取流之间下架某片）。
+        failed_log = resolve_file(_DOWNLOAD_CFG.get("failed_log"), "failed.jsonl")
+        to_process = load_refetch_ids(failed_log, fail_file)
+        print(f"[refetch-failed] 从 {failed_log.name} 挑出 "
+              f"{len(to_process)} 个待重新取流的 ID")
+        if not to_process:
+            print("没有需要重新取流的影片。")
+            return
+    else:
+        if not ids_file.exists():
+            print(f"ids.txt not found: {ids_file}")
+            return
+
+        with open(ids_file, 'r', encoding='utf-8') as f:
+            ids = [line.strip() for line in f if line.strip()]
+
+        processed = load_processed_ids(results_file, fail_file)
+        to_process = [tid for tid in ids if tid not in processed]
+        print(f"Total IDs: {len(ids)}, Already processed: {len(processed)}, "
+              f"To process: {len(to_process)}")
+
+        if not to_process:
+            print("All IDs processed.")
+            return
 
     max_workers = _CFG.get("max_workers", 50)
     max_rounds = _CFG.get("max_rounds", 8)
@@ -829,7 +915,17 @@ def main(argv=None):
     # 故单独落 unresolved_file，且不计入 load_processed_ids —— 下次运行自动重试。
     # 无条件覆盖写（包括清空）：该文件描述的是"最近一次运行结束时仍未解决的 ID"，
     # 若只在非空时才写，上次的残留会一直骗人说它们还没解决。
-    write_unresolved(unresolved_file, unresolved)
+    #
+    # ⚠️ --refetch-failed 模式下**跳过写入**：该模式只处理 failed.jsonl 里的一小撮
+    # 直链过期片，跑完就覆盖 unresolved.txt 会把全量运行留下的残留清单冲掉，
+    # 那些 ID 就此失去"下次自动重试"的线索。两种模式的 unresolved 语义不通用。
+    if args.refetch_failed:
+        if unresolved:
+            print(f"\n==> 本次重取仍有 {len(unresolved)} 个瞬时失败，"
+                  f"未写入 {unresolved_file.name}（避免覆盖全量运行的残留清单）；"
+                  f"再跑一次 --refetch-failed 即可继续重试。")
+    else:
+        write_unresolved(unresolved_file, unresolved)
 
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
 
