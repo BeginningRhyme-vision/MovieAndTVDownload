@@ -216,6 +216,17 @@ def test_vidlink_null_body_is_nosource(monkeypatch):
     assert status == "dead"
 
 
+@pytest.mark.parametrize("bad_quality", ["0", "-1"])
+def test_vidlink_non_positive_quality_becomes_none(monkeypatch, bad_quality):
+    """源站偶发 0/-1 画质。留着会让下游 meets_resolution_redline 把这个节点
+    判定性淘汰，白丢一个可用流；归 None 表示未声明、交由实测。"""
+    _install_fake_session(monkeypatch, vidlink_resp=_FakeResp(200, {
+        "stream": {"qualities": {bad_quality: {"url": "https://cdn/x.mp4"}}}}))
+    status, result = m.process_tmdb_id("42", providers=["vidlink"])
+    assert status == "ok"
+    assert result["urls"][0]["quality"] is None
+
+
 def test_vidlink_404_is_retriable_not_dead(monkeypatch):
     # 判死必须保守：404 可能是路由变更/enc 异常/WAF，只有 200+null 才是无源证据
     _install_fake_session(monkeypatch, vidlink_resp=_FakeResp(404, text="nope"))
@@ -229,6 +240,31 @@ def test_videasy_extracts_media_urls(monkeypatch):
     assert status == "ok"
     assert result["urls"][0]["provider"] == "videasy"
     assert result["urls"][0]["type"] == "m3u8"
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://a/x.m3u8", "m3u8"),
+    ("https://a/x.mp4", "mp4"),
+    # 带签名参数的直链：只看 ? 之前的路径，否则整串比对会漏判
+    ("https://cdn/v.mp4?sign=abc&t=1", "mp4"),
+    ("https://cdn/v.m3u8?token=x", "m3u8"),
+    ("https://a/X.MP4", "mp4"),          # 大小写
+    ("https://a/x.mp4#frag", "mp4"),
+    ("https://a/weird", "m3u8"),         # 认不出时保守当 m3u8
+])
+def test_media_type_is_detected_from_url(url, expected):
+    assert m._media_type_of(url) == expected
+
+
+def test_videasy_mp4_url_is_not_mislabeled_as_m3u8(monkeypatch):
+    """_find_media_urls 的正则同时匹配 .m3u8 与 .mp4。若把 mp4 直链标成 m3u8，
+    下游会拿它去解析 HLS playlist，必然失败。"""
+    _install_fake_session(monkeypatch, videasy_sources=_FakeResp(200, text="PAYLOAD"))
+    monkeypatch.setattr(m, "_find_media_urls",
+                        lambda _: ["https://cdn/movie.mp4?sign=x", "https://cdn/movie.m3u8"])
+    status, result = m.process_tmdb_id("42", providers=["videasy"])
+    assert status == "ok"
+    assert [u["type"] for u in result["urls"]] == ["mp4", "m3u8"]
 
 
 def test_videasy_no_streams_500_is_nosource(monkeypatch):

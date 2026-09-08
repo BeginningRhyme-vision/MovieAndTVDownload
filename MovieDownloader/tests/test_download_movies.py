@@ -53,6 +53,21 @@ def test_non_dict_headers_fall_back_to_empty():
     assert node["headers"] == {}
 
 
+@pytest.mark.parametrize("field", ["quality", "size"])
+@pytest.mark.parametrize("bad", [0, -1, -1080, "0", "-5"])
+def test_non_positive_quality_and_size_become_none(field, bad):
+    """results.jsonl 是跨进程的不可信输入。负数/0 会造成实质损害：
+    quality<=0 让节点被判定性淘汰；size<=0 作为总长兜底会算出空区间。
+    归 None 即"未声明"，交由下游实测，是安全的退化方向。"""
+    node = d._normalize_url_entry({"url": "https://a/x", field: bad})
+    assert node[field] is None
+
+
+def test_positive_quality_and_size_survive():
+    node = d._normalize_url_entry({"url": "https://a/x", "quality": 1080, "size": 123})
+    assert node["quality"] == 1080 and node["size"] == 123
+
+
 # ------------------------------------------------------------ mp4 直链请求头
 
 def test_mp4_headers_strip_referer_and_xhr():

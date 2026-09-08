@@ -405,6 +405,10 @@ def _fetch_vidlink(session, tmdb_id):
             quality = int(q)
         except (TypeError, ValueError):
             quality = None
+        # 非正画质（源站偶发 0/-1）不能留：下游 meets_resolution_redline 会据此
+        # 把节点判定性淘汰，白丢一个本来可用的流。None 表示未声明、交由实测。
+        if quality is not None and quality <= 0:
+            quality = None
         size = info.get("size")
         # bool 是 int 子类：size=true 会被 int() 成 1，必须排除
         if isinstance(size, bool) or not isinstance(size, (int, float)) or size <= 0:
@@ -465,7 +469,9 @@ def _fetch_videasy(session, tmdb_id):
             for u in found:
                 if u not in seen_urls:
                     seen_urls.add(u)
-                    urls.append(_url_entry(u, "videasy", "m3u8"))
+                    # _find_media_urls 的正则同时匹配 .m3u8 与 .mp4，必须按后缀分别
+                    # 标注 type：标错会让下游拿 mp4 直链去解析 HLS playlist，必然失败。
+                    urls.append(_url_entry(u, "videasy", _media_type_of(u)))
         except Exception as e:  # noqa: BLE001
             errors.append(f"{sv}: {e}")
             print(f"  videasy server '{sv}' failed for {tmdb_id}: {e}")
@@ -480,6 +486,17 @@ def _fetch_videasy(session, tmdb_id):
 
 # videasy 的解密结果结构不固定（有时嵌在 sources[].file，有时在别处），按正则递归捞直链
 _MEDIA_URL_RE = re.compile(r"https?://[^\s\"']+\.(?:m3u8|mp4)(?:\?[^\s\"']*)?", re.I)
+
+
+def _media_type_of(url):
+    """按 url 路径后缀判断是 HLS 播放列表还是 mp4 直链。
+
+    只看查询串之前的路径部分——`.mp4?sign=...` 这类带参数的直链若按整串判断会漏。
+    无法识别时保守当 m3u8（HLS 是各源的主要形态，且 m3u8 分支对非播放列表内容
+    有 validate_segment_content 兜底，比反过来更安全）。
+    """
+    path = str(url).split("?", 1)[0].split("#", 1)[0].lower()
+    return "mp4" if path.endswith(".mp4") else "m3u8"
 
 
 def _find_media_urls(obj):

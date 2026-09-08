@@ -1380,6 +1380,18 @@ def convert_ts_to_mp4(ts_path, mp4_path):
 #   - 纯 str：历史 results.jsonl（旧 vidup m3u8）；
 #   - dict：{"url","provider","type":"m3u8"|"mp4","headers","quality","size"}。
 # 这里统一归一成 dict，下游按 type 分支；非法条目返回 None（调用方跳过）。
+def _positive_or_none(value):
+    """把 quality/size 归一为正整数，非正数与非法值一律 None。
+
+    results.jsonl 是跨进程的不可信输入。负数/0 会造成实质损害：
+      - quality<=0 走 meets_resolution_redline 会被判定性淘汰，白丢一个可用节点；
+      - size<=0 作为 _mp4_probe_total_size 的 declared_size 兜底会算出空/负区间。
+    归为 None 即"未声明"，交由下游实测，是安全的退化方向。
+    """
+    parsed = parse_int(value)
+    return parsed if parsed and parsed > 0 else None
+
+
 def _normalize_url_entry(item):
     if isinstance(item, str):
         url = item.strip()
@@ -1405,8 +1417,8 @@ def _normalize_url_entry(item):
         "provider": str(item.get("provider") or "unknown"),
         "type": type_,
         "headers": {str(k): str(v) for k, v in headers.items() if v is not None},
-        "quality": parse_int(item.get("quality")),
-        "size": parse_int(item.get("size")),
+        "quality": _positive_or_none(item.get("quality")),
+        "size": _positive_or_none(item.get("size")),
     }
 
 
