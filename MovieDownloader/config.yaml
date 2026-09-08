@@ -66,7 +66,17 @@ tmdb_ids_to_links:
   #   videasy 11.7%（独占 11）、vidfast 8.0%（独占 0）、vidlink 6.7%（独占 5），ANY 13.3%
   #   命中 url 全部唯一、随机抽 18 条拉流 18/18 成功、vidup 复探 39/40 仍无源（97.5% 是真增量）
   # 注意：与 TVDownloader 的结论相反（那边 vidlink 是主力、videasy 与 vidfast 完全重合）。
-  # vidfast 独占为 0，但与 vidup 同构（零维护成本）且 servers 更多，留作坡度冗余。
+  #
+  # 同日互补性复验（AGENTS.md §10.12），各家去留依据：
+  #   videasy 必留：独占 11，移除则 ANY 40→29（-3.7pp）。虽与 vidfast 同走 peakstorm
+  #                 后端（共同命中 24 部中 20 部 url 完全相同），但检索面更广（多 m4uhd）。
+  #   vidlink 必留：独占 5，且是唯一独立片库——url 全为 hakunaymatata.com，与 peakstorm
+  #                 系零重合（共同命中 15 部，url 相同 0 部），且出 mp4 直链形成形态互补。
+  #   vidfast 保留（用户拍板"宁可慢不可漏"）：在 dead 片上独占 0、被 videasy 100% 覆盖；
+  #                 但在 vidup 有源片上，40 部中 19 部（47.5%）能给出 vidup 没有的额外节点
+  #                 （它 7 个 server，vidup 5 个）。实测救援率偏低（vidup 自身节点可播率
+  #                 97%，25 部中仅 1 部靠 vidfast 救回 = 4%），代价是每片多一轮完整链路。
+  #                 若日后要压缩取流耗时，这是第一个可以摘掉的。
   # 可用 --providers a,b 在命令行覆盖，便于单独验证某一家的实际贡献。
   providers: [vidup, videasy, vidlink, vidfast]
   # 并发线程数：同时解析多少个 tmdb_id。配合住宅代理分散 IP。
