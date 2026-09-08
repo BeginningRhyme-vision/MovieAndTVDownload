@@ -676,7 +676,7 @@ def process_tmdb_id(tmdb_id, providers=None):
                 return "retry", None
 
 
-def load_refetch_ids(failed_log, fail_file):
+def load_refetch_ids(failed_log, fail_file, success_log=None):
     """--refetch-failed 用：从下载侧的 failed.jsonl 里挑出"需重新取流"的 tmdb_id。
 
     背景（闭环缺口）：vidlink 出的是带时效签名的 mp4 直链，过期后下载侧拿到
@@ -690,8 +690,15 @@ def load_refetch_ids(failed_log, fail_file):
     fetched_at 择新（见 §10.16 C），**这里不需要删改任何历史行**——
     重新取一条更新的追加进去，下载侧自然会挑到新的那条。
 
-    已在 fail_file 里的（确认真无源）会被排除：那是走完白名单判死 + dead_confirm
-    二次确认的结论，不该被一条下载失败记录推翻。
+    两个排除条件，缺一都会造成无效重取或错误重取：
+
+    - **fail_file（确认真无源）**：那是走完白名单判死 + dead_confirm 二次确认的
+      结论，不该被一条下载失败记录推翻。
+    - **success_log（已经下成功了）**：failed.jsonl 是**纯追加、永不清理**的
+      （全程无 truncate，唯一的删除是 remove_upload_failure_from_log，且只删
+      stage=="upload" 的行）。所以某片被本命令修复、下载成功后，它那条旧的
+      "需重新取流"记录**仍留在 failed.jsonl 里**，下次再跑还会被挑出来重取一遍。
+      不排除的话，无效重取会随运行次数持续累积。
     """
     dead = set()
     if fail_file.exists():
@@ -700,6 +707,21 @@ def load_refetch_ids(failed_log, fail_file):
                 tid = line.strip()
                 if tid:
                     dead.add(tid)
+
+    done = set()
+    if success_log is not None and success_log.exists():
+        with open(success_log, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tid = obj.get("tmdbId")
+                if tid is not None:
+                    done.add(str(tid).strip())
 
     ids = []
     seen = set()
@@ -720,7 +742,7 @@ def load_refetch_ids(failed_log, fail_file):
             if tid is None:
                 continue
             tid = str(tid).strip()
-            if not tid or tid in seen or tid in dead:
+            if not tid or tid in seen or tid in dead or tid in done:
                 continue
             seen.add(tid)
             ids.append(tid)
@@ -843,7 +865,8 @@ def main(argv=None):
         # 它同样走完了白名单判死 + dead_confirm 二次确认，与全量模式下的判死
         # 同等可信（源站确实可能在两次取流之间下架某片）。
         failed_log = resolve_file(_DOWNLOAD_CFG.get("failed_log"), "failed.jsonl")
-        to_process = load_refetch_ids(failed_log, fail_file)
+        success_log = resolve_file(_DOWNLOAD_CFG.get("success_log"), "success.jsonl")
+        to_process = load_refetch_ids(failed_log, fail_file, success_log)
         print(f"[refetch-failed] 从 {failed_log.name} 挑出 "
               f"{len(to_process)} 个待重新取流的 ID")
         if not to_process:

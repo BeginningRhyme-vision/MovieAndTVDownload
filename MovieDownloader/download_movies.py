@@ -646,6 +646,10 @@ def _classify_failure(error_msg):
 # 被拒/失败原因归类规则：(类别名, 命中关键字元组)，按顺序首个命中者胜出。
 # 仅用于收尾聚合统计（观测性），量化各类误杀/失败占比，指导码率门槛校准。
 # 不参与任何判定逻辑，改动零风险。
+#
+# 例外：`_REFETCH_REASON_LABEL` 这一类**会被收尾提示读取**（提示用户跑
+# --refetch-failed），故抽成常量而非裸字符串——改类别名时不会漏掉那处。
+_REFETCH_REASON_LABEL = "直链失效需重新取流"
 _REJECT_REASON_RULES = (
     ("缺少字段/无媒体列表", ("缺少 tmdbId 或 urls", "没有找到媒体播放列表")),
     # “候选流无一入选”是汇总文案（不含单因 marker），须先于单因规则匹配。
@@ -657,7 +661,7 @@ _REJECT_REASON_RULES = (
     ("采样数据异常", ("采样数据或采样时长",)),
     ("正片缺片率过高", ("缺片率过高",)),
     ("源返回非视频分片", ("服务器返回的不是视频分片",)),
-    ("直链失效需重新取流", (_NEEDS_REFETCH_MARKER,)),
+    (_REFETCH_REASON_LABEL, (_NEEDS_REFETCH_MARKER,)),
     # mp4 直链专属类目：与上面的 m3u8 类目并列，便于在收尾统计里单独看
     # vidlink 直链的淘汰构成（多源接入后校准门槛/判断源质量的关键数据）。
     # 放在“超时/SSL”之前：这几条是确定性结论，不该被通用网络类目抢先命中。
@@ -2880,6 +2884,21 @@ def _run_pipeline():
             )
             _print_reject_stats(
                 "可重试失败（瞬时错误）", reject_retriable, "跨轮重投会重复计数"
+            )
+
+        # 直链过期是**唯一一类"本脚本判死、但上游一条命令就能救回"**的失败：
+        # vidlink 的签名 url 有时效，重投同一条必然再挂，所以这里判死；但只要重新
+        # 取一次流就能拿到新链接。若不主动提示，这些片会安静躺在 failed.jsonl 里
+        # ——它们既不在 success.jsonl 也不在磁盘上，下次运行会被重新投递，然后拿着
+        # 同一条过期 url 再失败一次，每跑一轮白费一次，且永远不会自己好转。
+        expired_count = reject_permanent.get(_REFETCH_REASON_LABEL, 0)
+        if expired_count:
+            print(
+                f"\n⚠️  有 {expired_count} 部因直链已失效（签名过期）而失败。\n"
+                f"    这类失败**重跑本脚本无效**（拿到的还是同一条过期 url），\n"
+                f"    需先让上游换一条新直链：\n"
+                f"        python tmdb_ids_to_links.py --refetch-failed\n"
+                f"    跑完再重新执行本脚本即可（新结果会按 fetched_at 自动选用）。"
             )
 
 

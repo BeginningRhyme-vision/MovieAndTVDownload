@@ -483,6 +483,32 @@ def test_refetch_missing_failed_log_is_empty(tmp_path):
     assert m.load_refetch_ids(tmp_path / "nope.jsonl", tmp_path / "fail.txt") == []
 
 
+def test_refetch_skips_already_downloaded(tmp_path):
+    """已下成功的不重取：failed.jsonl 纯追加、永不清理，某片被本命令救回后
+    那条旧的"需重新取流"记录仍留在文件里，不排除会让无效重取逐次累积。"""
+    failed = tmp_path / "failed.jsonl"
+    fail = tmp_path / "fail.txt"
+    success = tmp_path / "success.jsonl"
+    _write_failed_log(failed, [
+        {"tmdbId": "11", "error": f"{m.NEEDS_REFETCH_MARKER}: u"},
+        {"tmdbId": "22", "error": f"{m.NEEDS_REFETCH_MARKER}: u"},
+    ])
+    # 22 后来被救回并下载成功（success.jsonl 里 tmdbId 可能是 int）
+    success.write_text(json.dumps({"tmdbId": 22}) + "\n", encoding="utf-8")
+    assert m.load_refetch_ids(failed, fail, success) == ["11"]
+
+
+def test_refetch_without_success_log_still_works(tmp_path):
+    """success_log 省略或文件不存在时不应报错（首次运行、或只想全量重取）。"""
+    failed = tmp_path / "failed.jsonl"
+    fail = tmp_path / "fail.txt"
+    _write_failed_log(failed, [
+        {"tmdbId": "11", "error": f"{m.NEEDS_REFETCH_MARKER}: u"},
+    ])
+    assert m.load_refetch_ids(failed, fail) == ["11"]
+    assert m.load_refetch_ids(failed, fail, tmp_path / "nope.jsonl") == ["11"]
+
+
 def test_refetch_marker_matches_downloader_constant():
     """🔒 跨文件字符串契约：两侧靠这段文案耦合，改一边不改另一边会让闭环静默断开
     （--refetch-failed 永远挑不出 id，且不报任何错）。"""

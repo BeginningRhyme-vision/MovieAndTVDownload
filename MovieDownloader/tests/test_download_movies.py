@@ -143,6 +143,23 @@ def test_reject_reason_rules_are_ordered_before_generic_ones():
     assert "重新取流" in reason
 
 
+def test_refetch_label_is_what_classifier_actually_emits():
+    """🔒 收尾提示靠 `reject_permanent[_REFETCH_REASON_LABEL]` 判断要不要提醒用户跑
+    --refetch-failed。若该常量与分类器实际产出的类别名对不上，计数恒为 0，
+    提示永远不出现——而这些片正是"重跑下载无效、必须先重新取流"的那批。
+
+    真正的风险不是改常量（规则表引用同一个常量，会一起变），而是**把规则表里
+    那条规则删掉、改判定关键字、或被前面的规则抢先命中**。故断言分类器对真实
+    错误文案的产出，而不是断言两个常量相等（那是同义反复）。
+    """
+    reason = d.classify_reject_reason(
+        f"直链已失效（HTTP 410），{d._NEEDS_REFETCH_MARKER}: https://cdn/a.mp4")
+    assert reason == d._REFETCH_REASON_LABEL
+    # 规则表里必须真有这一类，否则上面的断言在规则被删后会静默退化
+    assert any(label == d._REFETCH_REASON_LABEL
+               for label, _ in d._REJECT_REASON_RULES)
+
+
 # ------------------------------------------------ 输入去重按 fetched_at 择新
 
 def _pick_latest(rows):
