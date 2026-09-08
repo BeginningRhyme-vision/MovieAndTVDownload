@@ -254,6 +254,20 @@ download_movies:
   # 未完成 future 挂/摘 waiter，主循环退化成 O(N²)；分批后 wait 规模恒定。
   # 留空/不配时默认 max_workers × 2。
   download_queue_depth: 64
+  # 流式来源（§12 取流↔下载重叠）下，「在途任务已排空但取流还没产出新片」时的
+  # 轮询间隔（秒）。只有这一种情况才会 sleep——此刻主循环无事可做，不让出 CPU
+  # 就是 100% 空转。取流侧产出约 4.6 部/分钟，2s 粒度远不构成瓶颈。
+  # 单独跑 download_movies.py（非 pipeline 模式）时这段逻辑永不触发。
+  stream_idle_poll_seconds: 2
+  # pipeline.py（取流↔下载同进程重叠）专用。仅 `python pipeline.py` 读取，
+  # 单独跑 tmdb_ids_to_links.py / download_movies.py 时完全无影响。
+  pipeline:
+    # 取流→下载的队列容量（部）。满了之后取流侧入队会阻塞，天然形成反压。
+    # 取流才是瓶颈（~4.6 部/分钟 < 下载 ~6.4 部/分钟），队列长期偏空，
+    # 这个上限基本碰不到——它是保险丝，不是主调节手段。
+    # 调大 = 允许取流跑在下载前面更多，但直链在队列里等待的时间也更长
+    # （vidlink 签名有时效，这正是 §12 要解决的问题）。
+    queue_maxsize: 200
   # 独立的 FFmpeg 转封装线程数。转封装是 `ffmpeg -c copy` 纯 IO 拷贝，并发过高
   # 只会在同一块盘上互抢 IO，吞吐不升反降。
   convert_workers: 8

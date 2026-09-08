@@ -6,6 +6,7 @@
 """
 
 import json
+import os
 
 import pytest
 
@@ -435,7 +436,8 @@ def _stub_final_retry(monkeypatch, batches):
     slept = []
     queue = list(batches)
 
-    def fake_run_batch(ids, results_file, fail_file, max_workers, providers=None):
+    def fake_run_batch(ids, results_file, fail_file, max_workers, providers=None,
+                       on_result=None):
         calls.append(list(ids))
         return queue.pop(0)
 
@@ -584,3 +586,108 @@ def test_refetch_marker_matches_downloader_constant():
     assert m.NEEDS_REFETCH_MARKER in (
         f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: https://x/y.mp4"
     )
+
+
+# ------------------------------------------------- 取流侧单实例锁（§12 第 2 步）
+
+@pytest.fixture
+def fetch_lock(tmp_path, monkeypatch):
+    """把锁文件指到临时目录，避免污染真实脚本目录。"""
+    lock = tmp_path / "tmdb_ids_to_links.main.lock"
+    monkeypatch.setattr(m, "FETCH_LOCK_FILE", str(lock))
+    yield lock
+
+
+def test_fetch_lock_blocks_a_second_live_instance(fetch_lock, monkeypatch):
+    """两个全量取流同时跑会重复写 results.jsonl、白烧一倍代理流量，必须拦住。"""
+    # 伪造一把由"别的活进程"持有的锁
+    fetch_lock.write_text("999999")
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
+
+    with pytest.raises(SystemExit) as excinfo:
+        m.acquire_fetch_lock()
+    assert "已有取流进程在运行" in str(excinfo.value)
+
+
+def test_fetch_lock_reclaims_stale_lock(fetch_lock, monkeypatch):
+    """上次异常退出留下的陈旧锁（PID 已死）必须能自动接管，否则要人工删文件。"""
+    fetch_lock.write_text("999999")
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
+
+    m.acquire_fetch_lock()  # 不该抛
+
+    assert fetch_lock.read_text().strip() == str(os.getpid())
+    m.release_fetch_lock()
+    assert not fetch_lock.exists()
+
+
+def test_fetch_lock_release_only_removes_own_lock(fetch_lock, monkeypatch):
+    """绝不能删掉别人的锁：那会让两个全量取流同时跑起来。"""
+    fetch_lock.write_text("999999")
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
+
+    m.release_fetch_lock()
+
+    assert fetch_lock.exists(), "误删了其他进程的锁"
+
+
+def test_fetch_lock_roundtrip_is_idempotent(fetch_lock):
+    m.acquire_fetch_lock()
+    assert m.is_fetch_running() is True  # 自己持有时也算"在运行"
+    m.release_fetch_lock()
+    assert m.is_fetch_running() is False
+    m.release_fetch_lock()  # 重复释放不该抛
+
+
+# ------------------------------------------------- on_result 回调（§12 快车道）
+
+def test_run_batch_forwards_ok_results_to_callback(tmp_path, monkeypatch):
+    """ok 结果要同时落盘**和**走回调，两条路都不能少。"""
+    results = tmp_path / "results.jsonl"
+    fail = tmp_path / "fail.txt"
+    monkeypatch.setattr(
+        m, "process_tmdb_id",
+        lambda tid, providers=None: ("ok", {"tmdbId": tid, "urls": [], "title": "T"})
+    )
+    got = []
+
+    m.run_batch(["1", "2"], results, fail, max_workers=2, on_result=got.append)
+
+    assert sorted(e["tmdbId"] for e in got) == ["1", "2"]
+    # 落盘照旧——断点续跑/fetched_at 择新全靠它，绝不能因为有了回调就省掉
+    lines = [json.loads(x) for x in results.read_text().splitlines() if x.strip()]
+    assert sorted(e["tmdbId"] for e in lines) == ["1", "2"]
+
+
+def test_run_batch_survives_a_throwing_callback(tmp_path, monkeypatch):
+    """回调抛异常不得影响取流：结果已落盘，不能因为下游出问题就白跑一轮。"""
+    results = tmp_path / "results.jsonl"
+    fail = tmp_path / "fail.txt"
+    monkeypatch.setattr(
+        m, "process_tmdb_id",
+        lambda tid, providers=None: ("ok", {"tmdbId": tid, "urls": [], "title": "T"})
+    )
+
+    def boom(_result):
+        raise RuntimeError("队列炸了")
+
+    retry = m.run_batch(["1"], results, fail, max_workers=1, on_result=boom)
+
+    assert retry == []  # 没被误判成"待重跑"
+    lines = [x for x in results.read_text().splitlines() if x.strip()]
+    assert len(lines) == 1, "回调异常不该影响落盘"
+
+
+def test_run_batch_does_not_call_back_for_dead_or_retry(tmp_path, monkeypatch):
+    """只有 ok 才进队列：dead 是真无源、retry 还没有 urls，投给下载侧都是错的。"""
+    results = tmp_path / "results.jsonl"
+    fail = tmp_path / "fail.txt"
+    outcomes = {"1": ("dead", None), "2": ("retry", None)}
+    monkeypatch.setattr(
+        m, "process_tmdb_id", lambda tid, providers=None: outcomes[tid]
+    )
+    got = []
+
+    m.run_batch(["1", "2"], results, fail, max_workers=2, on_result=got.append)
+
+    assert got == []

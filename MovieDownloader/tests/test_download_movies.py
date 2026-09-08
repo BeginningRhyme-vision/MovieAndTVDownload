@@ -647,6 +647,108 @@ def test_merge_next_batch_keeps_refetch_only_entries():
     assert [e["tmdbId"] for e in merged] == ["9"]
 
 
+# ---- 首轮来源抽象（§12 流式化第 1 步）----
+
+
+def test_list_source_yields_every_entry_in_order_then_done():
+    """list 来源必须逐个吐出全部条目、顺序不变，最后返回 done。
+
+    锁死"改造后行为与改造前 `current_batch[next_submit]` 完全一致"：
+    首轮/重试轮都靠它，顺序或数量变了会直接影响投递语义。
+    """
+    entries = [{"tmdbId": str(i)} for i in range(3)]
+    source = d.ListEntrySource(entries)
+
+    got = []
+    while True:
+        state, entry = source.poll()
+        if state == "done":
+            break
+        assert state == "item"
+        got.append(entry["tmdbId"])
+
+    assert got == ["0", "1", "2"]
+    # 耗尽后必须稳定返回 done（主循环会重复问），不能抛异常或吐出重复条目。
+    assert source.poll() == ("done", None)
+
+
+def test_list_source_never_returns_wait():
+    """list 的存货是确定的，绝不能返回 wait。
+
+    若返回 wait，主循环会进入 STREAM_IDLE_POLL_SECONDS 的 sleep 分支空转，
+    把"本该立刻投递完"的一轮拖成按秒轮询。
+    """
+    source = d.ListEntrySource([{"tmdbId": "1"}])
+    assert source.poll()[0] == "item"
+    assert source.poll()[0] == "done"
+
+
+def test_empty_list_source_is_done_immediately():
+    """空批次必须立刻 done，否则首轮会卡在等待里永不收尾。"""
+    assert d.ListEntrySource([]).poll() == ("done", None)
+
+
+def test_list_source_snapshots_input():
+    """来源要对入参做快照：调用方后续改动原 list 不得影响已在跑的一轮。"""
+    entries = [{"tmdbId": "1"}]
+    source = d.ListEntrySource(entries)
+    entries.append({"tmdbId": "2"})
+
+    assert source.poll()[0] == "item"
+    assert source.poll() == ("done", None)
+
+
+def test_stream_idle_poll_is_positive():
+    """空闲轮询间隔必须为正：0 会让 pending 空时退化成 100% CPU 忙等。"""
+    assert d.STREAM_IDLE_POLL_SECONDS > 0
+
+
+def test_streaming_source_does_not_busy_wait_when_producer_is_slow():
+    """流式来源返回 wait 时，主循环必须让出 CPU，不能忙等。
+
+    复刻主循环那段"pending 为空 + 来源未耗尽"的分支：此时 wait(空集合) 会立刻
+    返回，若不 sleep 就是 100% CPU 空转。这里用一个"前 N 次说 wait、之后才出货"
+    的来源，断言轮询次数没有失控（真忙等会在同样时长里转出几万次）。
+    """
+    class _SlowSource:
+        def __init__(self, wait_times):
+            self.remaining_waits = wait_times
+            self.polls = 0
+            self.delivered = False
+
+        def poll(self):
+            self.polls += 1
+            if self.remaining_waits > 0:
+                self.remaining_waits -= 1
+                return "wait", None
+            if not self.delivered:
+                self.delivered = True
+                return "item", {"tmdbId": "1"}
+            return "done", None
+
+    source = _SlowSource(wait_times=3)
+    sleeps = []
+
+    # 复刻主循环的空闲分支：pending 空且来源未耗尽 -> sleep 后重新问来源要货。
+    exhausted = False
+    collected = []
+    while not exhausted:
+        state, entry = source.poll()
+        if state == "done":
+            exhausted = True
+        elif state == "item":
+            collected.append(entry)
+        else:
+            sleeps.append(d.STREAM_IDLE_POLL_SECONDS)
+
+    assert collected == [{"tmdbId": "1"}]
+    # 三次 wait 必须各对应一次让出 CPU，否则就是忙等。
+    assert len(sleeps) == 3
+    assert all(s > 0 for s in sleeps)
+    # 轮询次数应与"3 次 wait + 1 次出货 + 1 次 done"精确对应，不多不少。
+    assert source.polls == 5
+
+
 def test_refetch_survives_system_exit_from_fetcher(sandbox, monkeypatch):
     """取流模块用模块级 `raise SystemExit` 做配置校验，必须被兜住。
 

@@ -132,6 +132,13 @@ DOWNLOAD_QUEUE_DEPTH = max(
     int(MAX_WORKERS) + 1,
     int(_CFG.get("download_queue_depth", int(MAX_WORKERS) * 2)),
 )
+# 流式来源（§12）下"在途任务已排空、生产者仍未产出新片"时的轮询间隔（秒）。
+# 只在这一种情况下才会 sleep：此刻 pending 为空，wait() 会立即返回、退化成
+# 100% CPU 空转，故必须让出 CPU。取值无需精细——取流侧产出约 4.6 部/分钟
+# （§12.3），2s 的粒度不会成为瓶颈；用 list 来源时这段逻辑永不触发。
+STREAM_IDLE_POLL_SECONDS = max(
+    0.1, float(_CFG.get("stream_idle_poll_seconds", 2))
+)
 # 独立的 FFmpeg 转封装/移动线程数，不占用上面的下载槽位。
 # 转封装是 `ffmpeg -c copy` 纯 IO 拷贝，并发过高只会在同一块盘上互抢 IO，
 # 吞吐不升反降，故取值明显低于 max_workers。
@@ -776,6 +783,43 @@ def plan_retry_buckets(retriable, error_msg):
         bool(retriable),
         AUTO_REFETCH_ENABLED and needs_refetch(error_msg),
     )
+
+
+# ---- 首轮待下载条目的来源抽象（§12 流式化改造，第 1 步）----
+# 背景：首轮原本是一个已读全的固定 list（`current_batch[next_submit]`）。要让取流
+# 与下载重叠（§12.1），首轮必须能"边产边下"。这里把"下一部要下载的片从哪来"抽象成
+# 一个统一接口，主循环只依赖该接口，不关心背后是 list 还是队列。
+#
+# 🔑 poll() 必须**非阻塞且三态**，这是整个设计的关键约束：
+#   ("item", entry) 拿到一部片
+#   ("wait", None)  暂时没货，但生产者还活着 —— 主循环应去推进在途任务，稍后再问
+#   ("done", None)  生产者已收工且存货取尽 —— 首轮投递到此为止
+#
+# 为什么不能设计成"没货就阻塞等"：主事件循环若卡在 poll() 里，`wait(pending)` 就
+# 停摆——已下载完的片无人提交转封装、成品堆在 temp、上传信号量不释放。这正是
+# §10.21 B-6 踩过的坑（refetch 阻塞主循环数十分钟），不能再踩第二次。
+class ListEntrySource:
+    """把既有的固定 list 包装成来源接口：行为与改造前逐个索引取数完全一致。
+
+    第二轮起的重试批次仍用它，故多轮语义零改动；首轮在 download_movies.py 单独
+    运行时也用它（此时 results.jsonl 是取流跑完后的静态文件，一次读全最简单）。
+    永不返回 "wait" —— list 的存货是确定的，不存在"暂时没货"。
+    """
+
+    def __init__(self, entries):
+        self._entries = list(entries)
+        self._next = 0
+
+    def poll(self):
+        if self._next < len(self._entries):
+            entry = self._entries[self._next]
+            self._next += 1
+            return "item", entry
+        return "done", None
+
+    def __len__(self):
+        """已知总量，仅供日志显示；队列来源无此方法，故打印处需容错。"""
+        return len(self._entries)
 
 
 def merge_next_batch(round_failed_retriable, revived):
@@ -3037,10 +3081,21 @@ def _run_pipeline():
         while True:
             # 每轮开头清空 download_fail 状态文件，只记录本轮下载失败。
             truncate_log(DOWNLOAD_FAIL_LOG)
+            # 本轮待下载条目的来源（§12 第 1 步）。当前两轮都传 list，行为与改造前
+            # 完全一致；第 2 步会在首轮改传队列来源，其余轮次仍是 list。
+            batch_source = (
+                current_batch if hasattr(current_batch, "poll")
+                else ListEntrySource(current_batch)
+            )
+            # 队列来源没有确定总量，故取不到长度时显示"未知"而不是崩掉。
+            try:
+                batch_total = f"{len(batch_source)} 部"
+            except TypeError:
+                batch_total = "持续接收中"
             if MULTI_ROUND_ENABLED and MAX_ROUNDS > 1:
                 print(
                     f"\n===== 下载轮次 {round_no}/{MAX_ROUNDS}："
-                    f"本轮待下载 {len(current_batch)} 部 =====",
+                    f"本轮待下载 {batch_total} =====",
                     flush=True,
                 )
 
@@ -3050,17 +3105,25 @@ def _run_pipeline():
             # 全投会让主循环退化成 O(N²) 空转，把 CPU 耗在 waiter 管理上。
             # 语义完全不变：本轮每一部仍会被逐一投递，且全部有结论后才进下一轮；
             # 附带收益是磁盘占用更平滑（未投递的片不占 temp）。
-            next_submit = 0
+            source_exhausted = False
             round_download_futures = set()
 
             def submit_downloads():
-                nonlocal next_submit
-                while (
-                    len(round_download_futures) < DOWNLOAD_QUEUE_DEPTH
-                    and next_submit < len(current_batch)
-                ):
-                    entry = current_batch[next_submit]
-                    next_submit += 1
+                """从来源取片填满下载槽位。返回 False 表示"来源暂时没货但未耗尽"。
+
+                取到 "wait" 时立即停止本次投递（而不是原地等），把控制权交回主循环
+                去推进在途的转封装/上传——绝不能在这里阻塞（见 ListEntrySource 注释）。
+                """
+                nonlocal source_exhausted
+                while len(round_download_futures) < DOWNLOAD_QUEUE_DEPTH:
+                    if source_exhausted:
+                        return True
+                    state, entry = batch_source.poll()
+                    if state == "done":
+                        source_exhausted = True
+                        return True
+                    if state == "wait":
+                        return False
                     f = download_executor.submit(
                         process_one_entry, entry, processed_ids
                     )
@@ -3068,6 +3131,7 @@ def _run_pipeline():
                     stage_of[f] = "download"
                     pending.add(f)
                     round_download_futures.add(f)
+                return True
 
             round_failed_retriable = []
             round_failed_expired = []
@@ -3076,10 +3140,18 @@ def _run_pipeline():
             # 关键：只等“本轮下载 future”全部离开 download 阶段即算本轮下载完成，
             # 不等 pending 全空。上一轮遗留的转封装/上传在同一循环里并行推进，
             # 但不阻塞本轮判定——这正是方案 A 的并行精髓。
-            # 循环条件涵盖“还有在途下载”或“还有未投递的片”，二者皆空才收尾；
-            # 此时 pending 必非空（submit_downloads 已在上一轮末尾补满），
-            # 不会出现 wait 空集合的忙等。
-            while round_download_futures or next_submit < len(current_batch):
+            # 循环条件涵盖“还有在途下载”或“来源尚未耗尽”，二者皆空才收尾。
+            while round_download_futures or not source_exhausted:
+                if not pending:
+                    # 仅流式来源会走到这里：`round_download_futures ⊆ pending`
+                    # （两者的 add/discard 严格成对），故 pending 空即本轮无在途
+                    # 下载，再结合循环条件可知来源必定尚未耗尽——也就是"在途任务
+                    # 已排空，但生产者还没产出新片"。此时 wait(空集合) 会立刻返回、
+                    # 退化成 100% CPU 空转，故让出 CPU 后重新问来源要货。
+                    # list 来源永不返回 wait，故这段对单独跑下载的场景是死分支。
+                    time.sleep(STREAM_IDLE_POLL_SECONDS)
+                    submit_downloads()
+                    continue
                 done, _ = wait(pending, return_when=FIRST_COMPLETED)
                 for future in done:
                     pending.discard(future)

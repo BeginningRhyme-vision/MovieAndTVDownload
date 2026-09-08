@@ -790,12 +790,21 @@ def load_processed_ids(results_file, fail_file):
     return processed
 
 
-def run_batch(to_process, results_file, fail_file, max_workers, providers=None):
+def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
+              on_result=None):
     """并发处理一批 ID，实时落盘 ok/dead，返回本批"瞬时耗尽"待重跑的 ID 列表。
 
       - "ok"    → 追加写 results_file（output）
       - "dead"  → 追加写 fail_file，永久排除
       - "retry" → 不落盘，收集返回，交给上层多轮循环下一轮重跑
+
+    on_result（可选，§12 pipeline 模式用）：取到一条 ok 结果时回调一次，
+    让下游（下载侧）立刻拿到它，而不必等整轮跑完再读文件。
+      - 落盘照旧：回调只是"额外的快车道"，results_file 一行不少，
+        故断点续跑 / fetched_at 择新 / --refetch-failed 全部不受影响；
+      - **在写盘锁之外调用**，故允许阻塞（pipeline 的队列满时正是靠它形成反压）；
+        放在锁内会让一条的等待堵死其余所有取流线程，反压就变成了冻结；
+      - 回调抛异常不得影响取流：已落盘的结果不能因为下游出问题而白费。
     """
     lock = threading.Lock()
     ok_count = 0
@@ -817,6 +826,18 @@ def run_batch(to_process, results_file, fail_file, max_workers, providers=None):
                 with open(fail_file, 'a', encoding='utf-8') as f:
                     f.write(f"{tid}\n")
                 print(f"❌ DEAD: {tid}")
+        # ⚠️ 回调必须在**锁外**执行：它可能阻塞（pipeline 模式下队列满时要等
+        # 下载侧腾出空位，最长可达数分钟）。若放在临界区内，这一条的等待会把
+        # 其余 max_workers-1 个取流线程全堵在 lock 上，整批取流吞吐直接归零——
+        # 反压本意是"降速"，绝不该变成"冻结"。
+        # 落盘已在锁内完成，故此处失败也不丢数据。
+        if status == "ok" and result and on_result is not None:
+            # 下游（队列）出问题绝不能带塌取流：结果已经落盘了，
+            # 大不了这一条走不了快车道，下次运行仍能从文件里读到。
+            try:
+                on_result(result)
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ 结果回调异常（已落盘，不影响取流）: {exc}")
         return status
 
     # 线程池手动管理：Ctrl+C 时取消排队任务立即退出，不等几十万个 future 跑完
@@ -858,7 +879,22 @@ def _parse_args(argv):
     return ap.parse_args(argv)
 
 
-def main(argv=None):
+def main(argv=None, on_result=None):
+    """取流主流程。
+
+    on_result（可选）：pipeline 模式（§12）下把每条 ok 结果实时推给下游，
+    详见 run_batch 的同名参数。为 None 时行为与改造前完全一致。
+
+    单实例锁在 _main_impl 内按模式条件获取，这里统一释放：release 只在锁属于
+    本进程时才删文件，故 --refetch-failed（没抢锁）走到这里也是安全的空操作。
+    """
+    try:
+        return _main_impl(argv=argv, on_result=on_result)
+    finally:
+        release_fetch_lock()
+
+
+def _main_impl(argv=None, on_result=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     providers = _resolve_providers(args.providers) if args.providers else list(ACTIVE_PROVIDERS)
 
@@ -886,6 +922,10 @@ def main(argv=None):
             print("没有需要重新取流的影片。")
             return
     else:
+        # 全量取流才抢单实例锁：两个全量同时跑会重复写 results.jsonl。
+        # --refetch-failed **刻意不抢**——它只补跑一小撮直链过期的片、纯追加写，
+        # 本就设计为可与主流程共存（§10.21 G 已验证两者靠 fetched_at 择新互不冲突）。
+        acquire_fetch_lock()
         if not ids_file.exists():
             print(f"ids.txt not found: {ids_file}")
             return
@@ -918,7 +958,8 @@ def main(argv=None):
         print(f"{'=' * 70}")
 
         batch_size = len(pending)
-        retry_ids = run_batch(pending, results_file, fail_file, max_workers, providers=providers)
+        retry_ids = run_batch(pending, results_file, fail_file, max_workers,
+                              providers=providers, on_result=on_result)
 
         if not retry_ids:
             print("\n==> 瞬时失败已清零，所有有源 ID 已捞干净，正常结束。")
@@ -929,7 +970,8 @@ def main(argv=None):
             # 是"代理额度耗尽"或"enc-dec 维护"这类几十分钟级的，整批会在这里被放弃、
             # 等人发起下次运行。加时赛用长冷却再试几轮，把它们自动捞回来。
             unresolved, extra_rounds = _final_retry(
-                retry_ids, results_file, fail_file, max_workers, providers
+                retry_ids, results_file, fail_file, max_workers, providers,
+                on_result=on_result
             )
             round_no += extra_rounds
             if not unresolved:
@@ -976,7 +1018,8 @@ def main(argv=None):
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")
 
 
-def _final_retry(retry_ids, results_file, fail_file, max_workers, providers):
+def _final_retry(retry_ids, results_file, fail_file, max_workers, providers,
+                 on_result=None):
     """常规轮次跑满后的加时赛：长冷却再试几轮。
 
     返回 (仍未解决的 ID 列表, 实际跑了几轮)。轮数要回传给调用方，否则收尾打印的
@@ -1007,11 +1050,81 @@ def _final_retry(retry_ids, results_file, fail_file, max_workers, providers):
             time.sleep(FINAL_RETRY_COOLDOWN)
 
         pending = run_batch(
-            pending, results_file, fail_file, max_workers, providers=providers
+            pending, results_file, fail_file, max_workers, providers=providers,
+            on_result=on_result
         )
         if not pending:
             return [], extra_round
     return pending, FINAL_RETRY_ROUNDS
+
+
+# ---- 取流侧单实例锁（§12 第 2 步补齐）----
+# 下载侧一直有 acquire_main_lock，取流侧此前没有：两个全量取流同时跑会各自
+# 追加写同一个 results.jsonl（两边的 load_processed_ids 都是启动时读一次快照，
+# 拦不住对方后续新增的行），产出大量重复条目、白烧一倍代理流量。
+# pipeline 模式把取流也拉进同一进程，更需要这把锁。
+# 与下载侧完全同构（PID 文件 + 陈旧锁自动清理），刻意不共用一把锁：
+# "只跑取流"和"只跑下载"本就该能同机并行，这是既有的使用方式。
+FETCH_LOCK_FILE = str((_SCRIPT_DIR / "tmdb_ids_to_links.main.lock").resolve())
+
+
+def _pid_alive(pid):
+    """判断给定 PID 的进程是否存活（不发送真正的信号）。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 进程存在但无权限——仍视为存活。
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock_pid():
+    try:
+        with open(FETCH_LOCK_FILE, "r", encoding="utf-8") as f:
+            return int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def is_fetch_running():
+    """取流主流程是否已在运行；陈旧锁（PID 已死）会被就地清理并返回 False。"""
+    if not os.path.exists(FETCH_LOCK_FILE):
+        return False
+    pid = _read_lock_pid()
+    if pid > 0 and pid != os.getpid() and _pid_alive(pid):
+        return True
+    if pid == os.getpid():
+        return True
+    try:
+        os.remove(FETCH_LOCK_FILE)
+    except OSError:
+        pass
+    return False
+
+
+def acquire_fetch_lock():
+    """抢取流单实例锁；已被别的活进程持有时抛 SystemExit。"""
+    if is_fetch_running():
+        raise SystemExit(
+            f"已有取流进程在运行（PID {_read_lock_pid()}）。\n"
+            f"两个全量取流同时跑会重复写 results.jsonl、白烧一倍代理流量。\n"
+            f"若确认那个进程已死，删掉 {FETCH_LOCK_FILE} 再试。"
+        )
+    with open(FETCH_LOCK_FILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+
+def release_fetch_lock():
+    """退出时清理锁文件（仅当锁属于本进程时才删）。"""
+    if _read_lock_pid() == os.getpid():
+        try:
+            os.remove(FETCH_LOCK_FILE)
+        except OSError:
+            pass
 
 
 def write_unresolved(unresolved_file, ids):
