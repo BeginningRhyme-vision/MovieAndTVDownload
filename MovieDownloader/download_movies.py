@@ -1471,6 +1471,13 @@ def parse_resolution(resolution):
         return None
 
 
+# 分辨率探测不出来时的占位文案。模式 B 下分辨率不参与判定，探不到也照常下载
+# （§12.15），此时它只是**成品元数据**，缺了不影响正确性但影响日后检索。
+# 抽成常量是因为 finalize_one_entry 要拿它做相等比较来决定补探——散成字面量
+# 的话，哪天改了措辞而漏改比较处，补探就会静默失效。
+UNKNOWN_RESOLUTION = "未知分辨率"
+
+
 def probe_resolution(sample_path):
     """用 ffprobe 读取采样文件的真实分辨率，失败返回 None。"""
     command = [
@@ -2100,7 +2107,7 @@ def _mp4_probe_quality_by_sample(
             resolution = f"{actual_size[0]}x{actual_size[1]}"
         else:
             height = 0
-            resolution = "未知分辨率"
+            resolution = UNKNOWN_RESOLUTION
 
         duration = None
         minutes = parse_int(runtime_minutes)
@@ -2419,7 +2426,7 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None,
         resolution = f"{actual_size[0]}x{actual_size[1]}"
         height = actual_size[1]
     else:
-        resolution = "未知分辨率"
+        resolution = UNKNOWN_RESOLUTION
         height = 0
     print(f"  [{label}] 直链实测分辨率: {resolution}")
     if not meets_resolution_redline(height):
@@ -2676,7 +2683,7 @@ def process_one_entry(entry, processed_ids):
                         # 模式 B 才会走到这里。master 未声明且探测失败时
                         # actual_resolution 仍是 None，会一路透传进成品元数据与
                         # success.jsonl，打印成 "None"。统一成可读文案。
-                        actual_resolution = "未知分辨率"
+                        actual_resolution = UNKNOWN_RESOLUTION
 
                 # 模式 B（默认，只看码率）：分辨率探不到也能继续按码率判定与择优，
                 # 不该白白放弃一条可能合格的流。height 仅在模式 A 有意义。
@@ -2981,6 +2988,33 @@ def process_one_entry(entry, processed_ids):
                 processing_ids.discard(normalized_id)
 
 
+def _resolve_final_resolution(resolution, final_path, label):
+    """成品元数据里的分辨率：下载阶段没探到的，在成品上补探一次。
+
+    为什么会没探到（§12.15）：模式 B 下分辨率不参与画质判定，采样探测失败时
+    我们**故意不再阻断**下载（阻断是纯误杀——码率与分辨率无关）。代价是
+    `resolution` 落成 UNKNOWN_RESOLUTION。500 部实跑里这占了 **44%**。
+
+    为什么能在这里补：此刻转封装已完成、成品 mp4 就在本地，是**完整文件**而非
+    采样片段，moov 齐全，ffprobe 几乎必成——而下载阶段探的是中间几个分片拼成的
+    采样文件，master 未声明 RESOLUTION 时探不出来是常态。
+
+    🔑 本函数只补**元数据**，不做任何判定：
+      - 探到就用真值，探不到就保持原样（绝不因此判失败）；
+      - 已有真值的直接返回，不重复探（省一次 ffprobe）。
+    """
+    if resolution and resolution != UNKNOWN_RESOLUTION:
+        return resolution
+    size = probe_resolution(final_path)
+    if not size:
+        # 成品都探不出来就是真探不出来，保持占位文案。绝不能在此判失败——
+        # 片子已经下完并转封装好了，为一个元数据丢掉它是本末倒置。
+        return resolution
+    probed = f"{size[0]}x{size[1]}"
+    print(f"  [{label}] 成品补探分辨率: {probed}", flush=True)
+    return probed
+
+
 def finalize_one_entry(conversion_job, processed_ids):
     """转封装 + 移动到目标目录。成功后登记去重，把成品交给上传阶段。
 
@@ -3009,7 +3043,9 @@ def finalize_one_entry(conversion_job, processed_ids):
             "url": conversion_job["url"],
             "final_path": final_path,
             "bitrate_kbps": conversion_job["bitrate_kbps"],
-            "resolution": conversion_job["resolution"],
+            "resolution": _resolve_final_resolution(
+                conversion_job["resolution"], final_path, tmdb_id
+            ),
             "missing_segment_count": conversion_job["missing_segment_count"],
             "missing_segment_indices": conversion_job[
                 "missing_segment_indices"

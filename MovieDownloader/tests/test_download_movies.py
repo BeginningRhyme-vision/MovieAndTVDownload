@@ -1177,6 +1177,84 @@ def test_m3u8_stream_survives_failed_resolution_probe(sandbox, monkeypatch):
     assert job["resolution"] == "未知分辨率"
 
 
+# ---------------------------------------------------------------------------
+# 成品分辨率补探（待办 H）
+# ---------------------------------------------------------------------------
+# 模式 B 下采样探不到分辨率时不再阻断下载（§12.15，那是对的），代价是
+# success.jsonl 的 resolution 落成占位文案——500 部实跑里占了 44%。
+# 成品 mp4 是完整文件、moov 齐全，此时补探一次几乎必成。
+
+def test_final_resolution_is_probed_when_download_could_not_tell(monkeypatch):
+    """🔴 核心：下载阶段没探到的，在成品上补探并写入真值。"""
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (1920, 1080))
+
+    got = d._resolve_final_resolution(d.UNKNOWN_RESOLUTION, "/x/55.mp4", "55")
+
+    assert got == "1920x1080", "成品补探必须把占位文案换成真实分辨率"
+
+
+def test_final_resolution_keeps_placeholder_when_probe_also_fails(monkeypatch):
+    """🔑 底线：成品也探不出来时保持占位，**绝不判失败**。
+
+    片子已经下完并转封装好了，为一个元数据丢掉它是本末倒置。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+
+    got = d._resolve_final_resolution(d.UNKNOWN_RESOLUTION, "/x/55.mp4", "55")
+
+    assert got == d.UNKNOWN_RESOLUTION
+
+
+def test_final_resolution_does_not_reprobe_known_value(monkeypatch):
+    """已经有真值就不重复探——省一次 ffprobe（每部成品都要走这里）。"""
+    called = []
+    monkeypatch.setattr(
+        d, "probe_resolution", lambda p: called.append(p) or (640, 360),
+    )
+
+    got = d._resolve_final_resolution("1920x1080", "/x/55.mp4", "55")
+
+    assert got == "1920x1080", "已知真值不该被覆盖"
+    assert called == [], "已有真值时不该再调 ffprobe"
+
+
+def test_finalize_writes_probed_resolution_into_success_info(
+    sandbox, monkeypatch,
+):
+    """端到端：补探结果要真的落进 success_info，而不只是函数返回值。"""
+    monkeypatch.setattr(d, "convert_ts_to_mp4", lambda src, dst: True)
+    monkeypatch.setattr(d, "move_to_target_folder", lambda p, i: "/out/55.mp4")
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (1280, 720))
+
+    job = {
+        "tmdbId": "55", "normalized_id": "55", "title": "T", "year": 2024,
+        "url": "https://a/1.m3u8",
+        "final_ts": os.path.join(str(sandbox), "t.ts"),
+        "temp_mp4": os.path.join(str(sandbox), "t.mp4"),
+        "cleanup_paths": [],
+        "bitrate_kbps": 2000,
+        "resolution": d.UNKNOWN_RESOLUTION,
+        "missing_segment_count": 0,
+        "missing_segment_indices": [],
+    }
+
+    _, ok, info = d.finalize_one_entry(job, set())
+
+    assert ok is True
+    assert info["resolution"] == "1280x720", (
+        "success.jsonl 里必须是补探到的真实分辨率，不能还是占位文案"
+    )
+
+
+def test_unknown_resolution_constant_matches_literals():
+    """护栏：常量与三处产出点用的必须是同一个字符串。
+
+    补探靠 `resolution != UNKNOWN_RESOLUTION` 判断，措辞一旦对不上，
+    补探会**静默失效**（不报错、只是永远认为"已有真值"）。
+    """
+    assert d.UNKNOWN_RESOLUTION == "未知分辨率"
+
+
 def test_bitrate_reject_message_does_not_lead_with_resolution(monkeypatch):
     """模式 B 的淘汰文案不能以"分辨率 …"开头，但必须保留 marker。
 
