@@ -723,8 +723,29 @@ def test_list_source_alias_tracks_the_real_class():
     assert d._ListEntrySource is d.ListEntrySource
 
 
+def _isolate_logs(tmp_path, monkeypatch):
+    """把所有会被写盘的日志/目录指到 tmp_path。
+
+    ⚠️ 不做这件事会**污染真实工作区**：_run_pipeline 内部走 write_log 时用的是
+    模块级的 FAILED_LOG 等常量，只 patch INPUT_JSONL 拦不住写出。
+    服务器实跑时已被这一疏漏坑过——测试桩造的 {"tmdbId":"1","error":"stub"}
+    真的落进了生产的 failed.jsonl。
+    """
+    for name, filename in (
+        ("FAILED_LOG", "failed.jsonl"),
+        ("SUCCESS_LOG", "success.jsonl"),
+        ("DOWNLOAD_OK_LOG", "download_ok.jsonl"),
+        ("DOWNLOAD_FAIL_LOG", "download_fail.jsonl"),
+        ("UPLOAD_PENDING_LOG", "upload_pending.jsonl"),
+    ):
+        monkeypatch.setattr(d, name, str(tmp_path / filename))
+    monkeypatch.setattr(d, "BASE_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setattr(d, "TEMP_DIR", str(tmp_path / "temp"))
+
+
 def test_missing_input_file_exits_when_not_streaming(tmp_path, monkeypatch, capsys):
     """单独跑下载时，results.jsonl 缺失必须报错退出——它是唯一片源。"""
+    _isolate_logs(tmp_path, monkeypatch)
     monkeypatch.setattr(d, "INPUT_JSONL", str(tmp_path / "nope.jsonl"))
     monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
     monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
@@ -744,6 +765,7 @@ def test_missing_input_file_is_tolerated_when_streaming(tmp_path, monkeypatch, c
 
     修复前此用例会失败：_run_pipeline 在读到队列之前就返回了。
     """
+    _isolate_logs(tmp_path, monkeypatch)
     monkeypatch.setattr(d, "INPUT_JSONL", str(tmp_path / "nope.jsonl"))
     monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
     monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
