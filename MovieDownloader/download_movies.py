@@ -189,6 +189,18 @@ MP4_SAMPLE_SIZE = int(_CFG.get("mp4_sample_size", 8 * 1024 * 1024))
 # 仅在上游 runtime_minutes 缺失、不得不用样本时长时才参与判断。
 MP4_MIN_TRUSTED_DURATION = float(_CFG.get("mp4_min_trusted_duration", 600))
 MIN_RESOLUTION_HEIGHT = int(_CFG.get("min_resolution_height", 1080))
+# 【分辨率是否参与画质判定】码率任何时候都参与判定，分辨率则可整关摘除。
+#
+# false（默认，2026-09-09 起）：只看码率。红线关整关放行，码率门槛是**与分辨率
+#   无关的绝对线**（基准[codec] × leniency，不乘 (h/1080)²），择优纯比码率。
+# true（旧口径）：分辨率红线 + 码率门槛两关都卡，且分辨率绝对优先——红线用
+#   MIN_RESOLUTION_HEIGHT，码率门槛按 (h/1080)² 随流高度缩放，择优也按高度优先。
+#
+# ⚠️ 为什么 false 时必须同时去掉 (h/1080)² 缩放：那个因子本身就是分辨率在参与
+# 判定。若只摘掉红线关却保留缩放，480p 的门槛会被缩到 2000×(480/1080)²≈316
+# kbps —— 低分辨率片反而更容易过关，等于把分辨率以更隐蔽的方式又请了回来，
+# 与"只按码率判断"的意图正好相反。
+RESOLUTION_CHECK_ENABLED = bool(_CFG.get("resolution_check_enabled", False))
 # 唯一宽松系数：同时放宽“分辨率红线”与“码率门槛”两关（合并原来的两个容差系数）。
 LENIENCY = float(_CFG.get("leniency", 0.8))
 # 【整片画质判死阈值】本轮尝试过的节点中，被判"画质确定性淘汰"的比例达到该值，
@@ -205,12 +217,13 @@ LENIENCY = float(_CFG.get("leniency", 0.8))
 QUALITY_KILL_RATIO = float(_CFG.get("quality_kill_ratio", 0.5))
 # 各编码在 1080p 基准下的最低码率门槛（kbps）。实际门槛按该流自身高度平方缩放：
 #   门槛 = 基准[codec] × (h/1080)² × LENIENCY
+# 分辨率判定关闭时不做缩放，直接是 基准[codec] × LENIENCY（绝对线）。
 # HEVC/AV1/VP9 同主观画质更省码率，单独设等效基准；探测不到编码回退 H.264 基准（最严）。
 BITRATE_BASELINE = {
-    "h264": float(_CFG.get("bitrate_h264", 1850)),
-    "hevc": float(_CFG.get("bitrate_hevc", 1100)),
-    "av1": float(_CFG.get("bitrate_av1", 925)),
-    "vp9": float(_CFG.get("bitrate_vp9", 1400)),
+    "h264": float(_CFG.get("bitrate_h264", 2000)),
+    "hevc": float(_CFG.get("bitrate_hevc", 1189)),
+    "av1": float(_CFG.get("bitrate_av1", 1000)),
+    "vp9": float(_CFG.get("bitrate_vp9", 1514)),
 }
 # 1080p 码率基准高度：门槛随 (实测高度/此值)² 缩放（码率需求 ∝ 像素数 ∝ 高度²）。
 _BITRATE_BASELINE_HEIGHT = 1080
@@ -1534,16 +1547,27 @@ def normalize_codec(codec):
 
 
 def bitrate_threshold(height, codec):
-    """单一码率曲线：按“该流自身实测高度 height”平方缩放并乘 LENIENCY。
+    """码率门槛（kbps）。分辨率判定开关决定要不要按高度缩放。
 
-    门槛 = 基准[codec] × (height / 1080)² × LENIENCY
-    - height 用每个流自己的实测高度，不是红线（高分辨率流按自身高度算，
-      调低红线时也不会集体免检进伪高清）。
-    - codec 无法识别/探测失败时回退 H.264 基准（最严），依赖多轮重采样再探。
-    - 码率需求 ∝ 像素数 ∝ 高度²，故用平方缩放而非线性。
+    RESOLUTION_CHECK_ENABLED=True（默认）——单一码率曲线：
+        门槛 = 基准[codec] × (height / 1080)² × LENIENCY
+      - height 用每个流自己的实测高度，不是红线（高分辨率流按自身高度算，
+        调低红线时也不会集体免检进伪高清）。
+      - 码率需求 ∝ 像素数 ∝ 高度²，故用平方缩放而非线性。
+
+    RESOLUTION_CHECK_ENABLED=False——与分辨率无关的绝对线：
+        门槛 = 基准[codec] × LENIENCY
+      此时 height 参数被完全忽略（保留在签名里是为了两条分支调用点一致）。
+      去掉缩放是"只按码率判断"的必要条件：留着 (h/1080)² 等于让分辨率继续
+      隐式参与——480p 门槛会被缩到约五分之一，低清片反而更好过关。
+
+    两分支共同点：codec 无法识别/探测失败时回退 H.264 基准（最严）；
+    都乘 LENIENCY，故"整体调松/调严"始终只改 leniency 一处。
     """
     key = normalize_codec(codec)
     baseline = BITRATE_BASELINE.get(key, BITRATE_BASELINE["h264"])
+    if not RESOLUTION_CHECK_ENABLED:
+        return baseline * LENIENCY
     scale = (height / _BITRATE_BASELINE_HEIGHT) ** 2
     return baseline * scale * LENIENCY
 
@@ -1552,8 +1576,36 @@ def meets_resolution_redline(height):
     """分辨率红线（带 LENIENCY 容差）：实测高度 ≥ 红线×宽松系数 即过关。
 
     容差用于救回准红线片（如红线 1080 时的 1072/900），避免差几像素被一刀切。
+
+    分辨率判定关闭时恒真——把开关收敛在这一个函数里，三处红线关卡
+    （mp4 声明预检 / mp4 实测复检 / m3u8 流层）与 master 候选过滤都会自动
+    放行，无需在每个调用点各写一次 if，也就不会漏掉某一处。
     """
+    if not RESOLUTION_CHECK_ENABLED:
+        return True
     return height >= MIN_RESOLUTION_HEIGHT * LENIENCY
+
+
+def bitrate_reject_message(resolution, codec_label, bitrate, min_bitrate):
+    """码率不达标的淘汰文案。分辨率在两种模式下的地位不同，措辞也要跟着变。
+
+    模式 A：分辨率是判定标准之一，写在前面合理。
+    模式 B：分辨率**根本没参与判定**，若仍以"分辨率 854x480 流…"开头，日后翻
+    failed.jsonl 会误以为是分辨率把片子卡掉的，从而对着一个不生效的
+    min_resolution_height 反复调参。故降级为括号里的附带信息。
+
+    两种措辞都保留 `码率未达到` 这个 marker —— `_PERMANENT_FAILURE_MARKERS`
+    与 `_REJECT_REASON_RULES` 都靠它工作，历史 failed.jsonl 也按它归类。
+    """
+    if RESOLUTION_CHECK_ENABLED:
+        return (
+            f"分辨率 {resolution} 流（{codec_label}）"
+            f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+        )
+    return (
+        f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+        f"（{codec_label}，实测 {resolution}）"
+    )
 
 
 # ---------- 分片下载 ----------
@@ -1816,7 +1868,9 @@ def _positive_or_none(value):
     """把 quality/size 归一为正整数，非正数与非法值一律 None。
 
     results.jsonl 是跨进程的不可信输入。负数/0 会造成实质损害：
-      - quality<=0 走 meets_resolution_redline 会被判定性淘汰，白丢一个可用节点；
+      - quality<=0 在**模式 A** 下走 meets_resolution_redline 会被判定性淘汰，
+        白丢一个可用节点（模式 B 该关放行，但归一化仍要做——不能依赖当前
+        默认模式，开关随时可能被切回 true）；
       - size<=0 作为 _mp4_probe_total_size 的 declared_size 兜底会算出空/负区间。
     归为 None 即"未声明"，交由下游实测，是安全的退化方向。
     """
@@ -2029,15 +2083,24 @@ def _mp4_probe_quality_by_sample(
         with open(sample_path, "wb") as fh:
             fh.write(content)
         actual_size = probe_resolution(sample_path)
-        if not actual_size:
+        if not actual_size and RESOLUTION_CHECK_ENABLED:
+            # 模式 A：分辨率是判定标准之一，探不到就无法预判，放行整片后再验。
             print(
                 f"  [{label}] 直链头部样本无法探测（moov 可能不在文件头），"
                 f"跳过预检、下载整片后再验",
                 flush=True,
             )
             return None
-        height = actual_size[1]
-        resolution = f"{actual_size[0]}x{actual_size[1]}"
+        # 模式 B（默认，只看码率）：分辨率不参与判定，探不到也**不该放弃预检**。
+        # 码率 = total_size×8/duration，与分辨率毫无关系；在这里返回 None 会让
+        # 本可 8MB 就淘汰的低码率片白下整片（GB 级），把预检的全部收益架空。
+        # height 传 0 —— 模式 B 的 bitrate_threshold 本就忽略该参数。
+        if actual_size:
+            height = actual_size[1]
+            resolution = f"{actual_size[0]}x{actual_size[1]}"
+        else:
+            height = 0
+            resolution = "未知分辨率"
 
         duration = None
         minutes = parse_int(runtime_minutes)
@@ -2076,16 +2139,133 @@ def _mp4_probe_quality_by_sample(
         remove_file(sample_path)
 
 
-def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
+def _mp4_preflight(node, label, runtime_minutes=None):
+    """对单个 mp4 节点做「探总长 + 头部样本测码率」，供跨节点择优排序用。
+
+    返回 dict：
+      {"node":…, "total_size":…, "probed": (resolution, height, bitrate, codec)|None,
+       "bitrate": float|None, "estimated": bool}
+    失败（探不到总长 / 不支持 Range / 采样块请求失败）返回 None —— 该节点这一轮
+    多半是坏的，交给调用方排到最后，但**不判死**：仍会参与下载尝试。
+
+    ⚠️ 本函数只负责"测"，不做任何判死。画质门槛一律留给 `_download_mp4_direct`
+    统一判，避免同一套判定散成两处、日后改门槛时漏改一边。
+    """
+    url = node["url"]
+    headers = _mp4_request_headers(node.get("headers"))
+    try:
+        total_size, range_ok = _mp4_probe_total_size(url, headers, node.get("size"))
+    except Exception:
+        return None
+    if not range_ok or total_size <= 0:
+        return None
+
+    probed = None
+    if total_size > MP4_SAMPLE_SIZE * 2:
+        sample_path = os.path.join(
+            TEMP_DIR,
+            f"mp4sample_{safe_file_token(label)}_"
+            f"{hashlib.sha1(url.encode('utf-8')).hexdigest()[:8]}.mp4",
+        )
+        try:
+            probed = _mp4_probe_quality_by_sample(
+                url, headers, total_size, sample_path, label, runtime_minutes
+            )
+        except Exception:
+            # 采样块拿不到：整片下载多半也会失败，但仍留着这个节点当兜底。
+            probed = None
+
+    if probed is not None:
+        return {
+            "node": node, "total_size": total_size, "probed": probed,
+            "bitrate": probed[2], "estimated": False,
+        }
+
+    # 降级 2：预检探不出码率（moov 不在头部 / 时长不可信 / 文件太小不值得预检），
+    # 用「总长 ÷ 上游时长」估一个。不花任何网络请求。
+    # ⚠️ 只用于**排序**，绝不用于判死——它没经过 ffprobe 校验，源站声明的 size
+    # 也未必可信。真正的判死一律在 _download_mp4_direct 里按实测码率做。
+    minutes = parse_int(runtime_minutes)
+    estimated = (
+        total_size * 8 / (minutes * 60) / 1000
+        if minutes and minutes > 0 else None
+    )
+    return {
+        "node": node, "total_size": total_size, "probed": None,
+        "bitrate": estimated, "estimated": True,
+    }
+
+
+def _rank_mp4_nodes(nodes, label, runtime_minutes=None):
+    """把多个 mp4 节点按「实测码率优先」排序，返回 [(node, preflight_or_None), …]。
+
+    这解决的问题：mp4 是"试到第一个成功就 break"，不像 m3u8 会在候选流之间择优。
+    取流侧又是按**声明分辨率**降序给的节点，于是「1080p/1700kbps 刚过线」会直接
+    胜出，而「480p/8000kbps」根本不会被看到 —— 同一份画质标准在两条路径上力度
+    不一致。分辨率移出判定标准后这个问题更突出。
+
+    三级降级（顺序即优先级）：
+      1. 预检拿到**实测**码率 → 按码率降序，最可信；
+      2. 预检拿不到 → 用 size×8/时长 **估算**码率降序（零网络开销，仅供排序）；
+      3. 连估算都做不了（无 size 或无时长）→ 保持上游给的原始顺序（按声明
+         分辨率降序），排在最后。
+
+    🔑 两条底线：
+      - 排序**不淘汰任何节点**。预检失败不代表节点坏，只是探不出码率；
+      - 全部节点都预检不出时，本函数退化为"原样返回"，行为等同改动前。
+    """
+    if len(nodes) < 2:
+        # 单节点无所谓择优，别白花一次预检（它会多发 1~2 个网络请求）。
+        return [(node, None) for node in nodes]
+
+    ranked = []
+    for index, node in enumerate(nodes):
+        info = _mp4_preflight(node, label, runtime_minutes)
+        bitrate = info["bitrate"] if info else None
+        # 排序键：① 有码率的排前面；② 实测的排在估算的前面（同为有码率时）；
+        # ③ 码率降序；④ 同码率按上游原始顺序稳定排列。
+        ranked.append((
+            (
+                bitrate is None,
+                bool(info["estimated"]) if info else True,
+                -(bitrate or 0),
+                index,
+            ),
+            node,
+            info,
+        ))
+    ranked.sort(key=lambda item: item[0])
+
+    measured = [r for r in ranked if r[2] and not r[2]["estimated"]]
+    if measured:
+        best = measured[0]
+        print(
+            f"  [{label}] mp4 择优：{len(nodes)} 个节点，"
+            f"选中实测 {best[2]['probed'][2]:.0f} kbps "
+            f"({best[1].get('provider')}/{best[2]['probed'][0]})",
+            flush=True,
+        )
+    return [(node, info) for _key, node, info in ranked]
+
+
+def _download_mp4_direct(node, output_path, label, runtime_minutes=None,
+                         preflight=None):
     """mp4 直链：Range 分块并发下载到 output_path，并做画质筛选。
 
     流程：
-      1. quality 声明存在时先过分辨率红线（不达标直接确定性淘汰，省流量）；
-      2. Range 探测总长 → 按 MP4_CHUNK_SIZE 分块，MP4_CONCURRENCY 并发，
-         严格按块序落盘（复用分片下载的滑动窗口思路）；不做断点续传；
-      3. 下载完成后 ffprobe 实测分辨率/编码/时长，码率 = 字节×8/时长 对齐
+      1. 【仅模式 A】quality 声明存在时先过分辨率红线（不达标直接确定性淘汰，
+         省流量）。模式 B 下 meets_resolution_redline 恒真，本关整关放行——
+         声明 480p 也可能是高码率清晰片，该由第 2/3 步的码率关来判；
+      2. Range 探测总长 → 头部样本预检码率（不达标当场淘汰，省下整片流量）；
+      3. 按 MP4_CHUNK_SIZE 分块、MP4_CONCURRENCY 并发下载，严格按块序落盘
+         （复用分片下载的滑动窗口思路）；不做断点续传；
+      4. 下载完成后 ffprobe 实测分辨率/编码/时长，码率 = 字节×8/时长 对齐
          bitrate_threshold（与 m3u8 路径同一套门槛）。
     返回 (resolution_str, bitrate_kbps)。任何块失败即整体失败（直链无“缺片豁免”）。
+
+    preflight：跨节点择优阶段已经跑过的预检结果（见 `_mp4_preflight`），形如
+    {"total_size":…, "probed":…}。传入即复用，避免同一节点被探两次总长/两次
+    头部样本——那是纯粹的重复网络开销。为 None 时按老路自己现探。
     """
     url = node["url"]
     headers = _mp4_request_headers(node.get("headers"))
@@ -2096,7 +2276,10 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
             f"（容差 {LENIENCY:.2f}），跳过"
         )
 
-    total_size, range_ok = _mp4_probe_total_size(url, headers, node.get("size"))
+    total_size, range_ok = (
+        (preflight["total_size"], True) if preflight is not None
+        else _mp4_probe_total_size(url, headers, node.get("size"))
+    )
     if not range_ok:
         raise RuntimeError(f"直链不支持 Range 分块下载: {url}")
     if total_size <= 0:
@@ -2111,7 +2294,10 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
     # 仅对「显著大于样本」的文件预检：total_size <= MP4_SAMPLE_SIZE 时采样等于
     # 把整片下一遍，之后正片再下一遍 —— 双倍流量却零收益，不如直接走正片下载
     # 后的复检。阈值取样本的 2 倍，保证预检省下的流量至少是样本本身的一倍。
-    if total_size > MP4_SAMPLE_SIZE * 2:
+    if preflight is not None:
+        # 择优阶段已经探过：直接复用，不再发第二次请求。
+        probed = preflight["probed"]
+    elif total_size > MP4_SAMPLE_SIZE * 2:
         # 样本文件名带 url 摘要：同一片的多个 mp4 节点虽是串行尝试，但摘要能
         # 保证任何调用姿势下都不会两个节点写同一个临时文件。
         sample_path = os.path.join(
@@ -2122,20 +2308,24 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
         probed = _mp4_probe_quality_by_sample(
             url, headers, total_size, sample_path, label, runtime_minutes
         )
-        if probed is not None:
-            pre_resolution, pre_height, pre_bitrate, pre_codec = probed
-            if not meets_resolution_redline(pre_height):
-                raise QualityRejectedError(
-                    f"分辨率 {pre_resolution} 低于红线 {MIN_RESOLUTION_HEIGHT}"
-                    f"（容差 {LENIENCY:.2f}），跳过"
+    else:
+        probed = None
+
+    if probed is not None:
+        pre_resolution, pre_height, pre_bitrate, pre_codec = probed
+        if not meets_resolution_redline(pre_height):
+            raise QualityRejectedError(
+                f"分辨率 {pre_resolution} 低于红线 {MIN_RESOLUTION_HEIGHT}"
+                f"（容差 {LENIENCY:.2f}），跳过"
+            )
+        pre_min_bitrate = bitrate_threshold(pre_height, pre_codec)
+        if pre_bitrate < pre_min_bitrate:
+            raise QualityRejectedError(
+                bitrate_reject_message(
+                    pre_resolution, pre_codec or "unknown",
+                    pre_bitrate, pre_min_bitrate,
                 )
-            pre_min_bitrate = bitrate_threshold(pre_height, pre_codec)
-            if pre_bitrate < pre_min_bitrate:
-                raise QualityRejectedError(
-                    f"分辨率 {pre_resolution} 流（{pre_codec or 'unknown'}）"
-                    f"码率未达到门槛：{pre_bitrate:.0f} kbps"
-                    f" < {pre_min_bitrate:.0f} kbps"
-                )
+            )
 
     # 不做断点续传：节点失败时上层会删掉残留 ts，启动时也会清理 temp_*，
     # 残留文件无法证明与本次直链一致，存在即视为脏数据重下。
@@ -2219,10 +2409,18 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
         raise RuntimeError(f"直链下载长度不符：{written} != {total_size}")
 
     actual_size = probe_resolution(output_path)
-    if not actual_size:
+    if not actual_size and RESOLUTION_CHECK_ENABLED:
+        # 模式 A：分辨率是判定标准，探不到就无从判断，只能判失败重下。
         raise RuntimeError("采样探测分辨率失败（可重试）")
-    resolution = f"{actual_size[0]}x{actual_size[1]}"
-    height = actual_size[1]
+    # 模式 B（默认，只看码率）：整片**已经下完了**，此时仅因探不到分辨率就丢弃
+    # 它是纯粹的误杀——分辨率根本不参与判定，height 只会被 bitrate_threshold
+    # 忽略。继续用码率判定即可；分辨率降级为成品元数据，未知就如实标注。
+    if actual_size:
+        resolution = f"{actual_size[0]}x{actual_size[1]}"
+        height = actual_size[1]
+    else:
+        resolution = "未知分辨率"
+        height = 0
     print(f"  [{label}] 直链实测分辨率: {resolution}")
     if not meets_resolution_redline(height):
         raise QualityRejectedError(
@@ -2246,8 +2444,7 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
     )
     if bitrate < min_bitrate:
         raise QualityRejectedError(
-            f"分辨率 {resolution} 流（{codec_label}）"
-            f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+            bitrate_reject_message(resolution, codec_label, bitrate, min_bitrate)
         )
     return resolution, bitrate
 
@@ -2287,7 +2484,7 @@ def process_one_entry(entry, processed_ids):
     temp_mp4 = os.path.join(TEMP_DIR, f"temp_{safe_file_token(tmdb_id)}.mp4")
     cleanup_paths.update((final_ts, temp_mp4))
 
-    def _attempt_download(node, is_last_node):
+    def _attempt_download(node, is_last_node, preflight=None):
         """对单个取流节点尝试完整下载，成功返回 conversion_job，失败抛异常。
 
         node 为归一化后的 dict；按 type 分支：m3u8 走 playlist 解析 + 采样 +
@@ -2295,6 +2492,9 @@ def process_one_entry(entry, processed_ids):
         is_last_node=False（还有备用节点）时，master playlist 解析用短重试
         PLAYLIST_RETRY_FALLBACK，坏节点快速判定即换下一个；末节点/单节点用
         默认 PLAYLIST_RETRY_MAX 死磕，不放过最后的机会。
+
+        preflight 仅对 mp4 有意义：跨节点择优时已探过的总长/头部样本，透传下去
+        复用，避免重复发请求。
         """
         url = node["url"]
         # 取流阶段记录的节点专属请求头（如特定 Referer/UA）：m3u8 与 mp4 两条
@@ -2305,7 +2505,7 @@ def process_one_entry(entry, processed_ids):
             # finally 删除，文件名含 url 摘要故此处无法预知；进程被杀等极端情况
             # 由启动时的 clean_temp_directory（前缀 mp4sample_）兜底清理。
             resolution, bitrate = _download_mp4_direct(
-                node, final_ts, tmdb_id, runtime_minutes
+                node, final_ts, tmdb_id, runtime_minutes, preflight
             )
             conversion_job = {
                 "tmdbId": tmdb_id,
@@ -2334,33 +2534,44 @@ def process_one_entry(entry, processed_ids):
         if not variants:
             raise RuntimeError("没有找到媒体播放列表或清晰度变体")
 
-        # 按声明分辨率高度从高到低排，高度相同时优先试 BANDWIDTH 高的。
-        # 分辨率未知的流排在最后，等采样后用 ffprobe 探测真实分辨率。
+        # 解析出每条流的声明分辨率（可能为 None）。排序与筛选口径见下方两段：
+        # 两者都随 RESOLUTION_CHECK_ENABLED 切换。
         annotated = [
             (resolution, playlist_url, bandwidth, parse_resolution(resolution))
             for resolution, playlist_url, bandwidth in variants
         ]
-        # 已声明分辨率且低于红线（含容差）的流直接排除，不必浪费采样流量。
-        # 未声明分辨率的流保留，等采样后用 ffprobe 探测真实高度再判。
+        # 模式 A：已声明分辨率且低于红线（含容差）的流直接排除，不必浪费采样流量。
+        #   未声明分辨率的流保留，等采样后用 ffprobe 探测真实高度再判。
+        # 模式 B：meets_resolution_redline 恒真 → 全部保留，候选一条不筛。
+        #   这是对的：低码率流要靠**实测采样码率**才能判，声明分辨率说明不了问题
+        #   （480p 也可能是高码率的清晰片）。代价是多采样几条流，但不会误杀。
         candidates = [
             item
             for item in annotated
             if item[3] is None or meets_resolution_redline(item[3][1])
         ]
         if not candidates:
+            # 仅模式 A 可能走到：模式 B 下上面的过滤恒为全保留，variants 非空则
+            # candidates 必非空（variants 为空已在前面单独报错）。故文案只按
+            # 模式 A 的语义写即可。
             raise QualityRejectedError(
                 f"没有找到高度达标（≥ {MIN_RESOLUTION_HEIGHT}×{LENIENCY:.2f}）的流"
             )
 
-        # 预排序：先试声明高度更高的流，同高度试声明 BANDWIDTH 更高的。
+        # 预排序：分辨率参与判定时先试声明高度更高的流，同高度试 BANDWIDTH 更高的；
         # 未声明分辨率（item[3] is None）用 -1 排最后，等采样后 ffprobe 探测再定夺。
-        candidates.sort(
-            key=lambda item: (
-                item[3][1] if item[3] else -1,
-                item[2],
-            ),
-            reverse=True,
-        )
+        # 分辨率不参与判定时改为纯按声明 BANDWIDTH 降序——此时择优只比码率，
+        # 高声明带宽的流最可能先胜出，先试它才能让下面的提前终止真正省下采样。
+        if RESOLUTION_CHECK_ENABLED:
+            candidates.sort(
+                key=lambda item: (
+                    item[3][1] if item[3] else -1,
+                    item[2],
+                ),
+                reverse=True,
+            )
+        else:
+            candidates.sort(key=lambda item: item[2], reverse=True)
 
         best_height = -1
         best_bitrate = 0.0
@@ -2382,13 +2593,23 @@ def process_one_entry(entry, processed_ids):
         for resolution, playlist_url, _declared_bandwidth, size in candidates:
             # 候选已按声明高度降序排列。走到"声明高度严格低于已选中流"的候选时，
             # 它即便采样也必然落选（择优是高度绝对优先），故这里跳过纯属浪费的采样。
-            # 三个合取项缺一不可：
+            # 四个合取项缺一不可：
+            #   RESOLUTION_CHECK_ENABLED —— 本剪枝的正确性完全建立在"择优按高度
+            #     绝对优先"之上。分辨率不参与判定时择优改成纯比码率，而声明高度低
+            #     不代表实测码率低，此时剪枝会真的丢掉更优的流。声明 BANDWIDTH 也
+            #     不能拿来剪枝：它是源站声明的峰值带宽，与我们实测的采样码率口径
+            #     不同，据此跳过同样会误剪。故该模式下老老实实全部采样。
             #   size is not None —— 未声明分辨率的流排在末尾，真实高度未知，
             #     必须采样后 ffprobe，跳过会丢画质；
             #   best_selected —— 只有真正选中过某流才生效，否则最高档瞬时抖动
             #     挂掉后整片会因"无一入选"白白失败，直接损失成功率；
             #   严格小于 —— 同高度的仍要采样比码率。
-            if size is not None and best_selected and size[1] < best_height:
+            if (
+                RESOLUTION_CHECK_ENABLED
+                and size is not None
+                and best_selected
+                and size[1] < best_height
+            ):
                 print(f"  跳过流 {resolution}：声明高度低于已选中的 {best_resolution}")
                 continue
             print(f"  检测流 {resolution}: {playlist_url}")
@@ -2444,14 +2665,22 @@ def process_one_entry(entry, processed_ids):
                 actual_resolution = resolution
                 if actual_size is None:
                     actual_size = probe_resolution(sample_path)
-                    if actual_size is None:
-                        # 探测失败常是采样片本次没下全/损坏（瞬时抖动），
+                    if actual_size is None and RESOLUTION_CHECK_ENABLED:
+                        # 模式 A：探测失败常是采样片本次没下全/损坏（瞬时抖动），
                         # 不是真无高清流 → 判可重试，下一轮重采样有机会救回。
                         raise RuntimeError("采样探测分辨率失败（可重试）")
-                    actual_resolution = f"{actual_size[0]}x{actual_size[1]}"
-                    print(f"  流 {resolution} 实测分辨率: {actual_resolution}")
+                    if actual_size is not None:
+                        actual_resolution = f"{actual_size[0]}x{actual_size[1]}"
+                        print(f"  流 {resolution} 实测分辨率: {actual_resolution}")
+                    else:
+                        # 模式 B 才会走到这里。master 未声明且探测失败时
+                        # actual_resolution 仍是 None，会一路透传进成品元数据与
+                        # success.jsonl，打印成 "None"。统一成可读文案。
+                        actual_resolution = "未知分辨率"
 
-                height = actual_size[1]
+                # 模式 B（默认，只看码率）：分辨率探不到也能继续按码率判定与择优，
+                # 不该白白放弃一条可能合格的流。height 仅在模式 A 有意义。
+                height = actual_size[1] if actual_size else 0
                 # 第 1 关 · 分辨率红线（带 LENIENCY 容差）。
                 if not meets_resolution_redline(height):
                     raise QualityRejectedError(
@@ -2475,15 +2704,21 @@ def process_one_entry(entry, processed_ids):
                 )
                 if bitrate < min_bitrate:
                     raise QualityRejectedError(
-                        f"分辨率 {actual_resolution} 流（{codec_label}）"
-                        f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+                        bitrate_reject_message(
+                            actual_resolution, codec_label, bitrate, min_bitrate
+                        )
                     )
 
-                # 择优：分辨率（实测高度）绝对优先，高度完全相同再比采样码率。
-                # 用实测高度而非粗档 tier，任意分辨率都能精确区分，降档也不退化。
-                better = height > best_height or (
-                    height == best_height and bitrate > best_bitrate
-                )
+                # 择优：分辨率参与判定时，实测高度绝对优先、高度完全相同再比采样
+                # 码率（用实测高度而非粗档 tier，任意分辨率都能精确区分，降档也不
+                # 退化）；不参与判定时纯比采样码率——既然高度不再是画质标准，就
+                # 不该拿它决定"多条合格流选哪条"，否则等于分辨率仍在暗中主导。
+                if RESOLUTION_CHECK_ENABLED:
+                    better = height > best_height or (
+                        height == best_height and bitrate > best_bitrate
+                    )
+                else:
+                    better = bitrate > best_bitrate
                 if better:
                     best_height = height
                     best_bitrate = bitrate
@@ -2530,6 +2765,8 @@ def process_one_entry(entry, processed_ids):
                 "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
             )
 
+        # 模式 B 下 best_resolution 可能是 "未知分辨率"（探测失败），此时码率才是
+        # 选中依据，分辨率只是附带信息。两种模式共用这一行，不必分支。
         print(
             f"  选中流: 分辨率 {best_resolution}, "
             f"采样码率 {best_bitrate:.0f} kbps"
@@ -2642,6 +2879,26 @@ def process_one_entry(entry, processed_ids):
         # 信息的节点数"——后者会把「2 个画质淘汰 + 1 个 502」算成 2/2=100% 判死，
         # 那个 502 节点从没被真正看过画质，据此判死过于激进。
         quality_rejected_nodes = 0
+
+        # mp4 跨节点码率择优：把 mp4 节点按实测码率重排，最优的先试。
+        # 见 `_rank_mp4_nodes` —— 它只重排、不淘汰任何节点，故 fallback 能力
+        # （§10.13 实测救回过片子）完全保留，urls 的总数与集合都不变。
+        # m3u8 节点不参与：拿到它的码率要解析 master + 下载采样分片，成本高得多，
+        # 属 §10.10 ④「跨 provider 按画质排序」的范畴，用户明确暂缓。
+        mp4_nodes = [n for n in urls if n["type"] == "mp4"]
+        preflight_of = {}
+        if len(mp4_nodes) > 1:
+            ordered_mp4 = _rank_mp4_nodes(mp4_nodes, tmdb_id, runtime_minutes)
+            preflight_of = {
+                id(node): info for node, info in ordered_mp4 if info is not None
+            }
+            # 原地重排：mp4 节点之间按新顺序，m3u8 节点保持在原来的位置上，
+            # 这样两类节点的相对次序（进而 is_last_node 的语义）完全不变。
+            mp4_iter = iter(node for node, _info in ordered_mp4)
+            urls = [
+                next(mp4_iter) if n["type"] == "mp4" else n for n in urls
+            ]
+
         for idx, node in enumerate(urls, start=1):
             is_last_node = idx == len(urls)
             try:
@@ -2651,7 +2908,9 @@ def process_one_entry(entry, processed_ids):
                         f"({node['provider']}/{node['type']})",
                         flush=True,
                     )
-                conversion_job = _attempt_download(node, is_last_node)
+                conversion_job = _attempt_download(
+                    node, is_last_node, preflight_of.get(id(node))
+                )
                 break
             except Exception as exc:
                 last_exc = exc

@@ -237,11 +237,16 @@ def test_entries_missing_tmdb_id_are_dropped():
 # ---------------------------------------------- 候选流采样提前终止（画质择优）
 
 def _sampling_env(monkeypatch, variants):
-    """多 variant 采样场景的公共桩：返回记录被采样流 url 的 list。"""
+    """多 variant 采样场景的公共桩：返回记录被采样流 url 的 list。
+
+    显式置 RESOLUTION_CHECK_ENABLED=True：本组用例测的是"高度剪枝 / 高度择优"
+    这类**模式 A 专属**行为，不能依赖模块默认值（默认已是模式 B）。
+    """
     sampled = []
     seg_urls = [f"https://cdn/s{i}.ts" for i in range(20)]
 
     monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
     monkeypatch.setattr(
         d, "parse_master_playlist",
         lambda url, retries=None, headers=None: variants,
@@ -575,7 +580,7 @@ def test_mixed_node_failure_is_both_retriable_and_refetchable(sandbox, monkeypat
     def boom_master(url, retries=None, headers=None):
         raise RuntimeError(f"请求失败(HTTP Error 503): {url}")
 
-    def expired_mp4(node, output_path, label, runtime_minutes=None):
+    def expired_mp4(node, output_path, label, runtime_minutes=None, preflight=None):
         raise RuntimeError(
             f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: {node['url']}"
         )
@@ -635,9 +640,13 @@ def _quality_env(monkeypatch, per_node):
     这样不必伪造 playlist 就能精确控制每个节点的失败性质。
     """
     monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    # 择优阶段会对每个 mp4 节点发真实网络请求探总长/采样。本组用例只关心
+    # 判死与重投口径，故整体桩掉——返回 None 表示"探不出码率"，_rank_mp4_nodes
+    # 会保持上游原始顺序，与改动前的行为一致，用例断言的节点次序才稳定。
+    monkeypatch.setattr(d, "_mp4_preflight", lambda *a, **k: None)
     calls = []
 
-    def fake_mp4(node, output_path, label, runtime_minutes=None):
+    def fake_mp4(node, output_path, label, runtime_minutes=None, preflight=None):
         idx = len(calls)
         calls.append(node["url"])
         exc = per_node[idx]
@@ -826,6 +835,550 @@ def test_all_streams_quality_rejected_is_deterministic(sandbox, monkeypatch):
     assert "因画质不达标" in info["error"]
 
 
+# -------------------------------------- 分辨率判定开关（resolution_check_enabled）
+
+def test_resolution_check_defaults_to_off():
+    """护栏：默认业务语义是「只按码率判断画质」（模式 B）。
+
+    这是 2026-09-09 由用户拍板的口径切换。锁死它有两层意义：
+      ① 谁改回 true 都会在这里被拦下，避免默认口径被无意翻转；
+      ② 提醒后来者：任何测"高度剪枝 / 高度择优 / 分辨率红线"的用例都必须
+         自己显式 monkeypatch 成 True，不能依赖模块默认值。
+    """
+    import yaml
+
+    with open(os.path.join(os.path.dirname(d.__file__), "config.yaml")) as fh:
+        cfg = yaml.safe_load(fh)["download_movies"]
+
+    assert cfg["resolution_check_enabled"] is False
+    assert d.RESOLUTION_CHECK_ENABLED is False
+    # 码率红线 2 Mbps（用户指定），四档等效基准的相对关系见下面的用例。
+    assert cfg["bitrate_h264"] == 2000
+
+
+def test_bitrate_threshold_scales_with_height_when_resolution_counts(monkeypatch):
+    """开关启用：门槛 = 基准 × (h/1080)² × leniency（现行口径）。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 2000.0})
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+
+    assert d.bitrate_threshold(1080, "h264") == pytest.approx(1600)
+    assert d.bitrate_threshold(2160, "h264") == pytest.approx(6400)
+    # 480p 被缩到很低——这正是模式 A 的设计（低清片由红线关拦，不靠码率关）。
+    assert d.bitrate_threshold(480, "h264") == pytest.approx(2000 * (480 / 1080) ** 2 * 0.8)
+
+
+def test_bitrate_threshold_is_absolute_when_resolution_is_off(monkeypatch):
+    """开关禁用：门槛 = 基准 × leniency，与高度**完全无关**。
+
+    🔑 这是"只按码率判断"的核心。若保留 (h/1080)² 缩放，480p 的门槛会被缩到
+    约 395 kbps —— 低分辨率片反而更容易过关，等于分辨率以更隐蔽的方式仍在
+    参与判定，与开关意图正好相反。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 2000.0})
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+
+    for height in (360, 480, 720, 1080, 2160):
+        assert d.bitrate_threshold(height, "h264") == pytest.approx(1600)
+
+
+def test_codec_baselines_stay_relative_when_resolution_is_off(monkeypatch):
+    """禁用分辨率后，各编码之间的等效关系必须仍然成立。
+
+    否则会用 H.264 的绝对线去卡 AV1，把同主观画质的高效编码片全部误杀。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {
+        "h264": 2000.0, "hevc": 1189.0, "av1": 1000.0, "vp9": 1514.0,
+    })
+
+    assert d.bitrate_threshold(1080, "av1") < d.bitrate_threshold(1080, "hevc")
+    assert d.bitrate_threshold(1080, "hevc") < d.bitrate_threshold(1080, "h264")
+    # 探测不到编码时回退最严的 H.264 基准，禁用分辨率后也不能变。
+    assert d.bitrate_threshold(1080, None) == pytest.approx(2000)
+
+
+def test_resolution_redline_is_bypassed_when_disabled(monkeypatch):
+    """开关禁用后红线关恒真——所有红线关卡靠这一个函数统一失效。"""
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    assert d.meets_resolution_redline(360) is False
+
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    assert d.meets_resolution_redline(360) is True
+
+
+def test_declared_480p_gate_follows_the_switch(sandbox, monkeypatch):
+    """声明 480p 的 mp4 直链：开关启用时当场判死，禁用时必须放行到下一步。
+
+    真穿过 `_download_mp4_direct` 的第一道关卡，不桩该函数本身——否则改坏关卡
+    测试也发现不了（§12.13 I 的教训）。用"下一步抛哨兵异常"来证明确实放行了。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+
+    def sentinel(*_a, **_k):
+        raise RuntimeError("已越过声明分辨率关（哨兵）")
+
+    # 关卡的下一步就是探总长，拿它当"是否放行"的探针。
+    monkeypatch.setattr(d, "_mp4_probe_total_size", sentinel)
+
+    entry = {"tmdbId": "55", "title": "T", "urls": [
+        {"url": "https://a/1.mp4", "provider": "vidlink", "type": "mp4",
+         "headers": {}, "quality": 480, "size": None},
+    ]}
+
+    # 模式 A：拦在第一关，根本走不到探总长。
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert "低于红线" in info["error"]
+    assert "哨兵" not in info["error"]
+
+    # 模式 B：红线关放行，走到了探总长（哨兵被触发）。
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "processing_ids", set())
+    _, ok2, info2 = d.process_one_entry(entry, set())
+    assert ok2 is False
+    assert "哨兵" in info2["error"]
+
+
+def test_selection_prefers_bitrate_when_resolution_is_off(sandbox, monkeypatch):
+    """禁用分辨率后择优纯比码率：低分辨率高码率的流可以胜出。
+
+    若择优仍按高度优先，等于分辨率虽然不参与"能不能过关"、却仍主导
+    "多条合格流选哪条"，开关就没有真正生效。
+
+    ⚠️ 声明带宽故意与实测码率**反向**设置（1080p 声明高、实测低）：这样
+    候选排序会把 1080p 排在前面并先选中它，从而真正走到"按高度剪枝"那条
+    路径上。若两者同向，剪枝条件根本不成立，用例就锁不住任何东西。
+    """
+    picked = _run_two_stream_pick(
+        monkeypatch, sandbox, resolution_check=False,
+        # (分辨率, 声明带宽, 实测采样码率)
+        streams=[("1920x1080", 9000, 1200), ("854x480", 1000, 4000)],
+    )
+    assert picked == "854x480"
+
+
+def test_selection_prefers_height_when_resolution_is_on(sandbox, monkeypatch):
+    """开关启用时择优仍是高度绝对优先（现行口径不得被改动）。"""
+    picked = _run_two_stream_pick(
+        monkeypatch, sandbox, resolution_check=True,
+        streams=[("1920x1080", 5000, 2500), ("854x480", 1500, 9000)],
+    )
+    assert picked == "1920x1080"
+
+
+def test_early_termination_is_off_when_resolution_is_off(sandbox, monkeypatch):
+    """禁用分辨率后，"声明高度更低就跳过采样"的剪枝必须停用。
+
+    该剪枝的正确性完全建立在"择优按高度绝对优先"之上。纯比码率时，声明高度
+    低不代表实测码率低，继续剪枝会真的丢掉更优的流（本例中 480p 才是赢家）。
+    """
+    sampled = []
+    picked = _run_two_stream_pick(
+        monkeypatch, sandbox, resolution_check=False,
+        streams=[("1920x1080", 9000, 1200), ("854x480", 1000, 4000)],
+        sampled_sink=sampled,
+    )
+    assert len(sampled) == 2, "两条流都必须采样，不能按高度剪枝"
+    assert picked == "854x480", "被剪掉的那条恰恰是更优的流"
+
+
+def _run_two_stream_pick(monkeypatch, sandbox, resolution_check, streams,
+                         sampled_sink=None):
+    """跑一次两条候选流的完整择优，返回最终选中流的分辨率字符串。
+
+    streams 为 [(分辨率字符串, 声明 BANDWIDTH, 目标实测采样码率 kbps)]。
+    声明带宽只影响候选排序，实测码率靠控制采样字节数精确造出——两者分开是
+    刻意的：真实源站的声明带宽本就未必等于实测码率。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", resolution_check)
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    monkeypatch.setattr(d, "SAMPLE_COUNT", 4)
+    # 开关启用时红线要压低，否则 480p 在候选过滤阶段就被剔除、测不到择优。
+    if resolution_check:
+        monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 360)
+
+    variants = [
+        (res, f"https://cdn/{res}.m3u8", float(bw)) for res, bw, _br in streams
+    ]
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None, headers=None: variants,
+    )
+    bitrate_of = {f"https://cdn/{res}.m3u8": br for res, _bw, br in streams}
+
+    def fake_media(url, headers=None):
+        if sampled_sink is not None:
+            sampled_sink.append(url)
+        # 分片 url 里带上所属流，供 download_segments 反查目标码率。
+        return [f"{url}#s{i}" for i in range(20)], [4.0] * 20, None
+
+    def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
+                      init_url=None, force_init=False, headers=None,
+                      retry_max=None):
+        if end_idx is None:
+            end_idx = len(urls)
+        n = end_idx - start_idx
+        stream_url = urls[start_idx].split("#")[0]
+        # 码率 = bytes×8/时长/1000，时长 = n×4.0s，反解出应写的字节数。
+        target_kbps = bitrate_of[stream_url]
+        total_bytes = int(target_kbps * 1000 * (n * 4.0) / 8)
+        with open(out, "wb") as fh:
+            fh.write(b"x" * 16)
+        return total_bytes, [], 0
+
+    monkeypatch.setattr(d, "parse_media_playlist", fake_media)
+    monkeypatch.setattr(d, "download_segments", fake_download)
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+
+    _, ok, job = d.process_one_entry({"tmdbId": "55", "urls": ["u"]}, set())
+    assert ok is True, "两条流都应合格，本用例只检验择优结果"
+    return job["resolution"]
+
+
+# ------- 分辨率作为「前置依赖」的三处误杀（2026-09-09 复盘发现，§12.15）-------
+# 开关只解决了"分辨率作为判定标准"，却漏了"分辨率作为必需中间数据"——
+# 这三处在探测不到分辨率时会直接放弃，而它们其实只需要码率。
+
+def test_finished_mp4_is_not_discarded_when_resolution_probe_fails(sandbox, monkeypatch):
+    """🔴 整片已下完，不能只因探不到分辨率就丢弃（模式 B）。
+
+    分辨率根本不参与判定，height 只会被 bitrate_threshold 忽略。为一个不再需要
+    的值丢弃一部下载完成的 GB 级影片，是纯粹的误杀。
+
+    本例真正跑完 `_download_mp4_direct`（只桩网络层），确保走到那处判断。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)   # 探不到分辨率
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+
+    # 体积取小值（用例要真写盘），靠调低 duration 维持 2000 kbps 的比例：
+    # 900_000 字节 × 8 / 3.6s / 1000 = 2000 kbps。
+    total = 900_000
+    monkeypatch.setattr(d, "_probe_duration", lambda p: 3.6)
+    monkeypatch.setattr(d, "_mp4_probe_total_size",
+                        lambda url, headers, declared: (total, True))
+    # 跳过头部预检（本例要验的是**整片下完之后**那道复检）。
+    monkeypatch.setattr(d, "_mp4_probe_quality_by_sample", lambda *a, **k: None)
+    # 桩掉网络层：按 Range 返回等长字节，让复检拿到真实文件大小。
+    monkeypatch.setattr(
+        d, "_download_mp4_chunk",
+        lambda url, headers, start, end, index, abort_event=None:
+            b"x" * (end - start + 1),
+    )
+
+    entry = {"tmdbId": "55", "title": "T", "runtime_minutes": 60, "urls": [
+        {"url": "https://a/1.mp4", "provider": "vidlink", "type": "mp4",
+         "headers": {}, "quality": None, "size": None},
+    ]}
+
+    _, ok, job = d.process_one_entry(entry, set())
+
+    assert ok is True, "整片已下完且码率达标，不该因探不到分辨率被丢弃"
+    assert job["resolution"] == "未知分辨率"
+    assert job["bitrate_kbps"] == pytest.approx(2000, rel=0.01)
+
+
+def test_mp4_precheck_still_runs_without_resolution(sandbox, monkeypatch):
+    """🔴 头部预检不能因探不到分辨率就整个作废（模式 B）。
+
+    码率 = total_size×8/duration，与分辨率毫无关系。在这里返回 None 会让本可
+    8MB 就淘汰的低码率片白下整片（GB 级），把预检省流量的收益完全架空。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)   # 探不到分辨率
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    monkeypatch.setattr(d, "_download_mp4_chunk", lambda *a, **k: b"x" * 1024)
+
+    sample = os.path.join(str(sandbox), "s.mp4")
+    # runtime_minutes=60 → duration 3600s；total_size 900MB → 2000 kbps
+    probed = d._mp4_probe_quality_by_sample(
+        "https://a/1.mp4", {}, 900_000_000, sample, "55", 60,
+    )
+
+    assert probed is not None, "模式 B 下必须仍能预检出码率"
+    resolution, height, bitrate, codec = probed
+    assert height == 0
+    assert resolution == "未知分辨率"
+    assert bitrate == pytest.approx(2000, rel=0.01)
+    assert codec == "h264"
+
+
+def test_mp4_precheck_still_bails_out_in_mode_a(sandbox, monkeypatch):
+    """模式 A 下行为不变：探不到分辨率就放弃预检，下整片后再验。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    monkeypatch.setattr(d, "_download_mp4_chunk", lambda *a, **k: b"x" * 1024)
+
+    sample = os.path.join(str(sandbox), "s.mp4")
+    probed = d._mp4_probe_quality_by_sample(
+        "https://a/1.mp4", {}, 900_000_000, sample, "55", 60,
+    )
+    assert probed is None
+
+
+def test_m3u8_stream_survives_failed_resolution_probe(sandbox, monkeypatch):
+    """🔴 m3u8 流层：探不到分辨率也应能凭码率入选（模式 B）。
+
+    master 未声明 RESOLUTION 且 ffprobe 探测失败时，模式 B 下不该放弃这条流。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)   # 探不到
+    monkeypatch.setattr(d, "SAMPLE_COUNT", 4)
+
+    # master 不声明 RESOLUTION（第一项为 None），逼流层去 ffprobe 探测。
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None, headers=None: [
+            (None, "https://cdn/only.m3u8", 3000.0),
+        ],
+    )
+    monkeypatch.setattr(
+        d, "parse_media_playlist",
+        lambda url, headers=None: (
+            [f"https://cdn/s{i}.ts" for i in range(20)], [4.0] * 20, None,
+        ),
+    )
+
+    def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
+                      init_url=None, force_init=False, headers=None,
+                      retry_max=None):
+        if end_idx is None:
+            end_idx = len(urls)
+        n = end_idx - start_idx
+        with open(out, "wb") as fh:
+            fh.write(b"x" * 16)
+        return n * 1_000_000, [], 0     # 2000 kbps，稳过 1000 门槛
+
+    monkeypatch.setattr(d, "download_segments", fake_download)
+
+    _, ok, job = d.process_one_entry({"tmdbId": "55", "urls": ["u"]}, set())
+
+    assert ok is True, "探不到分辨率不应让这条合格流被放弃"
+    assert job["resolution"] == "未知分辨率"
+
+
+def test_bitrate_reject_message_does_not_lead_with_resolution(monkeypatch):
+    """模式 B 的淘汰文案不能以"分辨率 …"开头，但必须保留 marker。
+
+    分辨率没参与判定却写在最前面，日后翻 failed.jsonl 会误以为是分辨率把片子
+    卡掉的，从而对着一个根本不生效的 min_resolution_height 反复调参。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    msg = d.bitrate_reject_message("854x480", "h264", 900, 1600)
+
+    assert msg.startswith("码率未达到门槛")
+    assert "854x480" in msg          # 仍作为附带信息保留，便于排查
+    # marker 不变：判定表、统计表、历史 failed.jsonl 都靠它工作。
+    assert d._classify_failure(msg) is False
+    assert d.classify_reject_reason(msg) == "码率未达门槛"
+
+    # 模式 A 的措辞保持原样，不得被改动。
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    msg_a = d.bitrate_reject_message("854x480", "h264", 900, 1600)
+    assert msg_a.startswith("分辨率 854x480")
+    assert d._classify_failure(msg_a) is False
+
+
+# ---------------- mp4 跨节点码率择优（§12.16）----------------
+# 背景：mp4 是"试到第一个成功就 break"，不像 m3u8 会在候选流之间择优。取流侧
+# 又按声明分辨率降序给节点，于是「1080p/1700kbps 刚过线」会直接胜出，而
+# 「480p/8000kbps」根本不会被看到。
+
+def _mp4_node(url, quality=None, size=None):
+    return {"url": url, "provider": "vidlink", "type": "mp4",
+            "headers": {}, "quality": quality, "size": size}
+
+
+def _stub_preflight(monkeypatch, by_url):
+    """按 url 给出预检结果。值为 (bitrate, estimated) 或 None（探测失败）。"""
+    def fake(node, label, runtime_minutes=None):
+        got = by_url.get(node["url"])
+        if got is None:
+            return None
+        bitrate, estimated = got
+        return {
+            "node": node, "total_size": 1_000_000,
+            "probed": None if estimated else ("1920x1080", 1080, bitrate, "h264"),
+            "bitrate": bitrate, "estimated": estimated,
+        }
+    monkeypatch.setattr(d, "_mp4_preflight", fake)
+
+
+def test_mp4_nodes_are_ranked_by_measured_bitrate(monkeypatch):
+    """实测码率最高的节点排第一，哪怕它声明分辨率最低。
+
+    这正是本功能要解决的场景：480p/8000kbps 必须赢过 1080p/1700kbps。
+    """
+    _stub_preflight(monkeypatch, {
+        "https://a/1080.mp4": (1700.0, False),
+        "https://a/480.mp4": (8000.0, False),
+    })
+    nodes = [_mp4_node("https://a/1080.mp4", 1080),
+             _mp4_node("https://a/480.mp4", 480)]
+
+    ordered = d._rank_mp4_nodes(nodes, "55", 60)
+
+    assert [n["url"] for n, _i in ordered] == [
+        "https://a/480.mp4", "https://a/1080.mp4",
+    ]
+
+
+def test_measured_bitrate_beats_estimated(monkeypatch):
+    """实测优先于估算：估算值再高也不能压过实测的。
+
+    估算来自源站声明的 size，未经 ffprobe 校验，可信度低一个量级。
+    """
+    _stub_preflight(monkeypatch, {
+        "https://a/measured.mp4": (2000.0, False),
+        "https://a/guessed.mp4": (9000.0, True),
+    })
+    nodes = [_mp4_node("https://a/guessed.mp4"),
+             _mp4_node("https://a/measured.mp4")]
+
+    ordered = d._rank_mp4_nodes(nodes, "55", 60)
+
+    assert ordered[0][0]["url"] == "https://a/measured.mp4"
+
+
+def test_unprobeable_nodes_sink_to_the_bottom_but_survive(monkeypatch):
+    """🔑 底线：预检失败的节点排到最后，但**绝不能被淘汰**。
+
+    探不出码率不代表节点是坏的（moov 不在文件头就会这样）。丢掉它们等于
+    白白损失多源 fallback 能力（§10.13 实测靠 fallback 救回过片子）。
+    """
+    _stub_preflight(monkeypatch, {
+        "https://a/ok.mp4": (2000.0, False),
+        "https://a/dead.mp4": None,      # 预检失败
+    })
+    nodes = [_mp4_node("https://a/dead.mp4"), _mp4_node("https://a/ok.mp4")]
+
+    ordered = d._rank_mp4_nodes(nodes, "55", 60)
+
+    assert [n["url"] for n, _i in ordered] == [
+        "https://a/ok.mp4", "https://a/dead.mp4",
+    ]
+    assert len(ordered) == 2, "节点数不能变少——排序只重排，不淘汰"
+
+
+def test_all_unprobeable_falls_back_to_upstream_order(monkeypatch):
+    """全部预检不出时退化为上游原始顺序，行为等同改动前。"""
+    _stub_preflight(monkeypatch, {})     # 全部返回 None
+    nodes = [_mp4_node("https://a/1.mp4", 1080),
+             _mp4_node("https://a/2.mp4", 720),
+             _mp4_node("https://a/3.mp4", 480)]
+
+    ordered = d._rank_mp4_nodes(nodes, "55", 60)
+
+    assert [n["url"] for n, _i in ordered] == [
+        "https://a/1.mp4", "https://a/2.mp4", "https://a/3.mp4",
+    ]
+
+
+def test_single_mp4_node_skips_preflight(monkeypatch):
+    """单节点不做择优预检——那是白花 1~2 个网络请求，且结果无从比较。"""
+    called = []
+    monkeypatch.setattr(
+        d, "_mp4_preflight",
+        lambda *a, **k: called.append(1) or None,
+    )
+
+    ordered = d._rank_mp4_nodes([_mp4_node("https://a/1.mp4")], "55", 60)
+
+    assert called == [], "单节点不该触发预检"
+    assert ordered == [(ordered[0][0], None)]
+
+
+def test_ranking_preserves_m3u8_positions(sandbox, monkeypatch):
+    """🔑 重排只在 mp4 节点之间发生，m3u8 节点必须留在原位。
+
+    否则 is_last_node 的语义会漂移（它决定 master playlist 用长重试还是短重试），
+    且 m3u8/mp4 的相对尝试次序被打乱，影响面远超本功能意图。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    _stub_preflight(monkeypatch, {
+        "https://a/lo.mp4": (1000.0, False),
+        "https://a/hi.mp4": (9000.0, False),
+    })
+
+    tried = []
+
+    def record_mp4(node, output_path, label, runtime_minutes=None, preflight=None):
+        tried.append(node["url"])
+        raise RuntimeError("请求失败(HTTP Error 502)")
+
+    def record_master(url, retries=None, headers=None):
+        tried.append(url)
+        raise RuntimeError("请求失败(HTTP Error 502)")
+
+    monkeypatch.setattr(d, "_download_mp4_direct", record_mp4)
+    monkeypatch.setattr(d, "parse_master_playlist", record_master)
+
+    # 顺序：mp4(lo) → m3u8 → mp4(hi)。择优后两个 mp4 互换，m3u8 仍在中间。
+    entry = {"tmdbId": "55", "title": "T", "urls": [
+        _mp4_node("https://a/lo.mp4"),
+        {"url": "https://a/mid.m3u8", "provider": "vidup", "type": "m3u8",
+         "headers": {}, "quality": None, "size": None},
+        _mp4_node("https://a/hi.mp4"),
+    ]}
+    d.process_one_entry(entry, set())
+
+    assert tried == [
+        "https://a/hi.mp4",     # 高码率的 mp4 换到了第一个 mp4 位置
+        "https://a/mid.m3u8",   # m3u8 仍在中间，位置未动
+        "https://a/lo.mp4",
+    ]
+
+
+def test_preflight_result_is_reused_not_reprobed(sandbox, monkeypatch):
+    """择优探到的结果要透传给下载，不能让同一节点被探两次。
+
+    否则每部片平白多出一轮 8MB 采样 + 探总长请求，择优的成本翻倍。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    _stub_preflight(monkeypatch, {
+        "https://a/1.mp4": (5000.0, False),
+        "https://a/2.mp4": (1000.0, False),
+    })
+
+    seen = []
+
+    def capture(node, output_path, label, runtime_minutes=None, preflight=None):
+        seen.append((node["url"], preflight))
+        raise RuntimeError("请求失败(HTTP Error 502)")
+
+    monkeypatch.setattr(d, "_download_mp4_direct", capture)
+
+    entry = {"tmdbId": "55", "title": "T", "urls": [
+        _mp4_node("https://a/1.mp4"), _mp4_node("https://a/2.mp4"),
+    ]}
+    d.process_one_entry(entry, set())
+
+    assert len(seen) == 2
+    for url, preflight in seen:
+        assert preflight is not None, f"{url} 的预检结果没被透传，会导致重复探测"
+        assert preflight["total_size"] == 1_000_000
+
+
 def test_mixed_stream_failures_stay_retriable(sandbox, monkeypatch):
     """单节点内：一条流画质淘汰 + 一条流网络异常 → 仍判可重试。
 
@@ -879,11 +1432,18 @@ def test_declared_quality_rejection_reaches_the_kill_path(sandbox, monkeypatch):
     """
     monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
     monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    # 本例走的是"声明分辨率低于红线"这道**模式 A 专属**关卡，必须显式开启
+    # （默认已是模式 B，红线关整关放行）。
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
     monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
     monkeypatch.setattr(d, "LENIENCY", 1.0)
+    # 两个 mp4 节点会触发跨节点择优，那会对每个节点发真实网络请求探总长。
+    # 本例只验"声明分辨率关 → 判死"这条链路，故桩掉择优的探测（返回 None =
+    # 探不出码率，保持上游原始顺序，与本例断言无关）。
+    monkeypatch.setattr(d, "_mp4_preflight", lambda *a, **k: None)
 
     # 两个节点都声明 480p：在 _download_mp4_direct 的第一道关卡就被拒，
-    # 探测总长等后续动作根本不会发生，故无需桩任何网络函数。
+    # 探测总长等后续动作根本不会发生，故无需桩其余网络函数。
     entry = {"tmdbId": "55", "title": "T", "urls": [
         {"url": "https://a/1.mp4", "provider": "vidlink", "type": "mp4",
          "headers": {}, "quality": 480, "size": None},
