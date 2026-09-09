@@ -146,7 +146,7 @@ def test_shutdown_unblocks_a_producer_stuck_on_a_full_queue():
     worker = p.FetchWorker(q)
     entered = threading.Event()
 
-    def blocking_fetch(argv=None, on_result=None):
+    def blocking_fetch(argv=None, on_result=None, stop_event=None):
         entered.set()
         on_result({"tmdbId": "1"})  # 队列已满 -> 阻塞在 put
 
@@ -175,7 +175,7 @@ def test_worker_puts_sentinel_even_when_fetch_raises_system_exit(monkeypatch):
     不放哨兵 = 下载侧永远等不到 "done" = 整个进程永久挂起。
     这是本方案最容易写出的死锁，必须锁死。
     """
-    def boom(argv=None, on_result=None):
+    def boom(argv=None, on_result=None, stop_event=None):
         raise SystemExit("缺少代理凭证: PROXY_USER")
 
     monkeypatch.setattr(p.fetcher, "main", boom)
@@ -206,7 +206,7 @@ def test_sentinel_is_never_dropped_when_the_queue_is_full(monkeypatch):
     q.put({"tmdbId": "b"})       # 队列已满
 
     monkeypatch.setattr(p.fetcher, "main",
-                        lambda argv=None, on_result=None: None)
+                        lambda argv=None, on_result=None, stop_event=None: None)
     worker = p.FetchWorker(q)
     worker.start()
     # 等满一个 ENQUEUE_TIMEOUT 还多：修复前哨兵此刻已被丢弃
@@ -232,7 +232,7 @@ def test_sentinel_is_never_dropped_when_the_queue_is_full(monkeypatch):
 
 
 def test_worker_puts_sentinel_when_fetch_raises_generic_error(monkeypatch):
-    def boom(argv=None, on_result=None):
+    def boom(argv=None, on_result=None, stop_event=None):
         raise RuntimeError("网络炸了")
 
     monkeypatch.setattr(p.fetcher, "main", boom)
@@ -251,7 +251,7 @@ def test_worker_stays_alive_after_main_task_for_standby(monkeypatch):
     下载侧还在跑，随时可能有 vidlink 直链过期需要重新取流；线程若退了，
     那些片只能退回 refetch_entries 的同步调用老路（§10.21 B-5/B-6 三个坑）。
     """
-    def quick(argv=None, on_result=None):
+    def quick(argv=None, on_result=None, stop_event=None):
         on_result({"tmdbId": "1", "urls": []})
 
     monkeypatch.setattr(p.fetcher, "main", quick)
@@ -271,7 +271,7 @@ def test_worker_stays_alive_after_main_task_for_standby(monkeypatch):
 
 
 def test_on_result_forwards_to_queue(monkeypatch):
-    def produce(argv=None, on_result=None):
+    def produce(argv=None, on_result=None, stop_event=None):
         for i in range(3):
             on_result({"tmdbId": str(i)})
 

@@ -903,3 +903,56 @@ def test_refetch_gives_up_at_the_round_timeout(sandbox, monkeypatch):
     assert [e["tmdbId"] for e in revived] == ["fast"]
     # 必须在超时附近返回，而不是等满 30s
     assert elapsed < 10
+
+
+# ------------------------------------------------- 单实例锁
+
+def test_main_lock_refuses_a_second_downloader(tmp_path, monkeypatch):
+    """🔴 探针实测的真问题：下载侧的单实例锁必须真的互斥。
+
+    早期 acquire_main_lock 只是覆盖写 PID、不做任何检查，形同虚设。
+    两个下载进程并发跑会读同一份 results.jsonl、写同一个 downloads/，
+    把同一部片下两遍——三层去重拦不住：success.jsonl 与磁盘扫描都只在
+    **启动时**读一次，processing_ids 更是进程内的集合，跨进程无效。
+    """
+    lock = tmp_path / "download_movies.main.lock"
+    monkeypatch.setattr(d, "MAIN_LOCK_FILE", str(lock))
+    # 伪造"别的活进程"持有锁
+    lock.write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(d, "_pid_alive", lambda pid: True)
+
+    with pytest.raises(SystemExit) as excinfo:
+        d.acquire_main_lock()
+
+    assert "已有下载进程在运行" in str(excinfo.value)
+    # 必须原样保留别人的锁，绝不能覆盖
+    assert lock.read_text(encoding="utf-8").strip() == "999999"
+
+
+def test_main_lock_clears_a_stale_lock(tmp_path, monkeypatch):
+    """陈旧锁（上次崩溃留下、PID 已死）必须能自动接管，否则要人工删文件才能重跑。"""
+    lock = tmp_path / "download_movies.main.lock"
+    monkeypatch.setattr(d, "MAIN_LOCK_FILE", str(lock))
+    lock.write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(d, "_pid_alive", lambda pid: False)
+
+    d.acquire_main_lock()
+
+    assert lock.read_text(encoding="utf-8").strip() == str(os.getpid())
+    d.release_main_lock()
+    assert not lock.exists()
+
+
+def test_release_main_lock_leaves_other_owners_alone(tmp_path, monkeypatch):
+    """只删属于本进程的锁：被拒的第二个进程退出时不得清掉第一个进程的锁。
+
+    main() 里 acquire 失败后 SystemExit 往上抛，若某条路径又调了 release
+    且它不认主，第二个进程反而会把正在跑的那个的锁删掉，互斥立刻失效。
+    """
+    lock = tmp_path / "download_movies.main.lock"
+    monkeypatch.setattr(d, "MAIN_LOCK_FILE", str(lock))
+    lock.write_text("999999", encoding="utf-8")
+
+    d.release_main_lock()
+
+    assert lock.exists(), "误删了别的进程持有的锁"

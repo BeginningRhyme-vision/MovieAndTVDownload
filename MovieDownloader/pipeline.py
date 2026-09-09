@@ -171,7 +171,11 @@ class FetchWorker:
 
     def _run(self):
         try:
-            fetcher.main(argv=self._argv, on_result=self._on_result)
+            # _stop 同时作为取流侧的协作式停止信号：下载侧收工或用户 Ctrl+C 后，
+            # 取流不再开新一轮、不再发起新请求、退避/冷却立刻醒来。
+            # 没有它的话，取流会把整批几十万 ID 跑完才罢休（实测 shutdown 白等满）。
+            fetcher.main(argv=self._argv, on_result=self._on_result,
+                         stop_event=self._stop)
         except SystemExit as exc:
             # 取流侧用模块级/流程内的 SystemExit 做配置校验（缺代理凭证、
             # 单实例锁被占等）。绝不能让它静默杀掉线程而下载侧毫不知情。
@@ -385,18 +389,30 @@ def main():
 
     started = time.time()
     worker.start()
+    interrupted = False
     try:
         downloader.main()
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n\n⚠️ [pipeline] 收到中断信号，正在收尾...", flush=True)
     finally:
         downloader.ListEntrySource = real_list_source
         downloader.async_refetch_hook = real_hook
         worker.shutdown()
+        # ⚠️ 收尾统计必须在 finally 里：Ctrl+C 时它才是最该被看到的东西
+        # （跑了多久、取到多少、下了多少、有多少留给下次）。
+        # 放在 try 之外的话，中断路径会整段跳过，用户只看到一个光秃秃的 traceback。
+        _print_summary(worker, holder["source"], refetcher, started, interrupted)
 
-    source = holder["source"]
+    return 130 if interrupted else 0
+
+
+def _print_summary(worker, source, refetcher, started, interrupted=False):
     delivered = source.delivered if source else 0
     elapsed = time.time() - started
     print("\n" + "=" * 70)
-    print(f"[pipeline] 结束：取流入队 {worker.enqueued} 部"
+    print(f"[pipeline] {'已中断' if interrupted else '结束'}："
+          f"取流入队 {worker.enqueued} 部"
           + (f"（{worker.dropped} 部改走文件承接）" if worker.dropped else "")
           + f"，下载侧消费 {delivered} 部，总耗时 {elapsed / 60:.1f} 分钟")
     if refetcher is not None and refetcher.dispatched:
@@ -408,8 +424,11 @@ def main():
     if worker.error is not None:
         print(f"⚠️ 取流侧曾异常终止：{worker.error}")
         print("   已取到的片仍已下载；重跑本命令可继续未完成的部分。")
+    if interrupted:
+        print("   进度已全部落盘（results.jsonl / success.jsonl），"
+              "重跑本命令即可从断点继续。")
     print("=" * 70, flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

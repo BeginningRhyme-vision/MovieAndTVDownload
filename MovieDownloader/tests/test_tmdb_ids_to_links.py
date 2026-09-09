@@ -7,6 +7,7 @@
 
 import json
 import os
+import time
 
 import pytest
 
@@ -437,7 +438,7 @@ def _stub_final_retry(monkeypatch, batches):
     queue = list(batches)
 
     def fake_run_batch(ids, results_file, fail_file, max_workers, providers=None,
-                       on_result=None):
+                       on_result=None, stop_event=None):
         calls.append(list(ids))
         return queue.pop(0)
 
@@ -691,3 +692,78 @@ def test_run_batch_does_not_call_back_for_dead_or_retry(tmp_path, monkeypatch):
     m.run_batch(["1", "2"], results, fail, max_workers=2, on_result=got.append)
 
     assert got == []
+
+
+# ------------------------------------------------- 协作式停止信号
+
+def test_run_batch_skips_pending_ids_once_stopped(tmp_path, monkeypatch):
+    """🔴 探针实测的真问题：停止信号置位后不得再发起新的取流请求。
+
+    没有它的话，pipeline 被 Ctrl+C 时取流线程会把整批几十万 ID 跑完才罢休，
+    shutdown 只能白等满超时（实测中断后卡住 30s，线程仍活着）。
+    """
+    import threading
+
+    results = tmp_path / "results.jsonl"
+    fail = tmp_path / "fail.txt"
+    stop = threading.Event()
+    stop.set()          # 一开始就已置位：一个都不该跑
+    touched = []
+
+    def _spy(tid, providers=None):
+        touched.append(tid)
+        return ("ok", {"tmdbId": tid, "urls": [], "title": "T"})
+
+    monkeypatch.setattr(m, "process_tmdb_id", _spy)
+
+    retry = m.run_batch(["1", "2", "3"], results, fail, max_workers=2,
+                        stop_event=stop)
+
+    assert touched == [], f"停止后仍发起了取流请求: {touched}"
+    # 跳过的 ID 必须当作"待重跑"回传，绝不能被当成 dead 写进 fail.txt 永久排除
+    assert sorted(retry) == ["1", "2", "3"]
+    assert not fail.exists() or fail.read_text().strip() == ""
+
+
+def test_run_batch_without_stop_event_behaves_as_before(tmp_path, monkeypatch):
+    """不传 stop_event 时行为必须与改造前完全一致（单独跑取流的老路）。"""
+    results = tmp_path / "results.jsonl"
+    fail = tmp_path / "fail.txt"
+    monkeypatch.setattr(
+        m, "process_tmdb_id",
+        lambda tid, providers=None: ("ok", {"tmdbId": tid, "urls": [], "title": "T"})
+    )
+
+    retry = m.run_batch(["1", "2"], results, fail, max_workers=2)
+
+    assert retry == []
+    lines = [x for x in results.read_text().splitlines() if x.strip()]
+    assert len(lines) == 2
+
+
+def test_final_retry_cooldown_is_interruptible(monkeypatch):
+    """加时赛冷却默认 1800s，必须能被停止信号打断。
+
+    否则 Ctrl+C 后要干等半小时才轮到 shutdown，用户只会以为程序挂了。
+    """
+    import threading
+
+    stop = threading.Event()
+    stop.set()
+    called = []
+
+    monkeypatch.setattr(m, "FINAL_RETRY_ENABLED", True)
+    monkeypatch.setattr(m, "FINAL_RETRY_ROUNDS", 2)
+    monkeypatch.setattr(m, "FINAL_RETRY_COOLDOWN", 1800)
+    monkeypatch.setattr(
+        m, "run_batch",
+        lambda *a, **kw: called.append(1) or []
+    )
+
+    started = time.monotonic()
+    pending, rounds = m._final_retry(["1"], None, None, 1, None, stop_event=stop)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 5, f"停止信号没能打断 1800s 冷却，白等了 {elapsed:.1f}s"
+    assert called == [], "停止后不该再跑新一批"
+    assert pending == ["1"], "未跑的 ID 必须原样留给下次运行"

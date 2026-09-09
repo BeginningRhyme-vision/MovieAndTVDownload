@@ -1126,20 +1126,40 @@ def _pid_alive(pid):
     return True
 
 
+def _read_main_lock_pid():
+    """读锁文件里的 PID；文件缺失/损坏时返回 0。"""
+    try:
+        with open(MAIN_LOCK_FILE, "r", encoding="utf-8") as file:
+            return int((file.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
 def acquire_main_lock():
-    """主流程启动时写入 PID 锁文件。"""
+    """抢下载单实例锁；已被别的活进程持有时抛 SystemExit。
+
+    ⚠️ 必须做互斥检查（早期版本只是覆盖写 PID，形同虚设）：
+    两个下载进程并发跑会读同一份 results.jsonl、写同一个 downloads/ 目录，
+    把同一部片下两遍。三层去重拦不住这种情况——success.jsonl 与磁盘扫描
+    都只在**启动时**读一次，processing_ids 更是进程内的集合，跨进程无效。
+    结果是双倍带宽、双倍代理流量，还可能两个进程同时写同一个临时文件。
+
+    pipeline.py 不另设锁，直接靠这把锁互斥：第二个 pipeline 会在
+    downloader.main() 这一步被拒（它的取流线程也会被取流锁独立拒掉）。
+    """
+    if is_main_running():
+        raise SystemExit(
+            f"已有下载进程在运行（PID {_read_main_lock_pid()}）。\n"
+            f"两个下载同时跑会把同一部片下两遍，白烧一倍带宽与代理流量。\n"
+            f"若确认那个进程已死，删掉 {MAIN_LOCK_FILE} 再试。"
+        )
     with open(MAIN_LOCK_FILE, "w", encoding="utf-8") as file:
         file.write(str(os.getpid()))
 
 
 def release_main_lock():
     """主流程退出时清理锁文件（仅当锁属于本进程时才删）。"""
-    try:
-        with open(MAIN_LOCK_FILE, "r", encoding="utf-8") as file:
-            pid = int((file.read() or "0").strip() or 0)
-    except (OSError, ValueError):
-        pid = 0
-    if pid == os.getpid():
+    if _read_main_lock_pid() == os.getpid():
         remove_file(MAIN_LOCK_FILE)
 
 
@@ -1150,11 +1170,7 @@ def is_main_running():
     """
     if not os.path.exists(MAIN_LOCK_FILE):
         return False
-    try:
-        with open(MAIN_LOCK_FILE, "r", encoding="utf-8") as file:
-            pid = int((file.read() or "0").strip() or 0)
-    except (OSError, ValueError):
-        return False
+    pid = _read_main_lock_pid()
     if pid > 0 and _pid_alive(pid):
         return True
     # 陈旧锁：进程已不在，清理掉。

@@ -791,7 +791,7 @@ def load_processed_ids(results_file, fail_file):
 
 
 def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
-              on_result=None):
+              on_result=None, stop_event=None):
     """并发处理一批 ID，实时落盘 ok/dead，返回本批"瞬时耗尽"待重跑的 ID 列表。
 
       - "ok"    → 追加写 results_file（output）
@@ -805,13 +805,26 @@ def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
       - **在写盘锁之外调用**，故允许阻塞（pipeline 的队列满时正是靠它形成反压）；
         放在锁内会让一条的等待堵死其余所有取流线程，反压就变成了冻结；
       - 回调抛异常不得影响取流：已落盘的结果不能因为下游出问题而白费。
+
+    stop_event（可选，§12 pipeline 模式用）：协作式停止信号。置位后：
+      - 尚未开跑的任务直接跳过（不再消耗代理流量）；
+      - 已在跑的那一条仍会跑完（HTTP 请求本身无法中途取消），但结果照常落盘。
+    没有它的话，pipeline 被 Ctrl+C 时取流线程会把整批几十万 ID 跑完才罢休，
+    shutdown 只能白等满超时（实测 30s 后线程仍活着）。
     """
     lock = threading.Lock()
     ok_count = 0
     dead_count = 0
     retry_ids = []
+    skipped = 0
 
     def process_one(tid):
+        # 停止信号已置位：不再开新的取流请求。返回 retry 而非 dead——
+        # 这些 ID 从未被判过无源，绝不能写进 fail.txt 被永久排除。
+        if stop_event is not None and stop_event.is_set():
+            with lock:
+                retry_ids.append(tid)
+            return "skipped"
         status, result = process_tmdb_id(tid, providers=providers)
         with lock:
             if status == "ok" and result:
@@ -850,10 +863,12 @@ def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
                 status = future.result()
                 if status == "ok":
                     ok_count += 1
-                elif status == "retry":
+                elif status in ("retry", "skipped"):
                     pass  # 已收集进 retry_ids
                 else:
                     dead_count += 1
+                if status == "skipped":
+                    skipped += 1
             except Exception as e:  # noqa: BLE001
                 print(f"⚠️  Unexpected exception for {tid}: {e}")
                 with lock:
@@ -863,7 +878,8 @@ def run_batch(to_process, results_file, fail_file, max_workers, providers=None,
         raise
     executor.shutdown(wait=True)
 
-    print(f"\n本批完成 | 成功 {ok_count} | 真无源 {dead_count} | 待重跑 {len(retry_ids)}")
+    print(f"\n本批完成 | 成功 {ok_count} | 真无源 {dead_count} | 待重跑 {len(retry_ids)}"
+          + (f" | 因停止信号跳过 {skipped}" if skipped else ""))
     return retry_ids
 
 
@@ -879,22 +895,25 @@ def _parse_args(argv):
     return ap.parse_args(argv)
 
 
-def main(argv=None, on_result=None):
+def main(argv=None, on_result=None, stop_event=None):
     """取流主流程。
 
     on_result（可选）：pipeline 模式（§12）下把每条 ok 结果实时推给下游，
     详见 run_batch 的同名参数。为 None 时行为与改造前完全一致。
 
+    stop_event（可选）：pipeline 模式下的协作式停止信号，让取流能在下载侧
+    收工/被中断时尽快收手，而不是把整批 ID 跑完（详见 run_batch 同名参数）。
+
     单实例锁在 _main_impl 内按模式条件获取，这里统一释放：release 只在锁属于
     本进程时才删文件，故 --refetch-failed（没抢锁）走到这里也是安全的空操作。
     """
     try:
-        return _main_impl(argv=argv, on_result=on_result)
+        return _main_impl(argv=argv, on_result=on_result, stop_event=stop_event)
     finally:
         release_fetch_lock()
 
 
-def _main_impl(argv=None, on_result=None):
+def _main_impl(argv=None, on_result=None, stop_event=None):
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     providers = _resolve_providers(args.providers) if args.providers else list(ACTIVE_PROVIDERS)
 
@@ -952,6 +971,11 @@ def _main_impl(argv=None, on_result=None):
     round_no = 0
     unresolved = []
     while pending:
+        # 停止信号：下载侧已收工或被 Ctrl+C，别再开新一轮（一轮就是几万个请求）。
+        if stop_event is not None and stop_event.is_set():
+            unresolved = list(pending)
+            print(f"\n==> 收到停止信号，剩余 {len(unresolved)} 个 ID 留待下次运行。")
+            break
         round_no += 1
         print(f"\n{'=' * 70}")
         print(f"==> 第 {round_no}/{max_rounds} 轮 | 待处理 {len(pending)} 个 ID")
@@ -959,7 +983,8 @@ def _main_impl(argv=None, on_result=None):
 
         batch_size = len(pending)
         retry_ids = run_batch(pending, results_file, fail_file, max_workers,
-                              providers=providers, on_result=on_result)
+                              providers=providers, on_result=on_result,
+                              stop_event=stop_event)
 
         if not retry_ids:
             print("\n==> 瞬时失败已清零，所有有源 ID 已捞干净，正常结束。")
@@ -971,7 +996,7 @@ def _main_impl(argv=None, on_result=None):
             # 等人发起下次运行。加时赛用长冷却再试几轮，把它们自动捞回来。
             unresolved, extra_rounds = _final_retry(
                 retry_ids, results_file, fail_file, max_workers, providers,
-                on_result=on_result
+                on_result=on_result, stop_event=stop_event
             )
             round_no += extra_rounds
             if not unresolved:
@@ -991,7 +1016,15 @@ def _main_impl(argv=None, on_result=None):
             print(f"\n==> 本轮 {len(retry_ids)}/{batch_size} 待重跑，疑似代理/源站故障，等待 {wait}s 后重试")
         else:
             print(f"\n==> 等待 {wait}s 后开始下一轮")
-        time.sleep(wait)
+        # 用 stop_event.wait 代替 sleep：退避最长 300s，Ctrl+C 后干等这么久
+        # 会让 shutdown 白白超时。有信号则立刻醒来，无信号时行为与 sleep 一致。
+        if stop_event is not None:
+            if stop_event.wait(wait):
+                print("\n==> 退避期间收到停止信号，本次取流到此为止。")
+                unresolved = list(pending)
+                break
+        else:
+            time.sleep(wait)
 
     # 多轮跑满仍未捞回的 ID **绝不能写进 fail_file**：fail_file 的语义是"源站明确
     # 说没有这片，永久排除"，为此判死链路做了白名单（只有 NoSource）加 dead_confirm
@@ -1019,7 +1052,7 @@ def _main_impl(argv=None, on_result=None):
 
 
 def _final_retry(retry_ids, results_file, fail_file, max_workers, providers,
-                 on_result=None):
+                 on_result=None, stop_event=None):
     """常规轮次跑满后的加时赛：长冷却再试几轮。
 
     返回 (仍未解决的 ID 列表, 实际跑了几轮)。轮数要回传给调用方，否则收尾打印的
@@ -1039,6 +1072,8 @@ def _final_retry(retry_ids, results_file, fail_file, max_workers, providers,
 
     pending = retry_ids
     for extra_round in range(1, FINAL_RETRY_ROUNDS + 1):
+        if stop_event is not None and stop_event.is_set():
+            return pending, extra_round - 1
         print(f"\n{'=' * 70}")
         print(
             f"==> 最终捞回 {extra_round}/{FINAL_RETRY_ROUNDS} | "
@@ -1046,12 +1081,19 @@ def _final_retry(retry_ids, results_file, fail_file, max_workers, providers,
         )
         print(f"{'=' * 70}")
         # 冷却放在跑之前：常规轮刚跑完，故障源大概率还没恢复，立刻重跑只是白烧配额。
+        # ⚠️ 冷却默认 1800s，必须可被停止信号打断——否则 Ctrl+C 后要干等半小时，
+        # pipeline 的 shutdown 只能白白超时（这是实测卡住 30s 的元凶之一）。
         if FINAL_RETRY_COOLDOWN > 0:
-            time.sleep(FINAL_RETRY_COOLDOWN)
+            if stop_event is not None:
+                if stop_event.wait(FINAL_RETRY_COOLDOWN):
+                    print("\n==> 冷却期间收到停止信号，放弃剩余加时赛。")
+                    return pending, extra_round - 1
+            else:
+                time.sleep(FINAL_RETRY_COOLDOWN)
 
         pending = run_batch(
             pending, results_file, fail_file, max_workers, providers=providers,
-            on_result=on_result
+            on_result=on_result, stop_event=stop_event
         )
         if not pending:
             return [], extra_round
