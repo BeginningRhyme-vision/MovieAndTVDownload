@@ -25,16 +25,26 @@ import download_movies as downloader
 import tmdb_ids_to_links as fetcher
 
 
+_PIPELINE_CFG = (downloader._CFG.get("pipeline", {}) or {})
+
 # 队列容量：满了之后取流侧的 on_result 回调会阻塞，天然形成反压。
 # 取流侧才是瓶颈（§12.3：取流 ~4.6 部/分钟 < 下载 ~6.4 部/分钟），
 # 故队列长期偏空、这个上限基本不会碰到；它是保险丝，不是主调节手段。
-QUEUE_MAXSIZE = max(
-    1, int((downloader._CFG.get("pipeline", {}) or {}).get("queue_maxsize", 200))
-)
-# 取流侧入队的最长等待。队列满且下载侧长时间不消费时，不能让取流线程永久卡死
-# （那样 Ctrl+C 都退不出去），超时就放弃走快车道——结果**已经落盘**，
-# 下次运行仍能从 results.jsonl 读到，不丢片。
-ENQUEUE_TIMEOUT = 300
+#
+# ⚠️ 队列里的每一条都是**等待被下载的签名直链**，而 vidlink 的 mp4 直链带时效。
+# 容量越大 = 允许取流跑在下载前面越多 = 队首那条在队列里待得越久。
+# 按取流 ~4.6 部/分钟估算，1024 条约合 3.7 小时的产出量——仍远小于实测
+# "签发 30h 后仍能拉流"的下限（§12.8），安全。
+QUEUE_MAXSIZE = max(1, int(_PIPELINE_CFG.get("queue_maxsize", 1024)))
+
+# 取流侧入队的最长等待（秒）。只在**队列满**时才起作用：队列满且下载侧长时间
+# 不消费时，不能让取流线程永久卡死（那样 Ctrl+C 都退不出去），
+# 超时就放弃走快车道——结果**已经落盘 results.jsonl**，下次运行仍能读到，
+# 是「推迟」而非「丢失」。
+#
+# 按设计它**基本不该触发**（取流是瓶颈、队列长期偏空）。真频繁触发说明
+# "取流是瓶颈"的判断错了，那是要重新设计的信号，不是靠调这个数字解决。
+ENQUEUE_TIMEOUT = max(1, int(_PIPELINE_CFG.get("enqueue_timeout_seconds", 120)))
 
 
 class QueueEntrySource:

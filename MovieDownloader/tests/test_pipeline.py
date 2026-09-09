@@ -267,6 +267,43 @@ def test_refetch_failed_flag_is_rejected(monkeypatch):
     assert "refetch-failed" in str(excinfo.value)
 
 
+def test_queue_and_timeout_come_from_config():
+    """两个反压参数必须来自 config，且取值合理。
+
+    硬编码会让"队列满"这类问题只能改代码才能应对；而 §12.10 G 明确
+    这两个值的意义在于**触发时能被观察到**，故必须可配。
+    """
+    import yaml
+    from pathlib import Path
+
+    cfg_path = Path(__file__).resolve().parent.parent / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    section = cfg["download_movies"]["pipeline"]
+
+    # config 里写了什么，模块就该读到什么（防"加了配置项但代码没接"）
+    assert p.QUEUE_MAXSIZE == section["queue_maxsize"]
+    assert p.ENQUEUE_TIMEOUT == section["enqueue_timeout_seconds"]
+    # 必须为正：0 或负数会让 Queue(maxsize<=0) 退化成无界，反压彻底失效
+    assert p.QUEUE_MAXSIZE > 0
+    assert p.ENQUEUE_TIMEOUT > 0
+
+
+def test_queue_capacity_stays_within_link_lifetime():
+    """🔑 队列容量不能超过签名直链的有效期，否则桥反而制造了它要解决的问题。
+
+    队列里每一条都是**等待下载的签名直链**。容量 ÷ 取流速率 = 队首那条最长
+    要等多久。取流实测 ~4.6 部/分钟（§12.3）；vidlink 实测"签发 30h 后仍能
+    206 拉流"（§12.8）。留足安全边际：不得超过 12 小时的产出量。
+    """
+    fetch_rate_per_minute = 4.6
+    hours_of_backlog = p.QUEUE_MAXSIZE / fetch_rate_per_minute / 60
+
+    assert hours_of_backlog < 12, (
+        f"队列容量 {p.QUEUE_MAXSIZE} 约合 {hours_of_backlog:.1f} 小时产出量，"
+        f"队首直链可能等到过期——这正是 §12 要消除的问题"
+    )
+
+
 # ------------------------------------------------- AsyncRefetcher
 
 def _make_refetcher(monkeypatch, tmp_path, outcomes, workers=2):
