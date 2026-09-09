@@ -6,6 +6,7 @@ mp4 直链请求头、失败分类与被拒原因归类。全部为纯函数级�
 
 import json
 import os
+import threading
 import time
 
 import pytest
@@ -260,7 +261,8 @@ def _sampling_env(monkeypatch, variants):
     monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
 
     def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
-                      init_url=None, force_init=False, headers=None):
+                      init_url=None, force_init=False, headers=None,
+                      retry_max=None):
         if end_idx is None:
             end_idx = len(urls)
         n = end_idx - start_idx
@@ -978,3 +980,134 @@ def test_release_main_lock_leaves_other_owners_alone(tmp_path, monkeypatch):
     d.release_main_lock()
 
     assert lock.exists(), "误删了别的进程持有的锁"
+
+
+# ------------------------------------------------- 中断与重试预算
+
+@pytest.fixture(autouse=True)
+def _clear_interrupt():
+    """每个用例前后都清掉全局中断信号，避免相互污染。"""
+    d.interrupted.clear()
+    yield
+    d.interrupted.clear()
+
+
+def test_segment_retry_aborts_immediately_when_interrupted(monkeypatch):
+    """🔴 服务器实跑的真问题：中断后分片重试必须立刻收手。
+
+    Ctrl+C 只打断主线程，线程池里退避中的 worker 毫不知情。退避第 7 次起
+    封顶 60s、单分片最多 20 次，于是"中断统计都打印完了，进程还挂着 31 个
+    线程继续刷失败日志"，kill -INT 形同虚设，只能 kill -9。
+
+    修复前此用例会失败：sleep 期间没人叫得醒它，要跑满 20 次才返回。
+    """
+    def always_502(*a, **kw):
+        raise RuntimeError("502 Server Error: Bad Gateway")
+
+    monkeypatch.setattr(d, "request_with_retry", always_502)
+
+    result = {}
+
+    def worker():
+        started = time.monotonic()
+        try:
+            d.download_single_segment("http://x/s.ts", 0, 20, 1)
+        except Exception as exc:
+            result["error"] = str(exc)
+        result["elapsed"] = time.monotonic() - started
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    # 等到退避已经拉长（第 5 次起 ≥16s），此时若不可打断就必然超时
+    time.sleep(8)
+    d.interrupted.set()      # 模拟 Ctrl+C
+    thread.join(timeout=10)
+
+    assert not thread.is_alive(), "中断后线程仍在死磕重试"
+    assert result["elapsed"] < 12, (
+        f"中断后又跑了 {result['elapsed']:.1f}s，退避没有被打断"
+    )
+    assert "已取消" in result["error"]
+
+
+def test_segment_refuses_to_start_once_interrupted(monkeypatch):
+    """中断后连第一次请求都不该再发出去。"""
+    calls = []
+
+    def spy(*a, **kw):
+        calls.append(1)
+        return b"data"
+
+    monkeypatch.setattr(d, "request_with_retry", spy)
+    d.interrupted.set()
+
+    with pytest.raises(RuntimeError, match="已取消"):
+        d.download_single_segment("http://x/s.ts", 0, 20, 1)
+
+    assert calls == [], "中断后仍发起了请求"
+
+
+def test_abort_event_stops_one_movie_without_touching_others(monkeypatch):
+    """单部片的 abort_event 必须能打断**退避中**的重试，且不影响全局。
+
+    刻意在第一次请求之后才置位，绕开入口处的前置检查——只有退避路径也认
+    abort_event，这个用例才会通过。
+    """
+    abort = threading.Event()
+    calls = []
+
+    def fail_then_abort(*a, **kw):
+        calls.append(1)
+        abort.set()          # 第一次失败后，这部片被判定放弃
+        raise RuntimeError("502 Server Error: Bad Gateway")
+
+    monkeypatch.setattr(d, "request_with_retry", fail_then_abort)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="已取消"):
+        d.download_single_segment("http://x/s.ts", 0, 20, 1, abort_event=abort)
+    elapsed = time.monotonic() - started
+
+    assert len(calls) == 1, f"abort 置位后仍重试了 {len(calls)} 次"
+    assert elapsed < 5, f"退避没有响应 abort_event，耗时 {elapsed:.1f}s"
+    # 全局信号未被误置位
+    assert not d.interrupted.is_set()
+
+
+def test_sample_retry_budget_is_far_smaller_than_full_download():
+    """🔴 采样阶段的重试预算必须远小于正片。
+
+    采样只是"测个码率决定要不要下"，探不到就该换下一条流；正片死磕才值得
+    （已投入大量带宽）。两者共用 20 次，会把判断成本抬到执行成本的量级——
+    服务器实跑时 10 部片在采样里空转了 90 分钟（单条流采样理论上界 35 分钟）。
+    """
+    assert d.SAMPLE_SEG_RETRY_MAX < d.SEG_RETRY_MAX
+
+    # 按指数退避封顶 60s 估算单分片最长等待
+    def backoff_total(attempts):
+        return sum(min(1 * (2 ** (i - 1)), 60) for i in range(1, attempts))
+
+    sample_seconds = backoff_total(d.SAMPLE_SEG_RETRY_MAX)
+    assert sample_seconds <= 60, (
+        f"采样单分片最长退避 {sample_seconds}s，太久了——"
+        f"采样阶段应当快速失败并换下一条流"
+    )
+
+
+def test_download_segments_defaults_to_full_retry_budget(monkeypatch, tmp_path):
+    """不传 retry_max 时必须沿用正片预算，保持既有行为不变。"""
+    seen = []
+
+    def fake_seg(url, index, retry_max, delay, headers=None, abort_event=None):
+        seen.append(retry_max)
+        return b"x" * 10
+
+    monkeypatch.setattr(d, "download_single_segment", fake_seg)
+    out = tmp_path / "out.ts"
+
+    d.download_segments(["u1", "u2"], str(out), concurrency=1)
+    assert seen == [d.SEG_RETRY_MAX, d.SEG_RETRY_MAX]
+
+    seen.clear()
+    d.download_segments(["u1"], str(out), concurrency=1, retry_max=3)
+    assert seen == [3]

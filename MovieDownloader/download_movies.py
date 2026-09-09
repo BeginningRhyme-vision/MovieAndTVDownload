@@ -9,6 +9,7 @@ import math
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -149,6 +150,17 @@ TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
 SAMPLE_COUNT = int(_CFG.get("sample_count", 10))
 SEG_RETRY_MAX = int(_CFG.get("seg_retry_max", 20))
 SEG_RETRY_DELAY = float(_CFG.get("seg_retry_delay", 1))
+# 采样阶段的单分片重试上限，**刻意远小于** seg_retry_max。
+#
+# 采样只是为了"测个码率决定这条流要不要下"，探不到就该立刻换下一条流/节点；
+# 而正片下载死磕 20 次是值得的（已经投入了大量带宽，半途而废等于全白下）。
+# 两者用同一个值是把"判断成本"抬到了"执行成本"的量级。
+#
+# 🔴 服务器实跑教训：源站持续吐 400/502（都不在 _NO_RETRY_HTTP_STATUS 白名单里，
+# 故每片必须走满重试），一部片 = N 条候选流 × 10 个采样分片 × 20 次重试，
+# 退避第 7 次起封顶 60s —— 10 部片在采样阶段空转了 90 分钟仍无结论。
+# 按 3 次算，同样场景下单分片最长约 7s（1+2+4），整体缩短两个数量级。
+SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 3)))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
@@ -385,6 +397,20 @@ def wait_for_disk_gate():
 
 class UnsupportedPlaylistError(RuntimeError):
     """播放列表使用了当前手工分片下载器不支持的 HLS 功能。"""
+
+
+# 全局中断信号：Ctrl+C / SIGTERM 后置位，所有分片重试循环见状立刻放弃退避、
+# 归还线程。
+#
+# ⚠️ 为什么必须有它（服务器实跑踩到的坑）：分片重试是 `time.sleep(退避)` 的
+# 长循环，退避第 7 次起就封顶 60s，单分片最多 20 次。Ctrl+C 只会中断**主线程**，
+# 线程池里的 worker 察觉不到，会各自把 20 次重试跑完才罢休。
+# 实测表现是：中断统计都打印完了（"[pipeline] 已中断"），进程却还挂着 31 个
+# 线程继续刷失败日志，`kill -INT` 形同虚设，只能 kill -9。
+#
+# mp4 直链层早有同款机制（_download_mp4_chunk 的 abort_event），但那是**每部片
+# 一个**的局部信号，只能在"这部片判失败"时打断自己；进程级中断需要这个全局的。
+interrupted = threading.Event()
 
 
 # 并发开大后用于观察是否被源站风控：统计 403/429/503 的出现次数。
@@ -1492,15 +1518,25 @@ def validate_segment_content(content, url):
         raise RuntimeError(f"服务器返回的不是视频分片: {url}")
 
 
-def download_single_segment(url, index, retry_max, delay, headers=None):
+def download_single_segment(url, index, retry_max, delay, headers=None,
+                            abort_event=None):
     """下载单个 HLS 分片，失败按指数退避重试 retry_max 次。
 
     确定性失败（401/403/404/410/416，或源站返回 HTML/m3u8 而非视频数据）立即
     上抛、不再退避重试：这类结果重下必然复现，白等十几分钟只会占死下载窗口、
     延误换下一个取流节点。与 mp4 直链块层（_download_mp4_chunk）语义对齐。
+
+    abort_event（可选）：本部片的放弃信号，与全局 `interrupted` 一起决定是否
+    提前收手。⚠️ 退避必须用 wait() 而不是 sleep()——sleep 期间信号叫不醒它，
+    单分片最坏要干等 20×60s，Ctrl+C 之后进程还会挂着几十个线程刷日志
+    （服务器实跑实测，见 `interrupted` 的注释）。
     """
     last_error = None
     for attempt in range(1, retry_max + 1):
+        # 开跑之前先看一眼：中断后连第一次请求都不该再发。
+        if interrupted.is_set() or (abort_event is not None
+                                    and abort_event.is_set()):
+            raise RuntimeError(f"分片 {index + 1} 已取消")
         try:
             # 外层已经负责精确重试次数，因此这里关闭额外应用层重试。
             content = request_with_retry(
@@ -1526,7 +1562,11 @@ def download_single_segment(url, index, retry_max, delay, headers=None):
                 f"    分片 {index + 1} 下载失败 "
                 f"({attempt}/{retry_max}): {exc}; {wait:.1f}s 后重试"
             )
-            time.sleep(wait)
+            # 可被打断的退避：任一信号置位就立刻醒来收手。
+            if interrupted.wait(wait):
+                raise RuntimeError(f"分片 {index + 1} 已取消") from exc
+            if abort_event is not None and abort_event.is_set():
+                raise RuntimeError(f"分片 {index + 1} 已取消") from exc
 
     raise RuntimeError(
         f"分片 {index + 1} 重试 {retry_max} 次后仍失败: {last_error}"
@@ -1542,6 +1582,7 @@ def download_segments(
     init_url=None,
     force_init=False,
     headers=None,
+    retry_max=None,
 ):
     """
     并发下载、按索引顺序写入分片。
@@ -1563,9 +1604,18 @@ def download_segments(
     init 段——否则 fMP4 中间采样片缺 moov，ffprobe 无法探测分辨率/编码。
     headers 为取流阶段记录的节点专属请求头，透传给每个分片请求；为空时用全局
     HEADERS（与旧版行为一致）。
+
+    retry_max 为单分片重试上限，默认 SEG_RETRY_MAX（正片下载用）。
+    ⚠️ **采样阶段必须传更小的值**（SAMPLE_SEG_RETRY_MAX）：采样只是为了测个
+    码率决定要不要下，探不到就该早点换下一条流/节点。用正片那套 20 次会把
+    "判断要不要下"的成本放大到和"真下一部片"一个量级——服务器实跑时源站持续吐
+    400/502，10 部片在采样里空转了 90 分钟仍无结论（见 SAMPLE_SEG_RETRY_MAX）。
     """
     if end_idx is None:
         end_idx = len(segment_urls)
+
+    if retry_max is None:
+        retry_max = SEG_RETRY_MAX
 
     indices = list(range(start_idx, min(end_idx, len(segment_urls))))
     if not indices:
@@ -1584,7 +1634,7 @@ def download_segments(
         # force_init 强制补写，保证该采样文件自身可被 ffprobe 探测。
         if init_url and (mode == "wb" or force_init):
             init_data = download_single_segment(
-                init_url, -1, SEG_RETRY_MAX, SEG_RETRY_DELAY, headers
+                init_url, -1, retry_max, SEG_RETRY_DELAY, headers
             )
             output_file.write(init_data)
             init_bytes = len(init_data)
@@ -1608,7 +1658,7 @@ def download_segments(
                     download_single_segment,
                     segment_urls[index],
                     index,
-                    SEG_RETRY_MAX,
+                    retry_max,
                     SEG_RETRY_DELAY,
                     headers,
                 )
@@ -2315,6 +2365,8 @@ def process_one_entry(entry, processed_ids):
                         # moov，否则 fMP4 采样片缺编解码参数导致 ffprobe 探测失败。
                         force_init=True,
                         headers=node_headers,
+                        # 采样探不到就换下一条流，别按正片那套死磕（见常量注释）。
+                        retry_max=SAMPLE_SEG_RETRY_MAX,
                     )
                 )
                 sample_failed_set = set(sample_failed_indices)
@@ -2758,8 +2810,41 @@ def preflight_check_ffmpeg():
     print("[ffmpeg 预检通过] ffmpeg 与 ffprobe 均已就绪", flush=True)
 
 
+def install_interrupt_handler():
+    """让 Ctrl+C / SIGTERM 置位全局 `interrupted`，把中断意图传达给工作线程。
+
+    ⚠️ 只靠 Python 默认的 KeyboardInterrupt 是不够的：它只打断**主线程**，
+    线程池里正在退避重试的分片 worker 毫不知情，会各自把 20 次重试跑完
+    （最坏 20×60s）。服务器实跑实测——中断统计都打印完了，进程还挂着 31 个线程
+    继续刷失败日志，只能 kill -9。
+
+    首次收到信号：置位事件 + 恢复默认处理器，然后照常抛 KeyboardInterrupt 走
+    正常收尾（落盘、打统计、释放锁）。
+    再按一次 Ctrl+C 就是默认行为（立即终止），给"等不及了"留出硬退出的口子。
+    """
+    def _handler(signum, _frame):
+        interrupted.set()
+        print(
+            f"\n⚠️ 收到信号 {signum}，正在停止所有下载线程"
+            f"（再按一次 Ctrl+C 可强制退出）...",
+            flush=True,
+        )
+        # 恢复默认：第二次信号直接杀进程，不再走优雅收尾。
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        raise KeyboardInterrupt()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except ValueError:
+            # 非主线程注册会抛 ValueError（如被 import 进别的框架里跑），忽略即可。
+            pass
+
+
 def main():
     acquire_main_lock()
+    install_interrupt_handler()
     preflight_check_ffmpeg()
     if S3_ENABLED:
         preflight_check_s3()
