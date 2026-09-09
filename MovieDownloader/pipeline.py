@@ -341,6 +341,12 @@ def main():
             "请单独运行 python tmdb_ids_to_links.py --refetch-failed"
         )
 
+    # ⚠️ 必须在起线程**之前**校验参数。argv 是原样透传给取流侧的，若等到取流
+    # 线程里 argparse 才发现打错（如 --typo），那时下载侧已经开跑了：它会拿着
+    # 现有 results.jsonl 跑一整轮全量下载，而用户只是想让程序报错停下。
+    # 全量场景下这等于误启动几十万部片的下载任务（已探针实测复现）。
+    fetcher._parse_args(argv)
+
     print("=" * 70)
     print("pipeline 模式：取流与下载在同一进程内重叠运行")
     print(f"队列容量 {QUEUE_MAXSIZE}，满时取流侧自动降速（反压）")

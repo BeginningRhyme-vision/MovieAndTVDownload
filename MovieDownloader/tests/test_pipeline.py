@@ -308,6 +308,27 @@ def test_refetch_failed_flag_is_rejected(monkeypatch):
     assert "refetch-failed" in str(excinfo.value)
 
 
+def test_bad_argv_is_rejected_before_anything_starts(monkeypatch):
+    """🔴 探针实测的真问题：参数打错必须在**起线程之前**被拦下。
+
+    argv 是原样透传给取流侧的。若等到取流线程里 argparse 才发现问题，
+    那时下载侧已经开跑——它会拿着现有 results.jsonl 跑一整轮全量下载，
+    而用户只是想让程序报错停下。全量场景下等于误启动几十万部片的下载。
+    """
+    started = []
+    monkeypatch.setattr(p.FetchWorker, "start",
+                        lambda self: started.append(1))
+    monkeypatch.setattr(p.downloader, "main",
+                        lambda: started.append("downloader"))
+
+    for bad in (["--typo"], ["reupload"]):
+        monkeypatch.setattr(p.sys, "argv", ["pipeline.py"] + bad)
+        with pytest.raises(SystemExit):
+            p.main()
+
+    assert started == [], f"错误参数下仍启动了组件: {started}"
+
+
 def test_queue_and_timeout_come_from_config():
     """两个反压参数必须来自 config，且取值合理。
 
