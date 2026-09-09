@@ -626,6 +626,278 @@ def test_refetch_bucket_respects_the_kill_switch(monkeypatch):
     ) == (False, False)
 
 
+# ------------------------------------------------ 画质概率判死（§12.11 D 修复）
+
+def _quality_env(monkeypatch, per_node):
+    """构造多节点场景：per_node 为每个节点要抛的异常（None 表示成功）。
+
+    返回 (entry, 调用记录)。节点全部走 mp4 分支，桩掉 _download_mp4_direct，
+    这样不必伪造 playlist 就能精确控制每个节点的失败性质。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    calls = []
+
+    def fake_mp4(node, output_path, label, runtime_minutes=None):
+        idx = len(calls)
+        calls.append(node["url"])
+        exc = per_node[idx]
+        if exc is not None:
+            raise exc
+        return "1920x1080", 3000.0
+
+    monkeypatch.setattr(d, "_download_mp4_direct", fake_mp4)
+    entry = {"tmdbId": "55", "title": "T", "urls": [
+        {"url": f"https://a/{i}.mp4", "provider": "vidlink", "type": "mp4",
+         "headers": {}, "quality": None, "size": None}
+        for i in range(len(per_node))
+    ]}
+    return entry, calls
+
+
+def test_majority_quality_rejection_kills_the_movie(sandbox, monkeypatch):
+    """3 节点里 2 个画质淘汰 + 1 个 502 → 判死，不再进下一轮。
+
+    这正是 §12.11 D 的现场（892515）：改动前 any_retriable 只要有一个 502 就把
+    整片标成可重试，而画质声明下一轮一模一样，必然再挂。29 部这样的片白跑两轮
+    共 28 分钟只救回 1 部。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    entry, _ = _quality_env(monkeypatch, [
+        d.QualityRejectedError("声明分辨率 720p 低于红线 1080"),
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+        RuntimeError("请求失败(HTTP Error 502)"),
+    ])
+
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    assert info["retriable"] is False
+    # 文案必须换成汇总口径：改动前这里留的是末节点的 502，会写出
+    # "retriable=False 却写着 502" 的自相矛盾记录，且统计会归错类。
+    assert "因画质不达标" in info["error"]
+    assert d.classify_reject_reason(info["error"]) == "画质整体不达标(判死)"
+    # 落盘后只剩字符串，此时也必须仍判死（failed.jsonl 重新载入的路径）。
+    assert d._classify_failure(info["error"]) is False
+    assert d.plan_retry_buckets(info["retriable"], info["error"]) == (False, False)
+
+
+def test_minority_quality_rejection_still_retries(sandbox, monkeypatch):
+    """3 节点里只有 1 个画质淘汰（未过半）→ 维持乐观口径，照常重投。
+
+    未达阈值的场景一律不动，保证"宁可多下不误杀"在多数情形下仍然成立。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    entry, _ = _quality_env(monkeypatch, [
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+        RuntimeError("请求失败(HTTP Error 502)"),
+        RuntimeError("请求失败(HTTP Error 503)"),
+    ])
+
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    assert info["retriable"] is True
+
+
+def test_all_transient_failures_are_never_killed(sandbox, monkeypatch):
+    """全节点都是瞬时失败 → 绝不能判死。
+
+    §12.11 D 里三轮唯一救回的那部片（471998）正是这种形态：前几个节点全挂，
+    最后一个节点一次成功。若把瞬时失败也计入画质分子，就会误杀掉唯一的正收益。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    entry, _ = _quality_env(monkeypatch, [
+        RuntimeError("请求失败(HTTP Error 502)"),
+        RuntimeError("请求失败(HTTP Error 502)"),
+    ])
+
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    assert info["retriable"] is True
+
+
+def test_kill_ratio_one_point_zero_requires_every_node(sandbox, monkeypatch):
+    """阈值设 1.0 = 最保守档：必须全部节点都画质淘汰才判死。"""
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 1.0)
+    per_node = [
+        d.QualityRejectedError("声明分辨率 720p 低于红线 1080"),
+        RuntimeError("请求失败(HTTP Error 502)"),
+    ]
+    entry, _ = _quality_env(monkeypatch, per_node)
+    _, _ok, info = d.process_one_entry(entry, set())
+    assert info["retriable"] is True   # 2 个里只有 1 个画质淘汰，未达 1.0
+
+    entry2, _ = _quality_env(monkeypatch, [
+        d.QualityRejectedError("声明分辨率 720p 低于红线 1080"),
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+    ])
+    _, _ok2, info2 = d.process_one_entry(entry2, set())
+    assert info2["retriable"] is False
+
+
+def test_successful_node_is_never_killed(sandbox, monkeypatch):
+    """前两个节点画质淘汰但第三个成功 → 整片成功，判死逻辑不得介入。
+
+    判死只写在失败路径（except）里，这条用例锁死"过半淘汰"不会误伤成功片。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    monkeypatch.setattr(d, "convert_and_upload_enabled", True, raising=False)
+    entry, calls = _quality_env(monkeypatch, [
+        d.QualityRejectedError("声明分辨率 720p 低于红线 1080"),
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+        None,
+    ])
+
+    _, ok, job = d.process_one_entry(entry, set())
+
+    assert ok is True
+    assert job["resolution"] == "1920x1080"
+    assert len(calls) == 3
+
+
+def test_expired_link_on_non_last_node_still_triggers_refetch(sandbox, monkeypatch):
+    """过期直链排在非末位时，仍必须进重取桶。
+
+    改动前 needs_refetch 只看 error 文案，而 error 取的是**最后一个**节点的错误。
+    「节点1 vidlink 403 过期 → 节点2 502」这种排列下，那条过期直链在剩余所有
+    轮次里都是废的，且不报任何错——是 §10.21 B-2 在多节点场景下的漏网。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    entry, _ = _quality_env(monkeypatch, [
+        RuntimeError(f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}"),
+        RuntimeError("请求失败(HTTP Error 502)"),
+    ])
+
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    assert info["needs_refetch"] is True
+    # 进程内路径：显式标志位。
+    assert d.plan_retry_buckets(
+        info["retriable"], info["error"], info["needs_refetch"]
+    ) == (True, True)
+    # 落盘路径：`--refetch-failed` 只能读 failed.jsonl 的文案，marker 必须在。
+    assert d._NEEDS_REFETCH_MARKER in info["error"]
+
+
+def test_quality_kill_keeps_the_refetch_marker(sandbox, monkeypatch):
+    """判死改写文案后，过期 marker 不能被顺手抹掉。
+
+    判死说的是"这些节点画质不行"，与"另一个节点的直链该换新的"是两件事：
+    换到新直链后画质可能就达标了，抹掉 marker 等于永久放弃这条救援路径。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    entry, _ = _quality_env(monkeypatch, [
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+        d.QualityRejectedError("声明分辨率 360p 低于红线 1080"),
+        RuntimeError(f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}"),
+    ])
+
+    _, _ok, info = d.process_one_entry(entry, set())
+
+    assert info["retriable"] is False
+    assert "因画质不达标" in info["error"]
+    assert d._NEEDS_REFETCH_MARKER in info["error"]
+    assert d.plan_retry_buckets(
+        info["retriable"], info["error"], info["needs_refetch"]
+    ) == (False, True)
+
+
+def test_all_streams_quality_rejected_is_deterministic(sandbox, monkeypatch):
+    """单节点内：全部候选流都因画质淘汰 → 抛确定性异常，不再报"无一入选"。
+
+    改动前这里一律落"本轮候选流无一入选（可重试）"，把"全部真不达标"和
+    "采样抖动全挂"混为一谈。前者下一轮重采结果完全相同，是纯浪费。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    _sampling_env(monkeypatch, [
+        ("1920x1080", "https://cdn/a.m3u8", 5000.0),
+        ("1920x1080", "https://cdn/b.m3u8", 4000.0),
+    ])
+    # 门槛抬到采样码率（2000 kbps）之上，让两条流都栽在码率关。
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 9000.0})
+
+    _, ok, info = d.process_one_entry({"tmdbId": "55", "urls": ["u"]}, set())
+
+    assert ok is False
+    assert info["retriable"] is False
+    assert "因画质不达标" in info["error"]
+
+
+def test_mixed_stream_failures_stay_retriable(sandbox, monkeypatch):
+    """单节点内：一条流画质淘汰 + 一条流网络异常 → 仍判可重试。
+
+    存在瞬时异常时无法断定是"真不达标"还是"抖动全挂"，必须留给下一轮重采。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    _sampling_env(monkeypatch, [
+        ("1920x1080", "https://cdn/a.m3u8", 5000.0),
+        ("1920x1080", "https://cdn/b.m3u8", 4000.0),
+    ])
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 9000.0})
+
+    real_media = d.parse_media_playlist
+
+    def flaky_media(url, headers=None):
+        if url.endswith("b.m3u8"):
+            raise RuntimeError("请求失败(HTTP Error 502)")
+        return real_media(url, headers=headers)
+
+    monkeypatch.setattr(d, "parse_media_playlist", flaky_media)
+
+    _, ok, info = d.process_one_entry({"tmdbId": "55", "urls": ["u"]}, set())
+
+    assert ok is False
+    assert info["retriable"] is True
+    assert "候选流无一入选" in info["error"]
+
+
+def test_quality_kill_reason_beats_generic_categories():
+    """判死文案里附带了末节点错误，统计归类不能被那条错误抢走。
+    classify_reject_reason 是"首个命中者胜出"，若画质判死类目排在
+    "候选流无一入选"之后，所有判死片都会被记进后者——正好污染了要用来
+    评估本口径是否过激的那份数据。
+    """
+    msg = (
+        "3 个节点中 2 个因画质不达标被确定性淘汰（≥ 阈值 0.50），"
+        "判定整片画质不达标；末节点错误：本轮候选流无一入选（各流原因见上方日志）"
+    )
+    assert d.classify_reject_reason(msg) == "画质整体不达标(判死)"
+
+
+def test_declared_quality_rejection_reaches_the_kill_path(sandbox, monkeypatch):
+    """不桩 _download_mp4_direct，让真实的画质关卡自己抛异常并一路走到判死。
+
+    📌 这条用例是"反向验证时测试意外通过"逼出来的：上面几条都把
+    _download_mp4_direct 整个替换掉了，真实 raise 点根本没被执行——把某个
+    `raise QualityRejectedError` 改回 `raise RuntimeError` 时测试照样全绿。
+    强度不够的用例锁不住"关卡必须抛画质异常"这个约束，故补这一条真正穿过
+    _download_mp4_direct 内部声明分辨率关卡的用例。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+
+    # 两个节点都声明 480p：在 _download_mp4_direct 的第一道关卡就被拒，
+    # 探测总长等后续动作根本不会发生，故无需桩任何网络函数。
+    entry = {"tmdbId": "55", "title": "T", "urls": [
+        {"url": "https://a/1.mp4", "provider": "vidlink", "type": "mp4",
+         "headers": {}, "quality": 480, "size": None},
+        {"url": "https://a/2.mp4", "provider": "vidlink", "type": "mp4",
+         "headers": {}, "quality": 360, "size": None},
+    ]}
+
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    assert info["retriable"] is False
+    assert "因画质不达标" in info["error"]
+
+
 def test_merge_next_batch_prefers_the_refetched_entry():
     """同一部片同时进两个桶时，必须用重取后的新 entry，且只投一份。
 
