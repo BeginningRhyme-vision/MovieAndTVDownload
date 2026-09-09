@@ -712,6 +712,79 @@ def test_async_refetch_hook_defaults_to_none():
     assert d.async_refetch_hook is None
 
 
+def test_list_source_alias_tracks_the_real_class():
+    """`_ListEntrySource` 是判断"当前是否流式模式"的唯一依据，必须指向原类。
+
+    pipeline.py 会把模块级的 ListEntrySource 换成自己的工厂，_run_pipeline 靠
+    `ListEntrySource is not _ListEntrySource` 区分两种模式。这个别名若被误改成
+    别的东西，判断就会永久失真——单跑下载时会被当成流式（缺 results.jsonl 时
+    不再报错退出，而是空跑一场）。
+    """
+    assert d._ListEntrySource is d.ListEntrySource
+
+
+def test_missing_input_file_exits_when_not_streaming(tmp_path, monkeypatch, capsys):
+    """单独跑下载时，results.jsonl 缺失必须报错退出——它是唯一片源。"""
+    monkeypatch.setattr(d, "INPUT_JSONL", str(tmp_path / "nope.jsonl"))
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+
+    d._run_pipeline()
+
+    assert "找不到" in capsys.readouterr().out
+
+
+def test_missing_input_file_is_tolerated_when_streaming(tmp_path, monkeypatch, capsys):
+    """🔴 探针实测的真问题：pipeline 模式下 results.jsonl 缺失**不能**退出。
+
+    全新部署时片子由同进程的取流线程实时产出，这个文件本来就还不存在
+    （取流要几十秒才写出第一条）。若照旧 return，下载侧会在启动瞬间退出，
+    整条流水线只剩取流在跑，表现为"跑完什么都没下"——首次上服务器必现。
+
+    修复前此用例会失败：_run_pipeline 在读到队列之前就返回了。
+    """
+    monkeypatch.setattr(d, "INPUT_JSONL", str(tmp_path / "nope.jsonl"))
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", False)
+
+    delivered = []
+
+    class _QueueLike:
+        """模拟取流线程：先说"还没货"，再交出一部片，最后收工。"""
+        def __init__(self):
+            self.state = 0
+
+        def poll(self):
+            self.state += 1
+            if self.state == 1:
+                return "wait", None
+            if self.state == 2:
+                return "item", {"tmdbId": "1", "urls": [{"url": "u"}]}
+            return "done", None
+
+    def _fake_process(entry, processed_ids):
+        delivered.append(entry["tmdbId"])
+        return entry["tmdbId"], False, {"error": "stub", "retriable": False}
+
+    monkeypatch.setattr(d, "process_one_entry", _fake_process)
+    # 装上非原类的工厂 = 进入流式模式（与 pipeline.py 的做法一致）
+    monkeypatch.setattr(d, "ListEntrySource", lambda entries: _QueueLike())
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
+
+    d._run_pipeline()
+
+    assert delivered == ["1"], (
+        "pipeline 模式下 results.jsonl 缺失时下载侧提前退出了，"
+        "取流线程后续产出的片全部无人消费"
+    )
+    assert "尚不存在" in capsys.readouterr().out
+
+
 def test_streaming_source_does_not_busy_wait_when_producer_is_slow():
     """流式来源返回 wait 时，主循环必须让出 CPU，不能忙等。
 

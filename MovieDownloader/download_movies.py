@@ -822,6 +822,12 @@ class ListEntrySource:
         return len(self._entries)
 
 
+# 原始 list 来源的固定引用。pipeline.py 会把模块级的 ListEntrySource 换成自己的
+# 工厂，_run_pipeline 靠 `ListEntrySource is not _ListEntrySource` 判断当前是不是
+# 流式模式——两者语义差别很大（如 results.jsonl 缺失时该不该退出）。
+_ListEntrySource = ListEntrySource
+
+
 def merge_next_batch(round_failed_retriable, revived):
     """合并两条重投路径，按 tmdbId 去重，重取后的新 entry 优先。
 
@@ -2801,47 +2807,61 @@ def _run_pipeline():
         for duplicate_id, paths in list(sorted(duplicate_files.items()))[:10]:
             print(f"  {duplicate_id}: {' | '.join(paths)}")
 
+    # ⚠️ 输入文件缺失在两种模式下含义完全不同：
+    #   - 单独跑下载：results.jsonl 是唯一片源，没有它就无事可做，照旧退出。
+    #   - pipeline 模式：片子由**同进程的取流线程**实时产出，全新部署时这个
+    #     文件本来就还不存在（取流线程要几十秒才写出第一条）。此时若照旧
+    #     return，下载侧会在启动瞬间退出，整条流水线只剩取流在跑——
+    #     首次部署必现，且表现为"跑完什么都没下"。
+    # 故 pipeline 模式（来源由 ListEntrySource 钩子接管）下把它当空存量继续跑，
+    # 后续的片全部从队列里来。
+    streaming = ListEntrySource is not _ListEntrySource
     if not os.path.exists(INPUT_JSONL):
-        print(f"错误: 找不到 {INPUT_JSONL}")
-        return
+        if not streaming:
+            print(f"错误: 找不到 {INPUT_JSONL}")
+            return
+        print(f"{INPUT_JSONL} 尚不存在（全新部署），等待取流侧实时产出", flush=True)
 
     entries = []
     entry_by_id = {}
     invalid_input_count = 0
     duplicate_input_count = 0
-    with open(INPUT_JSONL, "r", encoding="utf-8") as file:
-        for line_number, line in enumerate(file, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError as exc:
-                print(f"跳过 JSONL 第 {line_number} 行: {exc}")
-                continue
+    input_lines = []
+    if os.path.exists(INPUT_JSONL):
+        with open(INPUT_JSONL, "r", encoding="utf-8") as file:
+            input_lines = list(enumerate(file, 1))
+    for line_number, line in input_lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            print(f"跳过 JSONL 第 {line_number} 行: {exc}")
+            continue
 
-            normalized_id = normalize_tmdb_id(entry.get("tmdbId"))
-            if not normalized_id:
-                # 缺身份字段的行读入即跳过：留着也只会在 process_one_entry 里
-                # 判"缺少 tmdbId 或 urls"，把一条残缺输入放大成一条 FAILED_LOG。
-                invalid_input_count += 1
-                continue
-            previous = entry_by_id.get(normalized_id)
-            if previous is None:
-                entry_by_id[normalized_id] = entry
-                continue
-            duplicate_input_count += 1
-            # results.jsonl 是追加写：同一片经多轮重试/复扫会留下多行，且
-            # **不保证越靠后越新**。必须按 fetched_at 取真正最新的一条——
-            # vidlink 的 mp4 直链带时效签名，拿到旧的等于白跑一次下载。
-            # 无戳时回退 -1（有戳的一定胜出；都无戳则保留先出现者，维持旧行为）。
-            # 括号不能省：`a or -1 > b` 会按 `a or (-1 > b)` 结合，恒真。
-            new_ts = parse_int(entry.get("fetched_at"))
-            old_ts = parse_int(previous.get("fetched_at"))
-            if (new_ts if new_ts is not None else -1) > (
-                old_ts if old_ts is not None else -1
-            ):
-                entry_by_id[normalized_id] = entry
+        normalized_id = normalize_tmdb_id(entry.get("tmdbId"))
+        if not normalized_id:
+            # 缺身份字段的行读入即跳过：留着也只会在 process_one_entry 里
+            # 判"缺少 tmdbId 或 urls"，把一条残缺输入放大成一条 FAILED_LOG。
+            invalid_input_count += 1
+            continue
+        previous = entry_by_id.get(normalized_id)
+        if previous is None:
+            entry_by_id[normalized_id] = entry
+            continue
+        duplicate_input_count += 1
+        # results.jsonl 是追加写：同一片经多轮重试/复扫会留下多行，且
+        # **不保证越靠后越新**。必须按 fetched_at 取真正最新的一条——
+        # vidlink 的 mp4 直链带时效签名，拿到旧的等于白跑一次下载。
+        # 无戳时回退 -1（有戳的一定胜出；都无戳则保留先出现者，维持旧行为）。
+        # 括号不能省：`a or -1 > b` 会按 `a or (-1 > b)` 结合，恒真。
+        new_ts = parse_int(entry.get("fetched_at"))
+        old_ts = parse_int(previous.get("fetched_at"))
+        if (new_ts if new_ts is not None else -1) > (
+            old_ts if old_ts is not None else -1
+        ):
+            entry_by_id[normalized_id] = entry
 
     entries = list(entry_by_id.values())
 

@@ -183,11 +183,15 @@ class FetchWorker:
         finally:
             # 无论正常收尾还是异常退出，都必须放哨兵——否则下载侧会一直
             # "等下一部片"而永不收尾（这是最容易写出的死锁）。
+            #
+            # ⚠️ 这里**不能**用带超时的 put：队列满时超时会让哨兵直接丢失，
+            # 下载侧的 source_exhausted 永远为 False、主循环永久空转
+            # （已探针实测复现）。结果条目超时了只是"推迟"（有 results.jsonl
+            # 兜底），哨兵超时却是"永久挂死"，二者代价完全不对等。
+            # 故死等——下载侧只要还在消费就一定能腾出位置；它彻底不再消费时
+            # 会调 shutdown()，那里会排空队列把这个 put 解开。
             self._main_done.set()
-            try:
-                self._q.put(_SENTINEL, timeout=ENQUEUE_TIMEOUT)
-            except queue.Full:
-                pass
+            self._q.put(_SENTINEL)
             print("\n[pipeline] 取流主任务结束，转入待命态（继续服务重新取流请求）",
                   flush=True)
             # 待命态：主任务做完了，但下载侧还在跑，随时可能有直链过期需要重取。

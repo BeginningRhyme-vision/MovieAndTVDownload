@@ -190,6 +190,47 @@ def test_worker_puts_sentinel_even_when_fetch_raises_system_exit(monkeypatch):
     assert not worker.thread.is_alive()
 
 
+def test_sentinel_is_never_dropped_when_the_queue_is_full(monkeypatch):
+    """🔴 探针实测的真问题：队列满时哨兵**绝不能**因超时被丢弃。
+
+    普通结果入队超时只是"推迟"——它早已落盘 results.jsonl，下次运行照样读到。
+    但哨兵超时是"永久挂死"：下载侧的 source_exhausted 永远为 False，
+    `while round_download_futures or not source_exhausted` 出不来，主循环空转到天荒地老。
+    两者代价完全不对等，故哨兵必须死等到队列腾出位置为止。
+
+    修复前（put 带 timeout）此用例会失败：哨兵被静默吞掉，poll 只返回 wait。
+    """
+    monkeypatch.setattr(p, "ENQUEUE_TIMEOUT", 1)
+    q = queue.Queue(maxsize=2)
+    q.put({"tmdbId": "a"})
+    q.put({"tmdbId": "b"})       # 队列已满
+
+    monkeypatch.setattr(p.fetcher, "main",
+                        lambda argv=None, on_result=None: None)
+    worker = p.FetchWorker(q)
+    worker.start()
+    # 等满一个 ENQUEUE_TIMEOUT 还多：修复前哨兵此刻已被丢弃
+    time.sleep(1.5)
+
+    source = p.QueueEntrySource(q)
+    states = []
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        state, _ = source.poll()
+        states.append(state)
+        if state == "done":
+            break
+        if state == "wait":
+            time.sleep(0.05)
+
+    assert "done" in states, (
+        f"哨兵在队列满时丢失（poll 序列 {states}），"
+        f"下载侧将永久空转——哨兵入队不得设超时"
+    )
+    worker.shutdown(timeout=5)
+    assert not worker.thread.is_alive()
+
+
 def test_worker_puts_sentinel_when_fetch_raises_generic_error(monkeypatch):
     def boom(argv=None, on_result=None):
         raise RuntimeError("网络炸了")
