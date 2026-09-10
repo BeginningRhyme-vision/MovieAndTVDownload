@@ -86,6 +86,25 @@ MAX_ROUNDS = max(1, int(_MULTI_ROUND_CFG.get("max_rounds", 1))) if MULTI_ROUND_E
 # 定的，但 200 部首跑实测（§12.11 E）403/429 零触发，502 才是主因，而 502 是
 # 源站容量问题、冷却再久也不解决——三轮 10 分钟纯空转占了总时长 13%。
 ROUND_COOLDOWN_SECONDS = max(0, int(_MULTI_ROUND_CFG.get("cooldown_seconds", 60)))
+# 【源站回源故障专用的长冷却】本轮存在"整节点采样全挂"的片时，改用本值。
+#
+# 为什么要分档（500 部实跑 §12.18 / 待办 I 的实测结论）：
+#   - 30 部这类失败中 29 部是**单节点**片，没有备用源可切，只能等源站恢复；
+#   - 实测确认是 **CDN 回源故障**而非 IP 拦截——同一条分片 url 直连与住宅代理
+#     各试 3 次全是 502，且域名根路径返回 200（拦截会在根路径就 403）。
+#     故换代理、换节点都无效，唯一变量是**时间**；
+#   - 这类故障的恢复是**小时级**：故障后约 4 小时复测，3 部里 2 部恢复正常
+#     （分片返回 200 + 2MB 数据）。而 60s × 3 轮只跨几分钟，必然全部撞墙——
+#     实测代价约 5-7.5 小时无效重试，换回 0 部成功。
+#
+# 取 1800s 与取流侧「加时赛」冷却一致（见 config.yaml 的 final_retry），
+# 那里的经验同样适用：短于此基本等于再烧一次常规轮，没有意义。
+#
+# ⚠️ 只在**存在**该类失败时才生效；其余失败（单流抖动、个别分片失败等）
+# 仍走 60s 快速重试，不受影响——它们几十秒就恢复，拉长纯属浪费。
+SOURCE_OUTAGE_COOLDOWN_SECONDS = max(
+    0, int(_MULTI_ROUND_CFG.get("source_outage_cooldown_seconds", 1800))
+)
 
 # ---- 轮次间就地重取流（直链过期自愈）----
 # 直链过期是唯一一类"本脚本判死、但重新取一次流就能救回"的失败：vidlink 的签名
@@ -913,6 +932,30 @@ class ListEntrySource:
 # 工厂，_run_pipeline 靠 `ListEntrySource is not _ListEntrySource` 判断当前是不是
 # 流式模式——两者语义差别很大（如 results.jsonl 缺失时该不该退出）。
 _ListEntrySource = ListEntrySource
+
+
+# 「整节点采样全挂」的错误 marker。这类失败的特征是：候选流一条都没选中，
+# 且淘汰原因不是画质而是采样阶段拿不到数据（源站 5xx）。
+#
+# 为什么认这一条就够：画质淘汰走的是 QualityRejectedError，落盘文案含
+# "因画质不达标"；只有混合/纯瞬时异常才会落到这句兜底文案上（见
+# process_one_entry 里 `if not best_selected` 的两个分支）。
+_SOURCE_OUTAGE_MARKER = "候选流无一入选"
+
+
+def is_source_outage(error_msg):
+    """这条失败是不是「源站回源故障」型（决定轮次冷却走长档还是短档）。
+
+    判据只认「整节点采样全挂」：候选流一条都没入选，且不是画质原因。
+    实测（§12.18 / 待办 I）这类失败 96.7% 发生在**单节点**片上——没有备用源
+    可切，换代理也无效（已实测：直连与 3 个住宅 IP 全是 502），唯一的变量是
+    时间，故只能靠拉长冷却去跨越源站的恢复窗口。
+
+    ⚠️ 刻意**不**把 "源站5xx"、"超时" 这类也算进来：它们多是单条流/单个分片的
+    瞬时抖动，几十秒就恢复，拉长冷却纯属浪费。只有"整个节点的所有候选流都
+    采不到数据"才够格判定为源站级故障。
+    """
+    return bool(error_msg) and _SOURCE_OUTAGE_MARKER in error_msg
 
 
 def merge_next_batch(round_failed_retriable, revived):
@@ -3429,12 +3472,14 @@ def _run_pipeline():
     reject_retriable = {}
 
     def handle_done_future(future, round_failed_retriable,
-                           round_failed_expired=None):
+                           round_failed_expired=None,
+                           round_source_outage=None):
         """处理一个已完成的 future，按其阶段推进流水线。
 
         round_failed_retriable 为本轮“可重试下载失败”的收集器（list）；
         round_failed_expired 为本轮“直链过期、可靠重新取流救回”的收集器；
-        末轮排空阶段两者都传 None（此时 pending 里只会剩转封装/上传，不会命中下载分支）。
+        round_source_outage 为本轮“整节点采样全挂”的标记收集器（决定冷却档位）；
+        末轮排空阶段三者都传 None（此时 pending 里只会剩转封装/上传，不会命中下载分支）。
         """
         stage = stage_of.pop(future, None)
 
@@ -3521,6 +3566,15 @@ def _run_pipeline():
                 round_failed_retriable.append(entry)
             if should_refetch and round_failed_expired is not None:
                 round_failed_expired.append(entry)
+            # 整节点采样全挂：本轮冷却要走长档（源站回源故障是小时级，
+            # 60s 跨不过去）。只记一次标志，不关心具体是哪几部片。
+            if (
+                should_retry
+                and round_source_outage is not None
+                and not round_source_outage
+                and is_source_outage(error_msg)
+            ):
+                round_source_outage.append(tmdb_id)
 
         elif stage == "conversion":
             entry = conversion_future_to_entry.pop(future)
@@ -3706,6 +3760,10 @@ def _run_pipeline():
 
             round_failed_retriable = []
             round_failed_expired = []
+            # 本轮是否出现过「整节点采样全挂」。用 list 而非 bool 是因为
+            # handle_done_future 是闭包，需要可变容器才能回写（它没有
+            # nonlocal 声明，且同一函数在末轮排空阶段也会被调用）。
+            round_source_outage = []
             submit_downloads()
 
             # 关键：只等“本轮下载 future”全部离开 download 阶段即算本轮下载完成，
@@ -3734,7 +3792,8 @@ def _run_pipeline():
                     # 绝不崩主流程）。
                     try:
                         handle_done_future(
-                            future, round_failed_retriable, round_failed_expired
+                            future, round_failed_retriable, round_failed_expired,
+                            round_source_outage,
                         )
                     except Exception as exc:
                         print(f"⚠️ future 处理异常，已跳过该条: {exc}", flush=True)
@@ -3858,13 +3917,23 @@ def _run_pipeline():
                 break
 
             revived_note = f"、{len(revived)} 部已换到新直链" if revived else ""
+            # 冷却档位：本轮出现过「整节点采样全挂」就走长档。那是源站回源故障，
+            # 恢复以小时计，60s 跨不过去（实测 3 轮全撞墙、0 部救回）。
+            cooldown = (
+                SOURCE_OUTAGE_COOLDOWN_SECONDS if round_source_outage
+                else ROUND_COOLDOWN_SECONDS
+            )
+            outage_note = (
+                f"（检测到源站采样全挂，冷却延长至 {cooldown}s 以跨过故障窗口）"
+                if round_source_outage else ""
+            )
             print(
                 f"\n本轮有 {len(round_failed_retriable)} 部可重试下载失败{revived_note}，"
-                f"冷却 {ROUND_COOLDOWN_SECONDS}s 后进入第 {round_no + 1} 轮...",
+                f"冷却 {cooldown}s 后进入第 {round_no + 1} 轮...{outage_note}",
                 flush=True,
             )
-            if ROUND_COOLDOWN_SECONDS > 0:
-                time.sleep(ROUND_COOLDOWN_SECONDS)
+            if cooldown > 0:
+                time.sleep(cooldown)
             current_batch = next_batch
             round_no += 1
 

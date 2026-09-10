@@ -1255,6 +1255,120 @@ def test_unknown_resolution_constant_matches_literals():
     assert d.UNKNOWN_RESOLUTION == "未知分辨率"
 
 
+# ---------------------------------------------------------------------------
+# 源站回源故障的长冷却分档（待办 I）
+# ---------------------------------------------------------------------------
+# 实测：这类失败 96.7% 发生在单节点片上，且换代理无效（直连与 3 个住宅 IP
+# 全是 502），恢复以小时计。60s×3 轮必然全部撞墙。
+
+def test_source_outage_detects_whole_node_sampling_failure():
+    """「候选流无一入选」= 整节点采样全挂 → 走长冷却。"""
+    assert d.is_source_outage(
+        "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
+    ) is True
+
+
+def test_source_outage_ignores_quality_rejection():
+    """🔑 画质判死不是源站故障——它确定性出局，重试再久也没用。
+
+    混淆两者会让"源站没坏、只是片子不合格"的轮次白等 30 分钟。
+    """
+    assert d.is_source_outage(
+        "2 个节点中 2 个因画质不达标被确定性淘汰（≥ 阈值 0.50），判定整片画质不达标"
+    ) is False
+
+
+def test_source_outage_ignores_transient_single_stream_errors():
+    """⚠️ 单条流/单个分片的瞬时抖动**不算**源站故障。
+
+    它们几十秒就恢复，拉长到 30 分钟纯属浪费。只有"整个节点的所有候选流
+    都采不到数据"才够格。
+    """
+    for msg in (
+        "请求失败(HTTP Error 502)",
+        "分片 176 重试 3 次后仍失败",
+        "采样数据或采样时长为 0",
+        "直链块不可用",
+        "",
+    ):
+        assert d.is_source_outage(msg) is False, f"不该把 {msg!r} 判成源站故障"
+
+
+def test_source_outage_cooldown_is_much_longer_than_normal():
+    """护栏：长档必须显著长于短档，否则分档就没意义。"""
+    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS >= d.ROUND_COOLDOWN_SECONDS * 10
+    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS == 1800
+    assert d.ROUND_COOLDOWN_SECONDS == 60
+
+
+def _run_two_rounds_capturing_cooldown(tmp_path, monkeypatch, error_msg):
+    """跑一轮真实的多轮循环，返回它实际睡了多久。
+
+    ⚠️ 必须走 `_run_pipeline` 而不是直接测 `is_source_outage`——后者只能证明
+    "判据函数对"，证明不了"接线接上了"。反向验证时把选档那行改成写死短档，
+    只测纯函数的用例会全部通过（已实测踩中）。
+    """
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", True)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 2)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", False)
+
+    inp = tmp_path / "in.jsonl"
+    inp.write_text(
+        json.dumps({"tmdbId": "55", "title": "T", "urls": ["u"]}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
+
+    # 每轮都以同一个错误失败 → 必然触发第 1→2 轮之间的冷却。
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (
+            entry["tmdbId"], False, {"error": error_msg, "retriable": True}
+        ),
+    )
+
+    slept = []
+    monkeypatch.setattr(d.time, "sleep", lambda s: slept.append(s))
+
+    d._run_pipeline()
+    return slept
+
+
+def test_whole_node_sampling_failure_triggers_the_long_cooldown(
+    tmp_path, monkeypatch,
+):
+    """🔴 端到端：整节点采样全挂 → 轮次冷却真的走长档。"""
+    slept = _run_two_rounds_capturing_cooldown(
+        tmp_path, monkeypatch,
+        "本轮候选流无一入选（各流原因见上方日志），下一轮重采",
+    )
+
+    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS in slept, (
+        f"源站故障轮次应冷却 {d.SOURCE_OUTAGE_COOLDOWN_SECONDS}s，实际睡了 {slept}"
+    )
+
+
+def test_ordinary_transient_failure_keeps_the_short_cooldown(
+    tmp_path, monkeypatch,
+):
+    """🔑 反向：普通瞬时失败仍走 60s，绝不能被拖成 30 分钟。
+
+    这是分档的意义所在——只给真正的源站故障付等待成本。
+    """
+    slept = _run_two_rounds_capturing_cooldown(
+        tmp_path, monkeypatch, "请求失败(HTTP Error 502)",
+    )
+
+    assert d.ROUND_COOLDOWN_SECONDS in slept
+    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS not in slept, (
+        f"普通抖动不该走长冷却，实际睡了 {slept}"
+    )
+
+
 def test_bitrate_reject_message_does_not_lead_with_resolution(monkeypatch):
     """模式 B 的淘汰文案不能以"分辨率 …"开头，但必须保留 marker。
 
