@@ -489,6 +489,70 @@ def record_block_status(status):
         print(f"  [风控监控] HTTP {status} 累计出现 {count} 次")
 
 
+# ---- mp4 直链的「CDN 主机级熔断」（2026-09-10，§12.21）----
+# 实测确诊：hakunaymatata 的 bcdnxw 这台主机整体故障（对**任何** IP、任何签名、
+# 冷却后都恒返回 429，Server 头是 nginx 而非正常的 Tengine），而同域的
+# bcdn/hcdn3 一切正常。一次实跑里 341 条 vidlink url 有 153 条（45%）指向它。
+#
+# 没有熔断时，每部片都要把这台坏主机的节点重试一遍（还跨 3 轮），
+# 白烧大量时间——实测 162 次无效 429 请求。
+#
+# 🔑 三条边界（避免把"省时间"做成"降成功率"）：
+#   - **只作用于 mp4 直链**：m3u8 分片层的 429 仍按限流处理、照常退避重试
+#     （_NO_RETRY_HTTP_STATUS 的注释明确写了 429/503 属"必须重试"一类）；
+#   - **只跳过同一台主机的节点**，其余节点（含同域其它主机）照常尝试；
+#   - **不判整片死**：熔断文案不进 _PERMANENT_FAILURE_MARKERS，整片仍可进
+#     下一轮重投——万一主机恢复了还能救回来。
+#   - 计数仅存活于**本次运行**（模块级字典，进程退出即清空），不落盘。
+_mp4_host_lock = threading.Lock()
+_mp4_host_429 = {}
+_mp4_host_tripped = set()
+# 单台主机累计多少次 429 后熔断。3 次足以区分"偶发限流"与"整机故障"：
+# 真限流退避后会恢复，整机故障则次次复现。
+MP4_HOST_CIRCUIT_THRESHOLD = max(
+    1, int(_CFG.get("mp4_host_circuit_threshold", 3))
+)
+# 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS（见上）。
+_MP4_HOST_BLOCKED_MARKER = "直链主机疑似故障已熔断"
+
+
+def _host_of(url):
+    """取 url 的主机名；解析不出返回空串。"""
+    try:
+        return str(url).split("://", 1)[1].split("/", 1)[0].lower()
+    except (IndexError, AttributeError):
+        return ""
+
+
+def _mp4_host_record_429(url):
+    """记一次 mp4 直链 429；达到阈值则熔断该主机（本次运行内）。"""
+    host = _host_of(url)
+    if not host:
+        return
+    with _mp4_host_lock:
+        _mp4_host_429[host] = _mp4_host_429.get(host, 0) + 1
+        count = _mp4_host_429[host]
+        newly_tripped = (
+            count >= MP4_HOST_CIRCUIT_THRESHOLD and host not in _mp4_host_tripped
+        )
+        if newly_tripped:
+            _mp4_host_tripped.add(host)
+    if newly_tripped:
+        print(
+            f"  [主机熔断] {host} 累计 {count} 次 429，本次运行内跳过该主机的"
+            f"全部 mp4 直链节点（其余节点不受影响）",
+            flush=True,
+        )
+
+
+def _mp4_host_is_tripped(url):
+    host = _host_of(url)
+    if not host:
+        return False
+    with _mp4_host_lock:
+        return host in _mp4_host_tripped
+
+
 # 确定性 HTTP 状态码：同一条 url 重试必然复现同样结果，重试纯属浪费时间与槽位。
 #   401/403 鉴权失败或签名过期（源站不认这个请求，退避多久都一样）
 #   404/410  资源不存在/已删除
@@ -786,6 +850,10 @@ _MP4_CHUNK_NO_RETRY_MARKERS = (
     "服务器未按 Range 响应",      # 200 全量响应，服务端不支持 Range
     "服务器返回的不是视频分片",   # 首块是 HTML/m3u8
     "直链块不可用",               # 404 直链不存在 / 416 Range 越界
+    # 429 整机故障（§12.21）：实测换 IP/换签名/冷却后恒定 429，退避 20 次纯空耗。
+    # ⚠️ 它**不在** _PERMANENT_FAILURE_MARKERS 里——只短路本层重试、尽快换节点，
+    # 整片仍可进下一轮重投（主机万一恢复还能救回）。
+    _MP4_HOST_BLOCKED_MARKER,
 )
 
 
@@ -1993,6 +2061,13 @@ def _mp4_probe_total_size(url, headers, declared_size):
     取流）。返回 (total_size, range_ok)：range_ok 仅由状态码是否为 206 决定；
     206 但 Content-Range 总长为 * 时回退到条目声明的 size。
     """
+    # 该主机已被熔断（整机故障，见 §12.21）：直接放弃，让上层立刻换下一个节点，
+    # 不再浪费一次必然 429 的请求。放在函数最前面——连 Session 与请求头都不必
+    # 准备。文案不进整片判死表，整片仍可进下一轮重投。
+    if _mp4_host_is_tripped(url):
+        raise RuntimeError(
+            f"{_MP4_HOST_BLOCKED_MARKER}（{_host_of(url)}），跳过该节点: {url}"
+        )
     session = get_session()
     request_headers = dict(HEADERS)
     request_headers.update(headers)
@@ -2009,6 +2084,9 @@ def _mp4_probe_total_size(url, headers, declared_size):
                 )
             if status in (429, 503):
                 record_block_status(status)
+            if status == 429:
+                # 只统计 mp4 直链层的 429，用于主机级熔断判定。
+                _mp4_host_record_429(url)
             response.raise_for_status()
             range_ok = status == 206
             if range_ok:
@@ -2058,6 +2136,17 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
                     raise RuntimeError(f"直链块不可用（HTTP {status}）: {url}")
                 if status in (429, 503):
                     record_block_status(status)
+                if status == 429:
+                    # mp4 直链的 429 实测是**整机故障**而非限流（§12.21）：
+                    # 换 IP、换签名、冷却后都恒定 429。继续按限流退避重试
+                    # SEG_RETRY_MAX(20) 次纯属空耗，故记入主机熔断并立即上抛，
+                    # 让上层尽快换下一个节点。
+                    # ⚠️ 仅限 mp4 直链这一层；m3u8 分片层的 429 语义未变。
+                    _mp4_host_record_429(url)
+                    raise RuntimeError(
+                        f"{_MP4_HOST_BLOCKED_MARKER}（HTTP 429，"
+                        f"{_host_of(url)}）: {url}"
+                    )
                 response.raise_for_status()
                 if status != 206:
                     raise RuntimeError(f"服务器未按 Range 响应（HTTP {status}）")

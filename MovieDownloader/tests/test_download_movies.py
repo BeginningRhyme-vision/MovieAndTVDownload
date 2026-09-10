@@ -2006,6 +2006,131 @@ def test_release_main_lock_leaves_other_owners_alone(tmp_path, monkeypatch):
     assert lock.exists(), "误删了别的进程持有的锁"
 
 
+# ------------------------------------------------- CDN 主机级熔断（429）
+# 背景（§12.21）：hakunaymatata 的 bcdnxw 整机故障——换 3 个住宅 IP、换新签名、
+# 冷却 30s 后**恒定** 429（Server 头 nginx，正常主机是 Tengine）。
+# 实跑 341 条 vidlink url 有 153 条指向它，每片都要白重试一遍、还跨 3 轮。
+# 这组用例锁死"省时间但不改变业务语义"这条边界。
+
+@pytest.fixture(autouse=True)
+def _clear_mp4_circuit():
+    """熔断状态是模块级的，用例间必须隔离，否则相互污染。"""
+    d._mp4_host_429.clear()
+    d._mp4_host_tripped.clear()
+    yield
+    d._mp4_host_429.clear()
+    d._mp4_host_tripped.clear()
+
+
+def test_host_of_parses_hostname():
+    assert d._host_of("https://bcdnxw.hakunaymatata.com/a/b.mp4?x=1") == \
+        "bcdnxw.hakunaymatata.com"
+    assert d._host_of("https://H.EXAMPLE.com/x") == "h.example.com"
+    assert d._host_of("not-a-url") == ""
+    assert d._host_of(None) == ""
+
+
+def test_circuit_trips_only_after_threshold(monkeypatch):
+    """未达阈值不得熔断——偶发限流退避后能恢复，过早熔断会误伤好主机。"""
+    monkeypatch.setattr(d, "MP4_HOST_CIRCUIT_THRESHOLD", 3)
+    url = "https://bad.cdn.com/a.mp4"
+    d._mp4_host_record_429(url)
+    assert not d._mp4_host_is_tripped(url), "1 次就熔断过于激进"
+    d._mp4_host_record_429(url)
+    assert not d._mp4_host_is_tripped(url)
+    d._mp4_host_record_429(url)
+    assert d._mp4_host_is_tripped(url), "达阈值必须熔断"
+
+
+def test_circuit_is_per_host_not_global(monkeypatch):
+    """只熔断出问题的那台主机；同域其它主机（bcdn/hcdn3 实测正常）不受牵连。"""
+    monkeypatch.setattr(d, "MP4_HOST_CIRCUIT_THRESHOLD", 2)
+    for _ in range(2):
+        d._mp4_host_record_429("https://bcdnxw.hakunaymatata.com/a.mp4")
+    assert d._mp4_host_is_tripped("https://bcdnxw.hakunaymatata.com/z.mp4")
+    assert not d._mp4_host_is_tripped("https://bcdn.hakunaymatata.com/a.mp4")
+    assert not d._mp4_host_is_tripped("https://hcdn3.hakunaymatata.com/a.mp4")
+
+
+def test_tripped_host_probe_fails_fast_without_request(monkeypatch):
+    """熔断后不得再发请求——这正是"省时间"的收益来源。"""
+    called = []
+    monkeypatch.setattr(d, "MP4_HOST_CIRCUIT_THRESHOLD", 1)
+    d._mp4_host_record_429("https://bad.cdn.com/a.mp4")
+
+    def _boom(*a, **kw):
+        called.append(1)
+        raise AssertionError("熔断后不该再发请求")
+
+    monkeypatch.setattr(d, "get_session", _boom)
+    with pytest.raises(RuntimeError) as ei:
+        d._mp4_probe_total_size("https://bad.cdn.com/other.mp4", {}, None)
+    assert d._MP4_HOST_BLOCKED_MARKER in str(ei.value)
+    assert not called
+
+
+def test_429_marker_does_not_kill_the_movie():
+    """🔴 最关键的一条：熔断只换节点，**绝不能**让整片判死。
+
+    若它进了 _PERMANENT_FAILURE_MARKERS，主机临时故障会把整片永久淘汰，
+    等于用"省时间"换掉了成功率——与优化初衷相反。
+    """
+    msg = f"{d._MP4_HOST_BLOCKED_MARKER}（HTTP 429，bad.cdn.com）: https://bad/x.mp4"
+    assert d._classify_failure(msg) is True, "必须仍可重试"
+    for marker in d._PERMANENT_FAILURE_MARKERS:
+        assert marker not in msg, f"熔断文案不得命中整片判死标记 {marker!r}"
+
+
+def test_429_marker_short_circuits_chunk_retry():
+    """块级重试必须立刻短路，不再走 SEG_RETRY_MAX(20) 次退避。"""
+    msg = f"{d._MP4_HOST_BLOCKED_MARKER}（HTTP 429，bad.cdn.com）"
+    assert any(m in msg for m in d._MP4_CHUNK_NO_RETRY_MARKERS)
+
+
+def test_429_does_not_trigger_refetch():
+    """429 是主机故障，不是签名过期——不该触发上游重新取流（那是 403/410）。"""
+    msg = f"{d._MP4_HOST_BLOCKED_MARKER}（HTTP 429，bad.cdn.com）"
+    assert d._NEEDS_REFETCH_MARKER not in msg
+
+
+def test_m3u8_layer_429_semantics_unchanged():
+    """🔴 边界：m3u8 分片层的 429 语义**不得**被本次改动影响。
+
+    _NO_RETRY_HTTP_STATUS 的注释明确写了 429/503 属"必须重试"一类；
+    把它们改成不重试会让真限流场景的成功率下降。
+    """
+    assert 429 not in d._NO_RETRY_HTTP_STATUS
+    assert 503 not in d._NO_RETRY_HTTP_STATUS
+
+
+def test_untripped_host_probe_still_requests(monkeypatch):
+    """未熔断的主机必须照常走网络——别把正常路径也短路了。"""
+    seen = []
+
+    class _Resp:
+        status_code = 206
+        headers = {"Content-Range": "bytes 0-0/12345"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+    class _Sess:
+        def request(self, *a, **kw):
+            seen.append(1)
+            return _Resp()
+
+    monkeypatch.setattr(d, "get_session", lambda: _Sess())
+    total, range_ok = d._mp4_probe_total_size("https://good.cdn.com/a.mp4", {}, None)
+    assert (total, range_ok) == (12345, True)
+    assert seen, "正常主机必须真的发请求"
+
+
 # ------------------------------------------------- 中断与重试预算
 
 @pytest.fixture(autouse=True)
