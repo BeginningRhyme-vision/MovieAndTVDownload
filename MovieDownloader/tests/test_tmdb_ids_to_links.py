@@ -297,6 +297,139 @@ def test_find_media_urls_walks_nested_structures():
     assert m._find_media_urls(payload) == ["https://a/x.m3u8", "https://b/y.mp4"]
 
 
+# --------------------------------------------- 单档 playlist 过滤（防静默降画质）
+# 背景：源站解密结构里 master 与它展开后的各档 media playlist 同时存在，正则递归
+# 会把它们捞成**平级节点**。下载侧「成功即 break」+「择优只在单个 master 内生效」，
+# 于是下到哪一档取决于源站返回顺序 —— 实测 545609/420808 因此下成 1080p
+# 而其 master 里有 2160p。下面用真实观测到的 url 形态锁死这个行为。
+
+_TOKEN = "https://moon.peakstorm.top/vd/TOKEN123"
+
+
+def _entry(url, provider="videasy", type_="m3u8"):
+    return {"url": url, "provider": provider, "type": type_,
+            "headers": {}, "quality": None, "size": None}
+
+
+def test_single_variant_urls_dropped_when_master_present():
+    """真实形态：1080p 排在最前、2160p 在中间、master 在最后。
+    过滤后只剩 master，下载侧才能在它内部正常择优拿到 2160p。"""
+    urls = [
+        _entry(f"{_TOKEN}/index-s1080p-v1-a1.m3u8"),
+        _entry(f"{_TOKEN}/index-s720p-v1-a1.m3u8"),
+        _entry(f"{_TOKEN}/index-s2160p-v1-a1.m3u8"),
+        _entry(f"{_TOKEN}/master.m3u8"),
+    ]
+    kept = m.drop_redundant_variant_urls(urls)
+    assert [u["url"] for u in kept] == [f"{_TOKEN}/master.m3u8"]
+
+
+def test_single_variant_in_subdirectory_is_dropped():
+    """master 在 token 根、单档在更深一层（.../sd/82/index-s2160p...），
+    仍属同源，必须一并丢弃。"""
+    urls = [
+        _entry(f"{_TOKEN}/master.m3u8"),
+        _entry(f"{_TOKEN}/sd/82/index-s2160p-v1-a1.m3u8"),
+    ]
+    kept = m.drop_redundant_variant_urls(urls)
+    assert [u["url"] for u in kept] == [f"{_TOKEN}/master.m3u8"]
+
+
+def test_lone_single_variant_is_kept_without_master():
+    """没有同源 master 时，单档流是唯一可用节点，绝不能丢——
+    丢了会把有源片直接变成无源。"""
+    urls = [_entry(f"{_TOKEN}/index-s1080p-v1-a1.m3u8")]
+    assert m.drop_redundant_variant_urls(urls) == urls
+
+
+def test_single_variant_from_other_host_is_kept():
+    """另一个 token 目录（= 另一路真正独立的源）的单档流不受影响。"""
+    other = "https://sun.peakstorm.top/r6/OTHER"
+    urls = [
+        _entry(f"{_TOKEN}/master.m3u8"),
+        _entry(f"{other}/index-s1080p-v1-a1.m3u8"),
+    ]
+    kept = m.drop_redundant_variant_urls(urls)
+    assert [u["url"] for u in kept] == [
+        f"{_TOKEN}/master.m3u8", f"{other}/index-s1080p-v1-a1.m3u8",
+    ]
+
+
+def test_mp4_entries_never_dropped():
+    """mp4 直链与 HLS 分档无关，任何情况下都不受过滤影响。"""
+    urls = [
+        _entry(f"{_TOKEN}/master.m3u8"),
+        _entry(f"{_TOKEN}/index-s1080p-v1-a1.m3u8"),
+        _entry("https://cdn/a.mp4?sign=x", provider="vidlink", type_="mp4"),
+    ]
+    kept = m.drop_redundant_variant_urls(urls)
+    assert [u["type"] for u in kept] == ["m3u8", "mp4"]
+
+
+def test_cross_provider_filtering():
+    """vidup 给 master、videasy 给同目录单档 —— 必须跨 provider 生效。
+    只在单家内部过滤会漏掉这种情况（实测两家常返回同一个 token 目录）。"""
+    urls = [
+        _entry(f"{_TOKEN}/index-s1080p-v1-a1.m3u8", provider="videasy"),
+        _entry(f"{_TOKEN}/master.m3u8", provider="vidup"),
+    ]
+    kept = m.drop_redundant_variant_urls(urls)
+    assert [u["provider"] for u in kept] == ["vidup"]
+
+
+def test_drop_redundant_handles_empty_and_no_master():
+    assert m.drop_redundant_variant_urls([]) == []
+    urls = [_entry("https://a/weird.m3u8")]
+    assert m.drop_redundant_variant_urls(urls) == urls
+
+
+def test_variant_with_query_string_is_dropped():
+    """带签名参数的单档流也要能识别。_playlist_base 会先剥掉 ?，
+    但 startswith 比对的是**原始 url**——若 master 带参数而单档不带
+    （或反过来），前缀比对仍需成立。"""
+    urls = [
+        _entry(f"{_TOKEN}/master.m3u8?token=abc"),
+        _entry(f"{_TOKEN}/index-s2160p-v1-a1.m3u8?token=abc"),
+    ]
+    kept = m.drop_redundant_variant_urls(urls)
+    assert [u["url"] for u in kept] == [f"{_TOKEN}/master.m3u8?token=abc"]
+
+
+def test_master_only_is_untouched():
+    """只有 master、没有单档流时，列表原样返回（不做无谓改动）。"""
+    urls = [_entry(f"{_TOKEN}/master.m3u8"), _entry("https://other/x.m3u8")]
+    assert m.drop_redundant_variant_urls(urls) == urls
+
+
+def test_filtering_preserves_relative_order():
+    """保留下来的节点必须维持原相对顺序——下载侧按顺序试节点，
+    顺序变了等于悄悄改了 provider 优先级。"""
+    other = "https://sun.peakstorm.top/r6/OTHER"
+    urls = [
+        _entry(f"{_TOKEN}/index-s1080p-v1-a1.m3u8", provider="videasy"),
+        _entry(f"{other}/a.m3u8", provider="videasy"),
+        _entry(f"{_TOKEN}/master.m3u8", provider="vidup"),
+        _entry("https://cdn/z.mp4", provider="vidlink", type_="mp4"),
+    ]
+    kept = m.drop_redundant_variant_urls(urls)
+    assert [u["url"] for u in kept] == [
+        f"{other}/a.m3u8", f"{_TOKEN}/master.m3u8", "https://cdn/z.mp4",
+    ]
+
+
+def test_process_tmdb_id_applies_variant_filtering(monkeypatch):
+    """端到端：过滤必须真的接在 process_tmdb_id 的汇总之后，否则改了也不生效。"""
+    _install_fake_session(monkeypatch, videasy_sources=_FakeResp(200, text="PAYLOAD"))
+    monkeypatch.setattr(m, "_find_media_urls", lambda _: [
+        f"{_TOKEN}/index-s1080p-v1-a1.m3u8",
+        f"{_TOKEN}/index-s2160p-v1-a1.m3u8",
+        f"{_TOKEN}/master.m3u8",
+    ])
+    status, result = m.process_tmdb_id("42", providers=["videasy"])
+    assert status == "ok"
+    assert [u["url"] for u in result["urls"]] == [f"{_TOKEN}/master.m3u8"]
+
+
 # ------------------------------------------------------------------ 多源汇总
 
 def test_urls_from_all_providers_are_merged_in_order(monkeypatch):

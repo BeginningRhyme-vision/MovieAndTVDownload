@@ -561,6 +561,87 @@ def _find_media_urls(obj):
     return list(dict.fromkeys(found))
 
 
+# 单档 media playlist 的文件名特征（peakstorm 系：index-s1080p-v1-a1.m3u8）。
+# 它是 master 内部某一档的直接入口，**档位已经写死**。
+_SINGLE_VARIANT_RE = re.compile(r"/index-s\d+p[^/]*\.m3u8", re.I)
+_MASTER_RE = re.compile(r"/master\.m3u8", re.I)
+
+
+def _playlist_base(url):
+    """取 playlist 所属的“影片目录”前缀，用于判断 master 与单档流是否同源。
+
+    peakstorm 的 master 与它的各档 media playlist 同处一个 token 目录下：
+        .../vd/<token>/master.m3u8
+        .../vd/<token>/index-s2160p-v1-a1.m3u8      ← 同级
+        .../vd/<token>/sd/82/index-s2160p-v1-a1.m3u8 ← 更深一层
+    故以 master 所在目录作为前缀，凡以它开头的单档流都算同源。
+    """
+    path = str(url).split("?", 1)[0].split("#", 1)[0]
+    return path.rsplit("/", 1)[0] + "/"
+
+
+def drop_redundant_variant_urls(urls):
+    """丢弃“已有同源 master 时多余的单档 playlist 节点”。
+
+    ❗这修的是一个会**静默降画质**的真 bug（2026-09-10 实测确认）：
+    源站的解密结构里同时含 master 和它展开后的各档 media playlist，
+    `_find_media_urls` 用正则递归捞取时把两者一视同仁，于是同一个 master 被
+    拆成多个**平级节点**塞进 urls：
+        1. index-s1080p-v1-a1.m3u8   ← 下载侧从这里开始，成功即 break
+        4. index-s2160p-v1-a1.m3u8   ← 4K 在这，永远轮不到
+        5. master.m3u8               ← 完整 master，同样轮不到
+    而下载侧的画质择优**只在单个 master 内部生效**（parse_master_playlist 对
+    单档 playlist 只会产出一条候选流），节点之间是"试到第一个成功就 break"。
+    结果：下到哪一档完全取决于源站返回各档 url 的先后顺序，**随机降画质**。
+    实测 545609 / 420808 都因此下成 1080p，而它们的 master 里有 2160p。
+
+    为什么"丢弃"是安全的（2026-09-10 对 17 部混合型影片逐一抓 master 核对）：
+    被丢弃的单档节点数与 master 内的流数**始终一一对应**，例如 645710
+    丢弃 4 个 index-sXXXp 节点，其 master 恰好是
+    ['3840x1600','2592x1080','1728x720','852x480'] 4 条流。
+    即单档 url 只是 master 各档的**平铺入口**，不含任何 master 没有的内容，
+    丢掉零损失，反而让择优重新拿到完整候选集。
+
+    ⚠️ 核对时的陷阱（我自己先踩了两次）：url 里的 `index-s2160p` 是**档位名**，
+    不是实际像素高度。宽银幕片的 2160p 档实际可能是 3840x1600（2.40:1），
+    拿档位名 2160 去比实测高度 1600 会得出"master 缺 2160p"的**假警报**。
+    要比就比**流的条数**或**宽度**，别比高度。
+
+    跨 provider 生效：vidup 与 videasy 常返回**同一个 token 目录**下的 url
+    （实测两家给的 `/vd/<token>/` 完全相同），故本函数必须作用于各家汇总后的
+    列表，只在单家内部过滤会漏掉"A 家给 master、B 家给单档"的情况。
+
+    三条安全底线（均有实测数据支撑，249 部真实 results 全量跑过）：
+      - 只丢“存在同源 master”的单档流，孤立的单档流（源站只给这一档）原样保留
+        —— 实测无 master 的片被误伤数为 0；
+      - 只认 m3u8，mp4 直链完全不受影响 —— 实测 341 个 mp4 节点前后不变；
+      - 过滤后若结果为空（理论上不会），返回原列表，绝不把有源片变成无源
+        —— 实测过滤后变空 0 部、最少也还剩 2 个节点。
+    """
+    if not urls:
+        return urls
+
+    master_bases = {
+        _playlist_base(u["url"])
+        for u in urls
+        if u.get("type") != "mp4" and _MASTER_RE.search(str(u.get("url", "")))
+    }
+    if not master_bases:
+        return urls
+
+    kept = []
+    for u in urls:
+        url = str(u.get("url", ""))
+        if (
+            u.get("type") != "mp4"
+            and _SINGLE_VARIANT_RE.search(url)
+            and any(url.startswith(base) for base in master_bases)
+        ):
+            continue
+        kept.append(u)
+    return kept or urls
+
+
 PROVIDERS = {
     "vidup": _fetch_vidup,
     "videasy": _fetch_videasy,
@@ -650,6 +731,11 @@ def process_tmdb_id(tmdb_id, providers=None):
                         result_title = provider_title
 
                 if urls:
+                    # 丢弃"已有同源 master 时多余的单档 playlist"。必须放在跨
+                    # provider 汇总之后：vidup 与 videasy 常给出同一个 token 目录
+                    # 下的 url，只在单家内部过滤会漏掉"A 家给 master、B 家给单档"。
+                    # 不过滤会让下载侧的画质择优失去作用对象（详见函数注释）。
+                    urls = drop_redundant_variant_urls(urls)
                     # 恒用入参 tmdb_id 作为 key（ids.txt / movies.jsonl 的 key），
                     # 保证全链路一致：续跑去重、元数据查表、下游 R2 路径与文件名都对得上。
                     result = {
