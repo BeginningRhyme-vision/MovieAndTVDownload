@@ -110,8 +110,13 @@ VIDEASY_SERVERS = ("cdn", "m4uhd")
 
 # 2026-09-08 电影版 300 部 dead 抽样实测（详见 AGENTS.md §10）：
 #   videasy 11.7%（独占 11）、vidfast 8.0%（独占 0）、vidlink 6.7%（独占 5），ANY 13.3%
-# 与电视剧版结论相反（那边 vidlink 是主力、videasy 与 vidfast 完全重合），故电影版默认全开。
-DEFAULT_PROVIDERS = ["vidup", "videasy", "vidlink", "vidfast"]
+# 与电视剧版结论相反（那边 vidlink 是主力、videasy 与 vidfast 完全重合）。
+#
+# vidfast 于 2026-09-09 摘除（四次独立验证零独占，详见 config.yaml 的注释与
+# AGENTS.md 待办 J）：决定性证据是 videasy 与它对同一片给出的 url **逐字相同**
+# ——两者共用同一个后端，vidfast 只是另一个前端入口，而它每片要多探 7 个 server。
+# PROVIDERS 里仍保留其实现，随时可用 --providers 或改配置启用。
+DEFAULT_PROVIDERS = ["vidup", "videasy", "vidlink"]
 
 API = _CFG.get("api", "https://enc-dec.app/api")
 MAX_RETRIES = _CFG.get("max_retries", 3)

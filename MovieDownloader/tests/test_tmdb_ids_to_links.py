@@ -123,10 +123,22 @@ def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=20
 
 # ------------------------------------------------------- provider 注册表 / 配置
 
-def test_default_providers_cover_all_four_sources():
-    # 电影版实测四家都有贡献，默认全开；顺序即下载侧的节点尝试顺序
-    assert m.DEFAULT_PROVIDERS == ["vidup", "videasy", "vidlink", "vidfast"]
+def test_default_providers_exclude_vidfast_but_keep_its_implementation():
+    """默认三家；vidfast 已摘除，但**实现必须还在注册表里**。
+
+    摘除依据（四次独立验证零独占，见 AGENTS.md 待办 J）：决定性证据是
+    videasy 与 vidfast 对同一片（84508）给出的 url **逐字相同**——共用同一个
+    后端，vidfast 只是另一个前端入口，而它每片要多探 7 个 server。
+
+    🔑 断言 PROVIDERS 仍含 vidfast 是**可逆性护栏**：摘除只是改配置，
+    不是删代码。日后想恢复只需把它加回 providers 列表，`--providers
+    vidup,vidfast` 也要照样能用来做对比验证。
+    """
+    assert m.DEFAULT_PROVIDERS == ["vidup", "videasy", "vidlink"]
     assert set(m.PROVIDERS) == {"vidup", "videasy", "vidlink", "vidfast"}
+    assert m._resolve_providers("vidfast") == ["vidfast"], (
+        "vidfast 必须仍能被显式指定，否则失去恢复与对比验证的能力"
+    )
 
 
 def test_resolve_providers_accepts_comma_string_and_dedupes():
