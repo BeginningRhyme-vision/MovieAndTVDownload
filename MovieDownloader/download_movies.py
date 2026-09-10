@@ -181,8 +181,15 @@ SEG_RETRY_DELAY = float(_CFG.get("seg_retry_delay", 1))
 # 🔴 服务器实跑教训：源站持续吐 400/502（都不在 _NO_RETRY_HTTP_STATUS 白名单里，
 # 故每片必须走满重试），一部片 = N 条候选流 × 10 个采样分片 × 20 次重试，
 # 退避第 7 次起封顶 60s —— 10 部片在采样阶段空转了 90 分钟仍无结论。
-# 按 3 次算，同样场景下单分片最长约 7s（1+2+4），整体缩短两个数量级。
-SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 3)))
+#
+# 3 → 5（2026-09-10，与 L1 状态码重试移除同批）：原先取 3 是在 urllib3 还会
+# 静默重试 2 次的前提下定的——那时单次循环底下实际有 3 个请求，3 次循环
+# ≈ 9 个请求，已经够多了。现在 L1 的 status_forcelist 清空（见 get_session），
+# 单次循环就是 1 个请求，3 次循环反而变成了**真的只试 3 次**，对源站几秒级
+# 抖动的容错变弱、可能压低成功率。提到 5 后：
+#   实际请求数 5 × 1 = 5 < 改动前的 9，**成本仍是降的**；
+#   L3 退避 1+2+4+8 ≈ 15s，足以跨过短抖动，又远低于正片那套（封顶 60s）。
+SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 5)))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
@@ -587,13 +594,35 @@ def get_session():
     """每个线程复用自己的 requests.Session。"""
     if not hasattr(_thread_local, "session"):
         session = requests.Session()
+        # ⚠️ 状态码重试**全部交给上层**（L3 分片层 / mp4 块层），这里只保留
+        # 连接级与读取级重试。2026-09-10 实测发现的隐形叠乘：
+        #
+        # 原配置 status_forcelist=(429,500,502,503,504) + total=2 会让 urllib3
+        # 对 5xx **静默重试 2 次**，且这层对上层完全透明——L3 日志里打印
+        # "分片 X 下载失败 (1/20)" 时，底层其实已经发了 3 个请求。
+        # 于是单个采样分片最坏 = 3(L3) × 3(L1) = 9 个请求，而日志只显示 3 次。
+        # 上次 1000 部实跑 `502 Server Error` 出现 7038 次、采样耗尽 2720 次，
+        # 两个数字对不上正是因为中间那批请求根本不可见。
+        #
+        # 交给 L3 的三个理由：
+        #   1. L3 的退避更合理（1/2/4/8s 指数 + 抖动，封顶 60s），
+        #      而 L1 的 backoff_factor=0.5 只有 0s、1s，重试过于密集；
+        #   2. L3 可被 `interrupted` / `abort_event` 打断，L1 的退避叫不醒；
+        #   3. L3 每次重试都有日志，L1 完全静默，排障时看不见真实请求量。
+        #
+        # 🔑 顺带修掉一个新引入的问题：429 留在 forcelist 里会让 mp4 主机熔断
+        # （§12.21）延迟生效——我们想"立刻换节点"，urllib3 却会先自己重试 2 次。
+        # 移除后熔断真正做到即时短路。
+        #
+        # connect/read 保留：连接重置、握手失败这类 socket 级抖动在同一条连接上
+        # 立即重试很划算，且不像 5xx 那样会被上层重复覆盖。
         retry = Retry(
             total=2,
             connect=2,
             read=2,
-            status=2,
+            status=0,               # 状态码一律不在本层重试
             backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
+            status_forcelist=(),    # 空：5xx/429 全部上抛给 L3 处理
             allowed_methods=frozenset(("GET", "HEAD")),
             raise_on_status=False,
         )

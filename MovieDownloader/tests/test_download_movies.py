@@ -2006,6 +2006,81 @@ def test_release_main_lock_leaves_other_owners_alone(tmp_path, monkeypatch):
     assert lock.exists(), "误删了别的进程持有的锁"
 
 
+# ------------------------------------------------- 重试分层（L1 交给 L3）
+# 背景（2026-09-10）：urllib3 层原本 status_forcelist=(429,500,502,503,504)
+# + total=2，会对 5xx **静默重试 2 次**且对上层完全透明——L3 打印
+# "分片 X 下载失败 (1/20)" 时底层其实已发了 3 个请求。单个采样分片最坏
+# 3(L3)×3(L1)=9 个请求，日志只显示 3 次。上次实跑 502 出现 7038 次而采样
+# 耗尽只有 2720 次，两个分母对不上正是因为中间请求不可见。
+# 现在状态码重试全部收归上层。这组用例锁死"职责转移而非取消重试"。
+
+def test_l1_does_not_retry_status_codes():
+    """L1 不得再对状态码重试——否则与 L3 叠乘且完全静默。"""
+    session = d.get_session()
+    adapter = session.get_adapter("https://example.com")
+    retry = adapter.max_retries
+    assert tuple(retry.status_forcelist or ()) == (), \
+        "status_forcelist 必须为空，5xx/429 交给 L3"
+    assert retry.status == 0, "status 重试次数必须为 0"
+
+
+def test_l1_still_retries_connection_level():
+    """连接级/读取级重试要保留：socket 抖动在同一条连接上立即重试很划算，
+    且不像 5xx 那样会被上层重复覆盖。"""
+    session = d.get_session()
+    retry = session.get_adapter("https://example.com").max_retries
+    assert retry.connect == 2
+    assert retry.read == 2
+
+
+def test_l3_still_retries_502(monkeypatch):
+    """🔴 关键：502 的重试**没有消失**，只是从 L1 移到了 L3。
+
+    若 L3 也不重试，源站几秒级抽风会直接判掉整部片——那才是真的降成功率。
+    """
+    calls = []
+
+    def flaky(method, url, **kw):
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("502 Server Error: Bad Gateway")
+        return b"\x47" + b"x" * 100      # 第 3 次成功
+
+    monkeypatch.setattr(d, "request_with_retry", flaky)
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+
+    content = d.download_single_segment(
+        "https://x/seg.ts", 0, retry_max=5, delay=0.001
+    )
+    assert content is not None
+    assert len(calls) == 3, "L3 必须继续重试 502 直到成功"
+
+
+def test_l3_gives_up_after_retry_max(monkeypatch):
+    """L3 的次数上限仍然生效，不会无限重试。"""
+    calls = []
+
+    def always_502(method, url, **kw):
+        calls.append(1)
+        raise RuntimeError("502 Server Error: Bad Gateway")
+
+    monkeypatch.setattr(d, "request_with_retry", always_502)
+    with pytest.raises(RuntimeError, match="重试 4 次后仍失败"):
+        d.download_single_segment("https://x/seg.ts", 0, retry_max=4, delay=0.001)
+    assert len(calls) == 4
+
+
+def test_sample_retry_budget_raised_to_five():
+    """采样重试上限 3 → 5。
+
+    3 是在 L1 还会静默重试 2 次时定的（实际 3×3=9 个请求）；L1 收归后
+    3 次就真的只有 3 个请求，抗抖动能力反而下降。5×1=5 仍低于原来的 9。
+    """
+    assert d.SAMPLE_SEG_RETRY_MAX == 5
+    assert d.SAMPLE_SEG_RETRY_MAX < d.SEG_RETRY_MAX, \
+        "采样预算必须远小于正片，否则'判断成本'会被抬到'执行成本'量级"
+
+
 # ------------------------------------------------- CDN 主机级熔断（429）
 # 背景（§12.21）：hakunaymatata 的 bcdnxw 整机故障——换 3 个住宅 IP、换新签名、
 # 冷却 30s 后**恒定** 429（Server 头 nginx，正常主机是 Tengine）。
