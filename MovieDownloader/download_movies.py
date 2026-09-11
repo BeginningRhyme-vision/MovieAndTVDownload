@@ -172,9 +172,36 @@ DEAD_REVIVE_MARGIN = max(1.0, float(_CFG.get("dead_revive_margin", 1.05)))
 RETRY_DEAD_MODE = False
 RETRY_ONLY_MODE = False
 BASE_DIR = resolve_dir(_CFG.get("base_dir"), "downloads")
-FOLDER_PREFIX = _CFG.get("folder_prefix", "movie_")
-MAX_VIDEOS_PER_FOLDER = _CFG.get("max_videos_per_folder", 1000)
-START_FOLDER_INDEX = _CFG.get("start_folder_index", 1)
+# 媒体类型命名空间（movies / tvs），同时作为本地与 R2 对象键的第一层目录，
+# 使两侧严格同构：
+#   本地  {BASE_DIR}/movies/{year}/{tmdbId}/{tmdbId}.mp4
+#   R2    {S3_PREFIX}/movies/{year}/{tmdbId}/{tmdbId}.mp4
+# strip("/") 防止配置写成 "movies/" 或 "/movies" 时拼出双斜杠/前导斜杠。
+FOLDER_PREFIX = (_CFG.get("folder_prefix") or "movies").strip().strip("/")
+
+# ---- 元信息与字幕（旁车资产，与视频同目录）----
+# 两者都是"锦上添花"：获取/写入失败只记日志，绝不影响整片成败。
+_ASSETS_CFG = _CFG.get("assets", {}) or {}
+META_ENABLED = bool(_ASSETS_CFG.get("meta_enabled", True))
+SUBTITLES_ENABLED = bool(_ASSETS_CFG.get("subtitles_enabled", True))
+# 语种白名单（小写语言代码）。取流侧可能给十几种语言，只留我们要的。
+SUBTITLE_LANGUAGES = [
+    str(lang).strip().lower()
+    for lang in (_ASSETS_CFG.get("subtitle_languages") or ["en", "zh"])
+    if str(lang).strip()
+]
+# 输出格式。vtt 供浏览器原生 <track>，srt 供本地播放器；两者由同一份源转换而来。
+SUBTITLE_FORMATS = [
+    fmt for fmt in (
+        str(f).strip().lower().lstrip(".")
+        for f in (_ASSETS_CFG.get("subtitle_formats") or ["vtt", "srt"])
+    ) if fmt in ("vtt", "srt")
+] or ["vtt"]
+SUBTITLE_TIMEOUT = float(_ASSETS_CFG.get("subtitle_timeout", 30))
+# 大小上限是防御性的：字幕正常几十 KB，若源站塞来视频/错误页，不设限会整个读进内存。
+SUBTITLE_MAX_BYTES = int(_ASSETS_CFG.get("subtitle_max_bytes", 5 * 1024 * 1024))
+# 影片目录下存放字幕的子目录名（与 fetch_subtitles.py 保持一致）。
+SUBS_SUBDIR = "subs"
 
 # 下载线程池固定保持的影片下载数。
 MAX_WORKERS = _CFG.get("max_workers", 32)
@@ -365,12 +392,6 @@ HEADERS = {
 
 
 log_lock = threading.Lock()
-folder_lock = threading.Lock()
-# 目标目录填充游标（folder_lock 保护）：缓存"当前正在填的目录号"，避免每次移动
-# 都从 START_FOLDER_INDEX 起对每个已满目录 os.listdir 计数（大批量时 O(N²)）。
-# 单调递增：当前目录填满即前进、不回头扫。重启后重置为 START，首次移动一次性
-# 定位到第一个未满目录再缓存住（一次 O(N)，之后 O(1) 起步）。
-_current_folder_index = START_FOLDER_INDEX
 processing_lock = threading.Lock()
 processing_ids = set()
 _thread_local = threading.local()
@@ -800,63 +821,66 @@ def scan_downloaded_mp4_ids():
     """
     扫描目标目录下已经落盘的非空 MP4。
 
-    返回 (ID 集合, 重复文件字典)。同一 ID 出现在多个目录时只报告，
+    目录结构 {BASE_DIR}/{FOLDER_PREFIX}/{year}/{tmdbId}/{tmdbId}.mp4，故按
+    「year 层 -> tmdbId 层」两级 scandir，**ID 取自目录名**（不再从文件名反解），
+    这样同目录下的 meta.json / subs/ 等非视频资产天然不参与去重判定。
+
+    返回 (ID 集合, 重复文件字典)。同一 ID 出现在多个 year 目录时只报告，
     不自动删除已有文件。
 
-    顺带清理 0 字节 mp4：那是 move_to_target_folder 落了占位文件后、移动完成前
-    进程被杀留下的孤儿，既不是有效成品也不该白占目录名额。只删大小为 0 的，
-    有内容的文件一律不动。
+    顺带清理 0 字节 mp4：那是移动中断留下的残骸，既不是有效成品也不该被
+    误判为"已下载"而永久跳过该片。只删大小为 0 的，有内容的一律不动。
     """
     downloaded_ids = set()
     locations = {}
     orphan_count = 0
 
-    if not os.path.isdir(BASE_DIR):
+    root = os.path.join(BASE_DIR, FOLDER_PREFIX) if FOLDER_PREFIX else BASE_DIR
+    if not os.path.isdir(root):
         return downloaded_ids, {}
 
     try:
-        folder_entries = list(os.scandir(BASE_DIR))
+        year_entries = list(os.scandir(root))
     except OSError as exc:
-        print(f"警告: 无法扫描目标目录 {BASE_DIR}: {exc}")
+        print(f"警告: 无法扫描目标目录 {root}: {exc}")
         return downloaded_ids, {}
 
-    for folder_entry in folder_entries:
-        if not folder_entry.is_dir(follow_symlinks=False):
-            continue
-        if not folder_entry.name.startswith(FOLDER_PREFIX):
+    for year_entry in year_entries:
+        if not year_entry.is_dir(follow_symlinks=False):
             continue
 
         try:
-            file_entries = os.scandir(folder_entry.path)
+            movie_entries = list(os.scandir(year_entry.path))
         except OSError as exc:
-            print(f"警告: 无法扫描目录 {folder_entry.path}: {exc}")
+            print(f"警告: 无法扫描目录 {year_entry.path}: {exc}")
             continue
 
-        with file_entries:
-            for file_entry in file_entries:
-                if not file_entry.is_file(follow_symlinks=False):
-                    continue
-                if not file_entry.name.lower().endswith(".mp4"):
-                    continue
-                try:
-                    if file_entry.stat(follow_symlinks=False).st_size <= 0:
-                        # 0 字节孤儿：占位后进程被杀留下的残骸，直接清掉。
-                        remove_file(file_entry.path)
-                        orphan_count += 1
-                        continue
-                except OSError:
-                    continue
+        for movie_entry in movie_entries:
+            if not movie_entry.is_dir(follow_symlinks=False):
+                continue
 
-                tmdb_id = normalize_tmdb_id(
-                    os.path.splitext(file_entry.name)[0]
-                )
-                if not tmdb_id:
-                    continue
-                downloaded_ids.add(tmdb_id)
-                locations.setdefault(tmdb_id, []).append(file_entry.path)
+            tmdb_id = normalize_tmdb_id(movie_entry.name)
+            if not tmdb_id:
+                continue
+
+            mp4_path = os.path.join(movie_entry.path, f"{tmdb_id}.mp4")
+            try:
+                size = os.stat(mp4_path, follow_symlinks=False).st_size
+            except OSError:
+                # 视频不存在（只有 meta/字幕，或目录空）：不算已下载。
+                continue
+
+            if size <= 0:
+                # 0 字节孤儿：移动中断留下的残骸，直接清掉。
+                remove_file(mp4_path)
+                orphan_count += 1
+                continue
+
+            downloaded_ids.add(tmdb_id)
+            locations.setdefault(tmdb_id, []).append(mp4_path)
 
     if orphan_count:
-        print(f"已清理 {orphan_count} 个 0 字节 mp4 孤儿（移动中断留下的占位文件）")
+        print(f"已清理 {orphan_count} 个 0 字节 mp4 孤儿（移动中断留下的残骸）")
 
     duplicates = {
         tmdb_id: paths for tmdb_id, paths in locations.items() if len(paths) > 1
@@ -1451,6 +1475,9 @@ def refetch_entries(entries, refetch_counts):
                 new_entry = dict(entry)
                 new_entry["urls"] = result["urls"]
                 new_entry["fetched_at"] = result.get("fetched_at")
+                # captions 同属取流产物，必须跟着一起更新：重取那次可能比原先
+                # 多拿到（或少拿到）字幕，沿用旧值会让字幕与 urls 来自不同批次。
+                new_entry["captions"] = result.get("captions") or []
                 revived.append(new_entry)
                 print(
                     f"  [重取成功] {tmdb_id}: {len(result['urls'])} 个新节点",
@@ -1560,24 +1587,47 @@ def remove_upload_failure_from_log(tmdb_id):
         os.replace(tmp_path, FAILED_LOG)
 
 
-def build_s3_key(local_path, year=None):
-    """把本地成品映射为 R2 对象键，按「发布年份/上传日期」分层。
+def year_segment(year):
+    """把发布年份规范成路径里的一段。
 
-    规则：{S3_PREFIX}/{发布年份}/{上传日期YYYYMMDD}/{文件名}
-    如成品 12345.mp4、发布年份 2000、上传日 20260901 ->
-        {S3_PREFIX}/2000/20260901/12345.mp4
-    year 缺失时用 unknown_year 兜底，避免拼出畸形 key。
-    上传日期取上传发生当天的本地系统日期。
+    只保留数字：防脏数据（含 '/'、空格等）拼出畸形路径 / 多层意外目录。
+    提取失败或缺失时兜底 unknown_year。本地目录与 R2 对象键共用此函数，
+    保证两侧的 year 段永远一致（否则 local_path 与 s3_key 无法互相换算）。
     """
-    filename = os.path.basename(local_path)
-    # year 段只保留数字：防脏数据（含 '/'、空格等）拼出畸形 key / 多层意外目录。
-    # 提取失败或缺失时兜底 unknown_year。
-    year_digits = re.sub(r"\D", "", str(year)) if year not in (None, "") else ""
-    year_seg = year_digits if year_digits else "unknown_year"
-    date_seg = time.strftime("%Y%m%d")
-    parts = [S3_PREFIX, year_seg, date_seg, filename] if S3_PREFIX \
-        else [year_seg, date_seg, filename]
-    return "/".join(parts)
+    digits = re.sub(r"\D", "", str(year)) if year not in (None, "") else ""
+    return digits if digits else "unknown_year"
+
+
+def asset_rel_path(tmdb_id, year, asset=None):
+    """同一部影片全部资产的公共相对路径：{FOLDER_PREFIX}/{year}/{tmdbId}[/{asset}]。
+
+    这是本地目录与 R2 对象键的**唯一真实来源**：本地把它接在 BASE_DIR 后、
+    R2 把它接在 S3_PREFIX 后，两侧因此严格同构、可互相换算。
+
+    asset 为 None 时返回影片目录本身；否则返回目录下某个资产的相对路径
+    （如 "12345.mp4"、"meta.json"、"subs/en.srt"）。
+    """
+    parts = [FOLDER_PREFIX, year_segment(year), str(tmdb_id)]
+    if asset:
+        parts.append(str(asset).strip("/"))
+    return "/".join(part for part in parts if part)
+
+
+def build_s3_key(tmdb_id, year=None, asset=None):
+    """把一部影片的某个资产映射为 R2 对象键。
+
+    规则：{S3_PREFIX}/{FOLDER_PREFIX}/{发布年份}/{tmdbId}/{资产文件名}
+    如 tmdbId 12345、发布年份 2000、资产 12345.mp4 ->
+        movies/2000/12345/12345.mp4
+    year 缺失时用 unknown_year 兜底，避免拼出畸形 key。
+
+    与旧版的关键差异：**对象键不再含上传日期**。日期段会把同一部片分多次
+    上传的视频/元信息/字幕切散到不同前缀下，前端无法按同前缀一次取全；去掉
+    后同 key 重传即覆盖（幂等），正是补传想要的语义。
+    """
+    asset = asset if asset is not None else f"{tmdb_id}.mp4"
+    rel = asset_rel_path(tmdb_id, year, asset)
+    return f"{S3_PREFIX}/{rel}" if S3_PREFIX else rel
 
 
 def upload_to_r2(local_path, s3_key):
@@ -1698,55 +1748,278 @@ def clean_temp_directory():
             remove_file(path)
 
 
-def move_to_target_folder(temp_mp4, tmdb_id):
+def movie_dir(tmdb_id, year):
+    """本地影片目录的绝对路径：{BASE_DIR}/{FOLDER_PREFIX}/{year}/{tmdbId}。
+
+    视频、meta.json、subs/ 全部落在这里，与 R2 侧 build_s3_key 的前缀同构。
     """
-    先在锁内选定落点目录并占位，再在锁外执行移动，防止高并发时目录容量超限。
+    return os.path.join(BASE_DIR, *asset_rel_path(tmdb_id, year).split("/"))
+
+
+def move_to_target_folder(temp_mp4, tmdb_id, year=None):
+    """把转封装好的成品移到 {BASE_DIR}/{FOLDER_PREFIX}/{year}/{tmdbId}/{tmdbId}.mp4。
+
     shutil.move 同时支持跨文件系统移动。
 
-    用模块级游标 _current_folder_index 缓存"当前正在填的目录号"，从它起找而非
-    每次从 START 全量重扫已满目录，把大批量下的 O(N²) listdir 降为 ~O(N)。
-
-    移动本身放在锁外：base_dir 与 temp_dir 跨盘时 shutil.move 是 copy+delete，
-    一部片要几十秒；若在锁内做，所有转封装 worker 会被这把全局锁完全串行化。
-    锁内已用 0 字节占位文件把目标名额定死，故锁外移动不会导致目录超容量。
+    每部影片独占一个目录，故**不需要任何全局锁**：
+      - 目录名由 (tmdbId, year) 唯一决定，不存在"选哪个桶"的共享决策；
+      - 同一 tmdbId 的并发已由 processing_ids/processing_lock 挡在上游，
+        同一目录不会有两个 worker 同时写。
+    这也一并去掉了旧桶号方案里的 0 字节占位文件 —— 占位只是为了让并发的
+    worker 在锁内计数时能看见彼此，新结构下无人需要计数。
     """
-    global _current_folder_index
-    with folder_lock:
-        index = _current_folder_index
-        while True:
-            folder_name = f"{FOLDER_PREFIX}{index:06d}"
-            folder_path = os.path.join(BASE_DIR, folder_name)
-            os.makedirs(folder_path, exist_ok=True)
-
-            mp4_count = sum(
-                1 for name in os.listdir(folder_path) if name.endswith(".mp4")
-            )
-            final_path = os.path.join(folder_path, f"{tmdb_id}.mp4")
-
-            # 同一个 tmdbId 覆盖旧文件不额外占用目录名额。
-            if mp4_count < MAX_VIDEOS_PER_FOLDER or os.path.exists(final_path):
-                # 缓存住当前落点目录：下次从这里起找，跳过前面已满目录。
-                _current_folder_index = index
-                # 占位：立即以空文件占住该名额，这样并发的其它 worker 在锁内
-                # 计数时就能看到它，不会把同一目录算成未满而超容量。空文件的
-                # 大小为 0，扫描去重（scan_downloaded_mp4_ids 只认非空 mp4）
-                # 也不会把它误判为已下载成品。
-                with open(final_path, "wb"):
-                    pass
-                break
-            index += 1
+    folder_path = movie_dir(tmdb_id, year)
+    os.makedirs(folder_path, exist_ok=True)
+    final_path = os.path.join(folder_path, f"{tmdb_id}.mp4")
 
     print(f"  [{tmdb_id}] 正在移动到: {final_path}", flush=True)
-    # 锁外移动：失败时清掉占位/半成品，交由上层按转封装失败处理。
+    # 失败时清掉半成品，交由上层按转封装失败处理。
     # 跨文件系统时 shutil.move 是 copy+del，若 copy 中途失败（目标盘写满/IO
     # 错误）会在 final_path 留下半成品 mp4：它不在 cleanup_paths、去重表也无
-    # 登记，会成孤儿并白占目录名额。
+    # 登记，会成孤儿。
     try:
         shutil.move(temp_mp4, final_path)
     except Exception:
         remove_file(final_path)
         raise
     return final_path
+
+
+# ---------- 旁车资产：meta.json 与字幕 ----------
+# 这两类资产与视频落在同一个影片目录下，R2 对象键也同前缀，前端按同前缀一次
+# 列举即可拿全。**全部按"尽力而为"处理**：任何失败只打印并记录，绝不抛到调用
+# 方——一部已经下好的片不该因为元信息/字幕这种附属物被判失败而重跑整个下载。
+
+# 字幕时间轴行（cue timing）。整行匹配、一次拿下起止两端，两端各自的时/分/秒
+# 结构用 `[\d:]+` 宽松描述 —— 实测同一个文件里会**混用两种形态**：
+#     00:34.958        （MM:SS.mmm，省略小时，1303 行）
+#     01:02:03.958     （HH:MM:SS.mmm，1083 行）
+# 早先按 `\d{1,2}:\d{2}:\d{2}` 写死三段式，省略小时的那一半完全匹配不到，
+# 分隔符没被替换，那批字幕在播放器中直接失效（真实 bug，已修）。
+#
+# 只改时间轴行、不碰正文（正文里的 "1.500 dollars" 这类小数必须原样保留），
+# 所以用 ^...$ + MULTILINE 锚定整行，而不是去局部替换"数字.数字"。
+# 行尾允许跟 VTT 的 cue 设置（如 "align:start line:0%"），原样保留。
+_CUE_TIMING_RE = re.compile(
+    r"^([\d:]+)([.,])(\d{1,3})(\s*-->\s*)([\d:]+)([.,])(\d{1,3})(.*)$",
+    re.MULTILINE,
+)
+
+
+def _normalize_timecode_ms(text, separator):
+    """把时间轴行的毫秒分隔符统一成 separator（'.' 给 VTT，',' 给 SRT）。
+
+    毫秒不足 3 位右侧补零（野生字幕里 "00:00:01,5" 确实存在），否则播放器会把
+    .5 当成 5 毫秒或直接解析失败。
+    """
+    def fix(match):
+        start, _, start_ms, arrow, end, _, end_ms, rest = match.groups()
+        return (f"{start}{separator}{start_ms:0<3.3}{arrow}"
+                f"{end}{separator}{end_ms:0<3.3}{rest}")
+
+    return _CUE_TIMING_RE.sub(fix, text)
+
+
+def _decode_subtitle(raw):
+    """字幕编码很杂，逐个尝试常见编码，最终统一输出 UTF-8 文本。"""
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "big5", "cp1252", "latin-1"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def srt_to_vtt(text):
+    """SRT -> WebVTT。纯文本转换，不需要 ffmpeg。
+
+    浏览器原生 <track> 只认 WebVTT。两者结构几乎一致，差异只有三处：
+      1. 必须有 "WEBVTT" 文件头；
+      2. 时间轴的毫秒分隔符是 '.' 而非 ','；
+      3. 序号行可留可去（VTT 里是可选的 cue 标识），故原样保留。
+    """
+    body = text.replace("\r\n", "\n").replace("\r", "\n").strip("\ufeff")
+    body = _normalize_timecode_ms(body, ".")
+    if body.lstrip().upper().startswith("WEBVTT"):
+        return body
+    return "WEBVTT\n\n" + body.lstrip("\n")
+
+
+def vtt_to_srt(text):
+    """WebVTT -> SRT：去掉 WEBVTT 头与 NOTE/STYLE 块，毫秒分隔符换回逗号。"""
+    body = text.replace("\r\n", "\n").replace("\r", "\n").strip("\ufeff").strip()
+    blocks = []
+    for block in re.split(r"\n{2,}", body):
+        head = block.lstrip().upper()
+        # WEBVTT 文件头与元数据块在 SRT 里没有对应物，直接丢弃。
+        if head.startswith(("WEBVTT", "NOTE", "STYLE", "REGION")):
+            continue
+        blocks.append(block.strip())
+
+    out = []
+    for index, block in enumerate(blocks, 1):
+        block = _normalize_timecode_ms(block, ",")
+        lines = block.split("\n")
+        # VTT 的 cue 标识行是可选的；没有序号时补上，SRT 要求序号必须存在。
+        if lines and "-->" in lines[0]:
+            lines.insert(0, str(index))
+        out.append("\n".join(lines))
+    return "\n\n".join(out) + "\n" if out else ""
+
+
+def _fetch_caption_text(caption):
+    """下载一条字幕并解码成文本。返回 (文本, 源格式) 或 None。
+
+    🔑 请求头策略：**默认沿用 Session 的取流站头，只由条目自带的 headers 覆盖**。
+    两套 CDN 的鉴权方向完全相反，2026-09-11 实测（temp/verify_caption_headers.py）：
+      - peakstorm（vidup/videasy 的 m3u8 与其 subs/*.vtt）：
+        带 vidup Referer -> 200；去掉 Referer -> **403**。它**要求** Referer。
+      - hakunaymatata（vidlink 的 mp4 直链）：
+        带任何 Referer -> 429；okhttp UA + 无 Referer -> 206。它**拒绝** Referer。
+    所以不能一刀切去掉 Referer —— 那会把占绝大多数的 peakstorm 字幕全打成 403。
+    取流侧已把每条字幕该用的头随 caption 一起存下（vidlink 带 okhttp UA），
+    这里让它覆盖默认值即可，两种 CDN 都能正确工作。
+
+    流式读取而非一次性 .content：大小上限必须在**下载过程中**生效，否则源站
+    误给一个几 GB 的地址时，整个响应会先进内存（转封装池 8 线程并发即 OOM），
+    上限检查形同虚设。
+    """
+    url = caption.get("url")
+    if not url:
+        return None
+
+    # 仅在条目显式给出 headers 时才覆盖（vidlink: okhttp UA + Referer=None）。
+    headers = dict(caption.get("headers") or {})
+
+    with get_session().get(
+        url, timeout=SUBTITLE_TIMEOUT, headers=headers or None, stream=True
+    ) as response:
+        response.raise_for_status()
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            # 超限立刻中断连接，不把剩余内容拉完。
+            if total > SUBTITLE_MAX_BYTES:
+                raise ValueError(
+                    f"字幕体积超过上限 {SUBTITLE_MAX_BYTES} 字节，疑似非字幕内容"
+                )
+            chunks.append(chunk)
+
+    raw = b"".join(chunks)
+    if not raw.strip():
+        raise ValueError("字幕内容为空")
+    text = _decode_subtitle(raw)
+    fmt = caption.get("type")
+    # 声明格式不可信时按内容判断：有 WEBVTT 头就是 vtt，否则按 srt 处理。
+    if fmt not in ("srt", "vtt"):
+        fmt = "vtt" if text.lstrip().upper().startswith("WEBVTT") else "srt"
+    return text, fmt
+
+
+def save_subtitles(tmdb_id, year, captions):
+    """下载 captions 里白名单语种的字幕，按 SUBTITLE_FORMATS 落到 {影片目录}/subs/。
+
+    返回已保存的相对路径列表（相对影片目录），供 meta.json 与上传阶段使用。
+    单条字幕失败只跳过它自己，不影响其它语种，更不影响整片。
+    """
+    if not SUBTITLES_ENABLED or not captions:
+        return []
+
+    wanted = {}
+    for caption in captions:
+        if not isinstance(caption, dict):
+            continue
+        lang = str(caption.get("language") or "").strip().lower()
+        # 同语种可能有多条（不同压制组），保留第一条。
+        if lang in SUBTITLE_LANGUAGES and lang not in wanted:
+            wanted[lang] = caption
+    if not wanted:
+        return []
+
+    target_dir = os.path.join(movie_dir(tmdb_id, year), SUBS_SUBDIR)
+    saved = []
+    for lang, caption in wanted.items():
+        try:
+            fetched = _fetch_caption_text(caption)
+            if not fetched:
+                continue
+            text, source_format = fetched
+            # 一份源转出两种格式：避免为同一语种下载两次。
+            variants = {}
+            if source_format == "srt":
+                variants["srt"] = text
+                variants["vtt"] = srt_to_vtt(text)
+            else:
+                variants["vtt"] = text
+                variants["srt"] = vtt_to_srt(text)
+
+            os.makedirs(target_dir, exist_ok=True)
+            for fmt in SUBTITLE_FORMATS:
+                content = variants.get(fmt)
+                if not content or not content.strip():
+                    continue
+                path = os.path.join(target_dir, f"{lang}.{fmt}")
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(content)
+                saved.append(f"{SUBS_SUBDIR}/{lang}.{fmt}")
+        except Exception as exc:  # noqa: BLE001 - 字幕失败绝不影响整片
+            print(f"  [{tmdb_id}] ⚠️ 字幕 {lang} 获取失败（已跳过）: {exc}",
+                  flush=True)
+
+    if saved:
+        print(f"  [{tmdb_id}] 已保存字幕: {', '.join(saved)}", flush=True)
+    return saved
+
+
+def build_meta(entry, success_info, subtitle_files):
+    """组装 meta.json 的内容：取流侧已有的元数据 + 本次实测的技术参数。
+
+    全部字段都来自已有数据，不发起任何额外网络请求。
+    """
+    tmdb_id = success_info.get("tmdbId")
+    return {
+        "tmdbId": tmdb_id,
+        "imdbId": entry.get("imdb_id"),
+        "title": success_info.get("title") or "",
+        "originalTitle": entry.get("original_title"),
+        "year": success_info.get("year"),
+        "runtimeMinutes": entry.get("runtime_minutes"),
+        "genres": entry.get("genres"),
+        "titleType": entry.get("title_type"),
+        # 本次下载的实测结果，供前端选播放档位/排查画质问题。
+        "video": {
+            "file": f"{tmdb_id}.mp4",
+            "resolution": success_info.get("resolution"),
+            "bitrateKbps": success_info.get("bitrate_kbps"),
+            "missingSegmentCount": success_info.get("missing_segment_count"),
+        },
+        "subtitles": [
+            {"language": os.path.basename(path).rsplit(".", 1)[0],
+             "format": path.rsplit(".", 1)[-1],
+             "path": path}
+            for path in subtitle_files
+        ],
+        "generatedAt": int(time.time()),
+    }
+
+
+def save_meta(tmdb_id, year, meta):
+    """把 meta.json 写进影片目录，返回路径；失败返回 None（不影响整片）。"""
+    if not META_ENABLED:
+        return None
+    try:
+        folder = movie_dir(tmdb_id, year)
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, "meta.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=2)
+        return path
+    except Exception as exc:  # noqa: BLE001 - 元信息失败绝不影响整片
+        print(f"  [{tmdb_id}] ⚠️ meta.json 写入失败（已跳过）: {exc}", flush=True)
+        return None
 
 
 # ---------- M3U8 解析 ----------
@@ -2942,6 +3215,9 @@ def process_one_entry(entry, processed_ids):
     ]
     year = entry.get("year")
     runtime_minutes = entry.get("runtime_minutes")
+    # 取流侧带回的外挂字幕（vidlink captions）。转封装阶段落盘时要用，
+    # 故随 conversion_job 一起传递。
+    captions = entry.get("captions") or []
 
     if not normalized_id or not urls:
         return tmdb_id, False, {"error": "缺少 tmdbId 或 urls", "retriable": False}
@@ -2998,6 +3274,8 @@ def process_one_entry(entry, processed_ids):
                 "resolution": resolution,
                 "missing_segment_count": 0,
                 "missing_segment_indices": [],
+                "captions": captions,
+                "entry": entry,
             }
             print(
                 f"  [{tmdb_id}] 直链下载完成，已释放下载槽位并进入转封装队列",
@@ -3336,6 +3614,8 @@ def process_one_entry(entry, processed_ids):
             "resolution": best_resolution,
             "missing_segment_count": len(failed_segment_indices),
             "missing_segment_indices": failed_segment_indices,
+            "captions": captions,
+            "entry": entry,
         }
         print(
             f"  [{tmdb_id}] 分片下载完成，已释放下载槽位并进入转封装队列",
@@ -3521,7 +3801,9 @@ def finalize_one_entry(conversion_job, processed_ids):
             raise RuntimeError("FFmpeg 转换失败")
 
         print(f"  [{tmdb_id}] 转封装完成，准备移动文件", flush=True)
-        final_path = move_to_target_folder(temp_mp4, tmdb_id)
+        final_path = move_to_target_folder(
+            temp_mp4, tmdb_id, conversion_job.get("year")
+        )
         success_info = {
             "tmdbId": tmdb_id,
             "title": conversion_job["title"],
@@ -3537,6 +3819,32 @@ def finalize_one_entry(conversion_job, processed_ids):
                 "missing_segment_indices"
             ],
         }
+        # 旁车资产：字幕 + meta.json。必须在 success_info 组装完之后做——
+        # meta 要写入实测的 resolution/bitrate。两者全程"尽力而为"，内部已
+        # 自行吞掉异常，不会把一部已落地的成品拖成失败。
+        year = conversion_job.get("year")
+        subtitle_files = []
+        try:
+            subtitle_files = save_subtitles(
+                tmdb_id, year, conversion_job.get("captions")
+            )
+        except Exception as exc:  # noqa: BLE001 - 双重兜底
+            print(f"  [{tmdb_id}] ⚠️ 字幕阶段异常（已跳过）: {exc}", flush=True)
+        success_info["subtitle_files"] = subtitle_files
+
+        # save_meta 内部已吞异常，但 build_meta 仍可能因脏 entry 抛错，故整段再兜一层。
+        try:
+            if save_meta(
+                tmdb_id, year,
+                build_meta(
+                    conversion_job.get("entry") or {}, success_info,
+                    subtitle_files,
+                ),
+            ):
+                success_info["has_meta"] = True
+        except Exception as exc:  # noqa: BLE001 - 双重兜底
+            print(f"  [{tmdb_id}] ⚠️ meta 阶段异常（已跳过）: {exc}", flush=True)
+
         completed = True
         print(f"  [{tmdb_id}] 转封装完成: {final_path}", flush=True)
         return tmdb_id, True, success_info
@@ -3552,6 +3860,89 @@ def finalize_one_entry(conversion_job, processed_ids):
             processing_ids.discard(normalized_id)
             if completed:
                 processed_ids.add(normalized_id)
+
+
+def collect_sidecar_assets(success_info):
+    """列出该片的旁车资产相对路径（相对影片目录），如 ["subs/en.vtt", "meta.json"]。
+
+    优先用 success_info 里记录的清单；缺失时（如 pending 记录来自旧版本）回退
+    为扫描影片目录 —— reupload 补传时 success_info 可能只是一条 pending 记录，
+    没有 subtitle_files/has_meta 字段，此时必须能自己发现资产，否则补传会漏掉。
+    """
+    assets = list(success_info.get("subtitle_files") or [])
+    if success_info.get("has_meta"):
+        assets.append("meta.json")
+    if assets:
+        return assets
+
+    # 回退：扫目录。只认我们自己产出的两类资产，不碰视频与其它文件。
+    folder = movie_dir(success_info["tmdbId"], success_info.get("year"))
+    found = []
+    if os.path.isfile(os.path.join(folder, "meta.json")):
+        found.append("meta.json")
+    subs = os.path.join(folder, SUBS_SUBDIR)
+    if os.path.isdir(subs):
+        try:
+            for name in sorted(os.listdir(subs)):
+                if os.path.isfile(os.path.join(subs, name)):
+                    found.append(f"{SUBS_SUBDIR}/{name}")
+        except OSError:
+            pass
+    return found
+
+
+def _cleanup_movie_dir(folder):
+    """删空 subs/ 与影片目录本身。只删空目录，有残留文件就保留。"""
+    for path in (os.path.join(folder, SUBS_SUBDIR), folder):
+        try:
+            os.rmdir(path)
+        except OSError:
+            # 非空或不存在都走这里：非空说明还有别的文件，不该删。
+            pass
+
+
+def upload_sidecar_assets(success_info, assets=None):
+    """把 meta.json 与字幕上传到与视频同前缀的 R2 位置。
+
+    返回已上传的对象键列表。**全程尽力而为**：单个资产失败只打印，不写 pending、
+    不影响视频的上传结果——视频才是主体，元信息/字幕缺失顶多是前端少个功能，
+    为它把整片打回重传不值得。
+
+    上传成功的资产会按 DELETE_LOCAL_AFTER_UPLOAD 删除本地副本（与视频同口径）：
+    R2 已有副本，本地再留一份只会在几十万部规模下累积出海量小文件与 inode，
+    而 disk_guard 只监控空间占用、对 inode 耗尽完全失明。
+    """
+    tmdb_id = success_info["tmdbId"]
+    year = success_info.get("year")
+    folder = movie_dir(tmdb_id, year)
+
+    if assets is None:
+        assets = collect_sidecar_assets(success_info)
+    if not assets:
+        return []
+
+    uploaded = []
+    for rel in assets:
+        local = os.path.join(folder, *rel.split("/"))
+        if not os.path.isfile(local):
+            continue
+        try:
+            key = build_s3_key(tmdb_id, year, rel)
+            ok, reason = upload_to_r2(local, key)
+            if ok:
+                uploaded.append(key)
+                if DELETE_LOCAL_AFTER_UPLOAD:
+                    remove_file(local)
+            else:
+                print(f"  [{tmdb_id}] ⚠️ 资产上传失败（已跳过）{rel}: {reason}",
+                      flush=True)
+        except Exception as exc:  # noqa: BLE001 - 资产失败不影响视频
+            print(f"  [{tmdb_id}] ⚠️ 资产上传异常（已跳过）{rel}: {exc}",
+                  flush=True)
+
+    if uploaded:
+        print(f"  [{tmdb_id}] 已上传 {len(uploaded)} 个附属资产", flush=True)
+    return uploaded
 
 
 def upload_one_entry(success_info):
@@ -3574,13 +3965,19 @@ def upload_one_entry(success_info):
     # 等抛异常，也在此兜底为“留本地 + 尽力写 pending + 返回失败”，绝不让异常逃逸
     # 到调用方——否则成品既不删也不进 pending，reupload 无从感知、磁盘永久泄漏。
     try:
-        s3_key = build_s3_key(local_path, success_info.get("year"))
+        s3_key = build_s3_key(tmdb_id, success_info.get("year"))
         ok, reason = upload_to_r2(local_path, s3_key)
         if ok:
             success_info["uploaded"] = True
             success_info["s3_key"] = s3_key
+            # 先传附属资产再删视频：删视频不依赖资产结果，但把两者放在一起
+            # 便于日志按片聚集。资产上传内部已完全吞异常。
+            success_info["asset_keys"] = upload_sidecar_assets(success_info)
             if DELETE_LOCAL_AFTER_UPLOAD:
                 remove_file(local_path)
+                # 视频与资产都已进 R2，本地影片目录此时应为空，回收掉它。
+                # 只删空目录：还有文件说明有资产没传成功，留着等 reupload。
+                _cleanup_movie_dir(movie_dir(tmdb_id, success_info.get("year")))
             write_log(SUCCESS_LOG, success_info)
             print(f"  [{tmdb_id}] 上传成功: {s3_key}", flush=True)
             return tmdb_id, True, success_info
@@ -3595,6 +3992,11 @@ def upload_one_entry(success_info):
             "year": success_info.get("year"),
             "local_path": local_path,
             "s3_key": s3_key,
+            # 资产清单随 pending 一起持久化：视频上传失败时旁车资产**也还没传**
+            # （它们在上面的 ok 分支里），reupload 必须知道要补哪些，否则这些
+            # 资产永远不会进 R2。
+            "subtitle_files": success_info.get("subtitle_files") or [],
+            "has_meta": bool(success_info.get("has_meta")),
             "fail_reason": reason,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
@@ -3611,6 +4013,8 @@ def upload_one_entry(success_info):
                 "year": success_info.get("year"),
                 "local_path": local_path,
                 "s3_key": success_info.get("s3_key", ""),
+                "subtitle_files": success_info.get("subtitle_files") or [],
+                "has_meta": bool(success_info.get("has_meta")),
                 "fail_reason": reason,
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
             })
@@ -4080,6 +4484,8 @@ def _run_pipeline():
                             "year": info.get("year"),
                             "local_path": info.get("final_path"),
                             "s3_key": "",
+                            "subtitle_files": info.get("subtitle_files") or [],
+                            "has_meta": bool(info.get("has_meta")),
                             "fail_reason": degrade_reason,
                             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                         })
@@ -4523,22 +4929,42 @@ def reupload_pending():
     for tmdb_id in order:
         record = latest_by_id[tmdb_id]
         local_path = record.get("local_path", "")
-        s3_key = record.get("s3_key") or build_s3_key(local_path, record.get("year"))
+        year = record.get("year")
+        s3_key = record.get("s3_key") or build_s3_key(tmdb_id, year)
 
         if not local_path or not os.path.exists(local_path):
-            # 文件已不在本地：视为已消解（可能此前已成功补传），从 pending 移除。
+            # 视频已不在本地：视为已消解（可能此前已成功补传），从 pending 移除。
+            # 但旁车资产可能还留着（它们只在视频上传成功那条分支里才会被传），
+            # 所以仍尝试补传一次再放手，否则这些资产永远不会进 R2。
             orphan_count += 1
-            print(f"  [{tmdb_id}] 本地文件不存在，跳过并移除 pending: {local_path}")
+            try:
+                assets = collect_sidecar_assets(record)
+                if assets and upload_sidecar_assets(record, assets):
+                    _cleanup_movie_dir(movie_dir(tmdb_id, year))
+            except Exception as exc:  # noqa: BLE001 - 资产失败不影响消解判定
+                print(f"  [{tmdb_id}] ⚠️ 补传资产异常（已跳过）: {exc}")
+            print(f"  [{tmdb_id}] 本地视频不存在，跳过并移除 pending: {local_path}")
             continue
 
         print(f"  [{tmdb_id}] 补传中 -> {s3_key}")
         ok, reason = upload_to_r2(local_path, s3_key)
         if ok:
+            # 视频进 R2 后，旁车资产也要跟着补 —— 它们在首次上传时因为视频失败
+            # 而被整段跳过，这里是唯一的补救点。
+            try:
+                upload_sidecar_assets(record)
+            except Exception as exc:  # noqa: BLE001 - 资产失败不影响视频补传结论
+                print(f"  [{tmdb_id}] ⚠️ 补传资产异常（已跳过）: {exc}")
             if DELETE_LOCAL_AFTER_UPLOAD:
                 remove_file(local_path)
+                _cleanup_movie_dir(movie_dir(tmdb_id, year))
             update_success_log(tmdb_id, {
                 "tmdbId": tmdb_id,
                 "title": record.get("title") or "",
+                # year 必须带上：它是影片目录/对象键里的一层，下游 fetch_subtitles
+                # 靠 (tmdbId, year) 重建同一个目录。丢了会退化成 unknown_year，
+                # 字幕就落到与视频不同的目录下。
+                "year": record.get("year"),
                 "final_path": local_path,
                 "s3_key": s3_key,
                 "uploaded": True,

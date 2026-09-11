@@ -10,8 +10,9 @@
 # 【接入进度】
 #   - fetch_movie_metadata / filter_to_ids / tmdb_ids_to_links / download_movies
 #     四段均已接入，对应脚本运行时会读取自己那一段。
-#   - fetch_subtitles 段为**预留**：该脚本目前只从 .env 读 SUBDL_API_KEY，
-#     不读本文件（见该段说明）。
+#   - fetch_subtitles 段**部分接入**：该脚本从 .env 读 SUBDL_API_KEY，并读取
+#     download_movies 段的 base_dir / folder_prefix / success_log（字幕与视频
+#     落在同一影片目录，路径必须同源）；本段其余字段仍为预留。
 #   - filter_to_ids 的**筛选规则**不在本文件，而在同目录 filter_config.yaml；
 #     本文件的 filter_to_ids 段只管输入输出路径。
 # ============================================================================
@@ -298,9 +299,37 @@ download_movies:
   #   3) 两者建议放在同一磁盘，成品从 temp_dir 移到 base_dir 才是瞬时操作。
   base_dir: "downloads"
   temp_dir: "temp"
-  folder_prefix: "movie_"
-  max_videos_per_folder: 1000
-  start_folder_index: 1
+  # 媒体类型命名空间：本地与 R2 对象键的**第一层目录**，用于在同一个桶里区分
+  # 电影与剧集（电影 movies、剧集 tvs）。两侧同时使用同一个值，故：
+  #   本地  {base_dir}/movies/{发布年份}/{tmdbId}/{tmdbId}.mp4
+  #   R2    {s3.prefix}/movies/{发布年份}/{tmdbId}/{tmdbId}.mp4
+  # 两侧严格同构 —— 本地路径与对象键可以互相换算，同一部片的视频、元信息
+  # (meta.json)、字幕 (subs/) 全部落在同一个 {tmdbId}/ 目录下，便于前端按
+  # 同前缀一次列举取全。
+  # ⚠️ 改这个值不会迁移已落盘/已上传的文件，只对之后的新文件生效。
+  folder_prefix: "movies"
+  # ---- 元信息与字幕（与视频落在同一个影片目录下）----
+  # 每部片除 {tmdbId}.mp4 外还会产出：
+  #   meta.json     影片元信息（取流侧已有字段 + 本次实测的分辨率/码率）
+  #   subs/{lang}.vtt / subs/{lang}.srt   外挂字幕（来自 vidlink 的 captions）
+  # 两者都是"锦上添花"：获取或写入失败只记日志，**不影响整片成败**——
+  # 一部已下好的片不该因为元信息这种小事被判失败而重跑整个下载。
+  assets:
+    # 是否生成 meta.json
+    meta_enabled: true
+    # 是否抓取取流侧带回的外挂字幕（results.jsonl 的 captions 字段）
+    subtitles_enabled: true
+    # 要保留的字幕语种（语言代码）。取流侧给的其它语种一律丢弃，避免
+    # 单片存下十几种语言、白白放大存储与上传请求数。
+    subtitle_languages: ["en", "zh"]
+    # 同时保留 VTT 与 SRT：浏览器原生 <track> 只吃 WebVTT，而多数本地播放器
+    # 以 SRT 为主。字幕体积极小（几十 KB），两份都存的代价可忽略。
+    subtitle_formats: ["vtt", "srt"]
+    # 单个字幕文件的下载超时（秒）与大小上限（字节）。
+    # 上限是防御性的：字幕正常只有几十 KB，若源站把一个视频/错误页塞过来，
+    # 不设限会把它整个读进内存。
+    subtitle_timeout: 30
+    subtitle_max_bytes: 5242880
   # 并发控制
   max_workers: 32          # 同时下载的影片数
   # 主循环同时持有的「下载 future」上限（分批投递深度）。必须 > max_workers，
@@ -531,7 +560,7 @@ download_movies:
     endpoint_url: ""         # 环境变量 R2_ENDPOINT_URL；如 https://<account_id>.r2.cloudflarestorage.com
     region: "auto"           # R2 固定用 auto
     bucket: ""               # 环境变量 R2_BUCKET；目标存储桶名
-    prefix: ""               # 桶内根前缀（留空）：对象键直接从「发布年份/上传日期/文件名」开始
+    prefix: ""               # 桶内根前缀（留空）：对象键直接从「folder_prefix/发布年份/tmdbId/」开始
     access_key: ""           # 环境变量 R2_ACCESS_KEY
     secret_key: ""           # 环境变量 R2_SECRET_KEY
     upload_workers: 16       # 上传并发数
@@ -569,8 +598,11 @@ fetch_subtitles:
   subdl_api_key: ""
   # 输入：download_movies.py 的成功日志
   success_log: "success.jsonl"
-  # 字幕输出根目录
-  subtitle_dir: "/mnt/MovieAndTVDownload/subtitles"
+  # 注：字幕**没有独立的输出根目录**。它与视频落在同一个影片目录下
+  #   {download_movies.base_dir}/{download_movies.folder_prefix}/{year}/{tmdbId}/subs/
+  # 该路径由 fetch_subtitles.py 直接读 download_movies 段的 base_dir 与
+  # folder_prefix 拼出（两侧必须同源，否则字幕会落到视频找不到的地方），
+  # 故此处不设 subtitle_dir。
   # 已处理状态记录（断点续跑）
   state_log: "subtitles.jsonl"
   # 要抓取的语言：SubDL 语言代码 -> 输出文件后缀

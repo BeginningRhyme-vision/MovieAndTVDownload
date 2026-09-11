@@ -234,7 +234,7 @@ def load_movie_metadata():
 _MOVIE_META, _MOVIE_SEARCH_META = load_movie_metadata()
 # 结果里的"身份字段"：由 process_tmdb_id 用入参权威写入，合并静态元数据时必须保护、
 # 绝不允许被覆盖（下游据此去重、拼文件名与 R2 对象键）。
-_IDENTITY_KEYS = frozenset({"urls", "tmdbId", "title", "fetched_at"})
+_IDENTITY_KEYS = frozenset({"urls", "tmdbId", "title", "fetched_at", "captions"})
 
 
 # ---------- 辅助函数 ----------
@@ -286,9 +286,10 @@ def _is_retriable(exc):
 
 
 # ---------- 取流源（provider）----------
-# 每个 provider 的签名：fn(session, tmdb_id) -> (urls, title)
-#   urls  非空列表，每项 {url, provider, type("m3u8"|"mp4"), headers, quality, size}
-#   title 源站给的片名，可为 None
+# 每个 provider 的签名：fn(session, tmdb_id) -> (urls, title, captions)
+#   urls     非空列表，每项 {url, provider, type("m3u8"|"mp4"), headers, quality, size}
+#   title    源站给的片名，可为 None
+#   captions 源站附带的外挂字幕列表，每项 {url, language, type}；无字幕时为 []
 # 语义：真无源抛 NoSource（唯一判死证据）；其余任何异常都视为瞬时错误。
 def _url_entry(url, provider, type_, headers=None, quality=None, size=None):
     return {
@@ -301,6 +302,147 @@ def _url_entry(url, provider, type_, headers=None, quality=None, size=None):
         "quality": quality,
         "size": size,
     }
+
+
+# 语言标识 -> ISO 639-1 语言代码。下游按语言代码命名字幕文件（en.vtt / zh.vtt）
+# 并按 config 的 subtitle_languages 白名单过滤，故必须先归一。
+#
+# 🔑 源站的语言写法极不统一（2026-09-11 实测 45 部样本，见 AGENTS §12.25）：
+#   vidup   tracks[]    : {"lang": "eng"}        或 {"label": "English"}
+#   videasy subtitles[] : "English" / "zh-CN" / "EN" / "Swedish" ...
+# 五种形态并存，其中 **3 字母 ISO 639-2 码（eng/zho/chi）最容易被漏掉** ——
+# 它能匹配"看起来像语言代码"的正则而原样透传成 "eng"，与白名单里的 "en"
+# 永不相等，字幕会被静默丢弃。必须显式映射。
+_CAPTION_LANGUAGE_CODES = {
+    # 英语
+    "en": "en", "eng": "en", "english": "en",
+    # 中文（源站会给 zho/chi 两种 639-2 码，简繁都归到 zh）
+    "zh": "zh", "zho": "zh", "chi": "zh", "chinese": "zh",
+    "chinese simplified": "zh", "chinese traditional": "zh",
+    "simplified chinese": "zh", "traditional chinese": "zh",
+    "mandarin": "zh",
+    # 以下语种实测在样本里频繁出现（Spanish×11、Portuguese(BR)×10 等）。
+    # 默认白名单只要 en/zh，但把映射写全：用户改 subtitle_languages 即可启用，
+    # 不必再回来改代码。注意 "Protuguese (BR)" 是源站的**拼写错误**，照抄。
+    "es": "es", "spa": "es", "spanish": "es",
+    "pt": "pt", "por": "pt", "portuguese": "pt",
+    "portuguese (br)": "pt", "protuguese (br)": "pt",
+    "ar": "ar", "ara": "ar", "arabic": "ar",
+    "fr": "fr", "fra": "fr", "fre": "fr", "french": "fr",
+    "de": "de", "deu": "de", "ger": "de", "german": "de",
+    "it": "it", "ita": "it", "italian": "it",
+    "ru": "ru", "rus": "ru", "russian": "ru",
+    "ja": "ja", "jpn": "ja", "japanese": "ja",
+    "ko": "ko", "kor": "ko", "korean": "ko",
+    "id": "id", "ind": "id", "indonesian": "id",
+    "tr": "tr", "tur": "tr", "turkish": "tr",
+    "pl": "pl", "pol": "pl", "polish": "pl",
+    "ro": "ro", "ron": "ro", "rum": "ro", "romanian": "ro",
+    "nl": "nl", "nld": "nl", "dut": "nl", "dutch": "nl",
+    "sv": "sv", "swe": "sv", "swedish": "sv",
+    "fi": "fi", "fin": "fi", "finnish": "fi",
+    "da": "da", "dan": "da", "danish": "da",
+    "no": "no", "nor": "no", "norwegian": "no",
+    "cs": "cs", "ces": "cs", "cze": "cs", "czech": "cs",
+    "el": "el", "ell": "el", "gre": "el", "greek": "el",
+    "he": "he", "heb": "he", "hebrew": "he",
+    "hi": "hi", "hin": "hi", "hindi": "hi",
+    "th": "th", "tha": "th", "thai": "th",
+    "vi": "vi", "vie": "vi", "vietnamese": "vi",
+    "hr": "hr", "hrv": "hr", "croatian": "hr",
+    "sr": "sr", "srp": "sr", "serbian": "sr",
+    "hu": "hu", "hun": "hu", "hungarian": "hu",
+    "uk": "uk", "ukr": "uk", "ukrainian": "uk",
+    "bg": "bg", "bul": "bg", "bulgarian": "bg",
+}
+
+
+def _caption_language_code(language):
+    """把源站给的语言标识规范成 ISO 639-1 小写代码（en / zh / ...）。
+
+    归一顺序（缺一不可，每一步都对应实测存在的形态）：
+      1. 整串查表 —— 覆盖 "English" / "eng" / "zh-CN" 之外的全部具名写法，
+         含带括号的 "Portuguese (BR)"；
+      2. 去掉地区后缀再查表 —— "zh-CN" / "pt_BR" -> "zh" / "pt"；
+      3. 已是 2 字母代码则直接采信（表里没列的小语种也能过）。
+    返回 None 表示无法识别（如整句描述 "Spanish; Castilian"），由调用方丢弃。
+
+    ⚠️ 不要退回"3 字母也原样返回"的老做法：那会让 "eng" 透传成 eng，
+    与白名单 "en" 对不上，字幕被静默丢掉（这正是本函数修掉的 bug）。
+    """
+    raw = str(language or "").strip()
+    if not raw:
+        return None
+
+    mapped = _CAPTION_LANGUAGE_CODES.get(raw.lower())
+    if mapped:
+        return mapped
+
+    # "zh-CN" / "pt_BR" / "en-US" 这类带地区后缀的：取主语言段再查表
+    head = re.split(r"[-_]", raw, maxsplit=1)[0].strip().lower()
+    mapped = _CAPTION_LANGUAGE_CODES.get(head)
+    if mapped:
+        return mapped
+
+    # 表外的 2 字母代码直接采信（ISO 639-1 本身就是两字母，不会误收语言名）
+    return head if re.fullmatch(r"[a-z]{2}", head) else None
+
+
+def _caption_entry(url, language, type_=None, headers=None):
+    """构造一条字幕记录。type 取字幕格式（srt / vtt），缺失时按 url 后缀推断。
+
+    headers 是下载该字幕时必须携带的请求头（与 _url_entry 同义）：字幕与视频
+    往往来自同一批 CDN，那些主机对 Referer/UA 有硬校验，缺了会 428/429。
+    """
+    fmt = str(type_ or "").strip().lower().lstrip(".")
+    if fmt not in ("srt", "vtt"):
+        path = str(url or "").split("?", 1)[0].split("#", 1)[0]
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        fmt = ext if ext in ("srt", "vtt") else "srt"
+    entry = {"url": url, "language": language, "type": fmt}
+    if headers:
+        entry["headers"] = dict(headers)
+    return entry
+
+
+def _parse_captions(items, where="", headers=None):
+    """把源站的字幕数组归一成 [{url, language, type}]，同语种保留第一条。
+
+    一个函数吃三家的形态（2026-09-11 实测，AGENTS §12.25）—— 字段名各不相同，
+    故 url 与 language 都要按多个候选键依次取：
+      vidup   tracks[]    : {"lang"/"language": "eng", "url": ...}
+                            {"label": "English",       "file": ...}   ← 键名完全不同
+      videasy subtitles[] : {"lang"/"language": "English"|"zh-CN"|"EN", "url": ...}
+      vidlink captions[]  : {"language": "English", "url": ...}
+
+    **整段容错**：任何结构异常都退化成空列表。字幕是"有就拿、没有就算了"的
+    附加物，绝不能让它的解析失败把一部有源的片拖成瞬时错误、进而反复重试。
+    """
+    if not isinstance(items, list):
+        return []
+
+    result = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # url 的候选键：vidup 形态 B 用 file，其余用 url
+        url = item.get("url") or item.get("file") or item.get("src")
+        if not url or not isinstance(url, str):
+            continue
+        # language 的候选键：vidup 形态 B 用 label，其余用 lang/language
+        code = _caption_language_code(
+            item.get("lang") or item.get("language") or item.get("label")
+        )
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        result.append(_caption_entry(url, code, item.get("type"), headers))
+
+    if result and where:
+        print(f"  [{where}] 字幕 {len(result)} 条: "
+              f"{', '.join(c['language'] for c in result)}")
+    return result
 
 
 def _fetch_vidup_like(session, site, api_name, tmdb_id):
@@ -360,6 +502,7 @@ def _fetch_vidup_like(session, site, api_name, tmdb_id):
     last_server_error = None
     urls = []
     result_title = None
+    result_captions = []
     stream_404 = 0
     for server in servers_decrypted:
         server_name = server.get('name', 'unknown') if isinstance(server, dict) else 'unknown'
@@ -387,6 +530,13 @@ def _fetch_vidup_like(session, site, api_name, tmdb_id):
                 urls.append(_url_entry(url, api_name, "m3u8"))
             if result_title is None:
                 result_title = stream_decrypted.get("title")
+            # 🔑 字幕在 stream_decrypted.tracks[] 里（§12.25，实测命中率 38.5%，
+            # 三家最高）。各 server 的 tracks 通常相同，取首个非空即可。
+            if not result_captions:
+                result_captions = _parse_captions(
+                    stream_decrypted.get("tracks"),
+                    f"{api_name}/{server_name} {tmdb_id}",
+                )
         except HttpStatusError as e:
             # 只有源站 stream 接口本身的 404 才算"该 server 无源"；enc-dec 的 404 是服务故障
             if e.status == 404 and e.where == "stream":
@@ -400,7 +550,7 @@ def _fetch_vidup_like(session, site, api_name, tmdb_id):
             continue
 
     if urls:
-        return urls, result_title
+        return urls, result_title, result_captions
     if stream_404 == len(servers_decrypted):
         raise NoSource(f"all {stream_404} {api_name} servers returned 404 for {tmdb_id}")
     raise Exception(f"All {api_name} servers failed for {tmdb_id}. Last error: {last_server_error}")
@@ -468,7 +618,18 @@ def _fetch_vidlink(session, tmdb_id):
         raise Exception(f"vidlink api: qualities without url for {tmdb_id}")
     # 画质从高到低，下游按顺序择优
     entries.sort(key=lambda u: (u["quality"] is None, -(u["quality"] or 0)))
-    return entries, None
+    # vidlink 也带 captions[]，顺手解析。⚠️ 实测 45 部样本里 26 部链路可用、
+    # captions 命中 0（§12.25），故字幕主力是 vidup/videasy，不是这里；
+    # 留着是因为零额外请求，源站日后补上就能自动吃到。
+    # 字幕与 mp4 走同一 CDN（hakunaymatata），沿用同一套下载头：okhttp UA +
+    # **显式压掉 Referer/X-Requested-With**（带任何 Referer 会 429）。
+    # mp4 路径由下载侧的 _mp4_request_headers 统一置 None，字幕路径没有那一层，
+    # 故必须在这里就写进条目里。requests 对值为 None 的头不会发送。
+    return entries, None, _parse_captions(
+        data.get("captions"),
+        headers={**VIDLINK_DOWNLOAD_HEADERS,
+                 "Referer": None, "X-Requested-With": None},
+    )
 
 
 def _fetch_videasy(session, tmdb_id):
@@ -490,6 +651,7 @@ def _fetch_videasy(session, tmdb_id):
     servers = VIDEASY_SERVERS if title else ("cdn",)
     urls = []
     seen_urls = set()
+    captions = []
     empty = 0
     errors = []
     for sv in servers:
@@ -510,6 +672,14 @@ def _fetch_videasy(session, tmdb_id):
             resp = _check(session.post(dec_url, json={"text": resp.text, "id": str(tmdb_id), "seed": seed},
                                        timeout=TIMEOUT), f"dec-videasy({sv})")
             decoded = validate(_json(resp, f"dec-videasy({sv})"), dec_url)
+            # 🔑 字幕在 decoded.subtitles[] 里（§12.25，实测命中率 23.7%）。
+            # 必须在 _find_media_urls 之前单独取：那个正则只捞 m3u8|mp4，
+            # 字幕是 .vtt/.srt，会被静默丢弃 —— 这正是此前拿不到字幕的原因。
+            # cdn 常给多语种（含 zh-CN），m4uhd 给 playhq 中转的 srt。
+            if isinstance(decoded, dict) and not captions:
+                captions = _parse_captions(
+                    decoded.get("subtitles"), f"videasy/{sv} {tmdb_id}"
+                )
             found = _find_media_urls(decoded)
             if not found:
                 empty += 1
@@ -526,7 +696,7 @@ def _fetch_videasy(session, tmdb_id):
             continue
 
     if urls:
-        return urls, None
+        return urls, None, captions
     if empty == len(servers):
         raise NoSource(f"all {empty} videasy servers empty for {tmdb_id}")
     raise Exception(f"All videasy servers failed for {tmdb_id}: {errors}")
@@ -706,11 +876,13 @@ def process_tmdb_id(tmdb_id, providers=None):
                 urls = []
                 seen_urls = set()
                 result_title = None
+                result_captions = []
                 nosource_errors = []
                 transient_errors = []
                 for name in providers:
                     try:
-                        provider_urls, provider_title = PROVIDERS[name](session, tmdb_id)
+                        provider_urls, provider_title, provider_captions = \
+                            PROVIDERS[name](session, tmdb_id)
                     except NoSource as e:
                         nosource_errors.append(f"{name}: {e}")
                         continue
@@ -729,6 +901,15 @@ def process_tmdb_id(tmdb_id, providers=None):
                             urls.append(u)
                     if result_title is None and provider_title:
                         result_title = provider_title
+                    # 字幕跨家按语种合并（不是"取首家非空"）：实测 vidup 常只给
+                    # English，而 videasy/cdn 能给 zh-CN + 十几种语言，两家互补。
+                    # 只取首家会白丢中文字幕。同语种保留先出现的那家。
+                    if provider_captions:
+                        have = {c["language"] for c in result_captions}
+                        result_captions.extend(
+                            c for c in provider_captions
+                            if c["language"] not in have
+                        )
 
                 if urls:
                     # 丢弃"已有同源 master 时多余的单档 playlist"。必须放在跨
@@ -745,6 +926,10 @@ def process_tmdb_id(tmdb_id, providers=None):
                         # 会是 None。兜底成空串，保证契约里 title 恒为 str——
                         # 否则 None 会一路透传到 success.jsonl 与日志里打成 "None"。
                         "title": result_title or "",
+                        # 源站附带的外挂字幕（目前只有 vidlink 提供），每项
+                        # {url, language, type}。下载侧据此直接拉字幕并转 VTT，
+                        # 空列表表示这部片得靠后置的 fetch_subtitles.py 去 SubDL 补。
+                        "captions": result_captions,
                         # 取流时刻（秒级时间戳）。results.jsonl 是追加写，同一片多轮重试会留下
                         # 多行；下游据此挑真正最新的一条。对 vidlink 这类带时效签名的直链尤为
                         # 关键：拿到过期 url 等于白跑一次下载。

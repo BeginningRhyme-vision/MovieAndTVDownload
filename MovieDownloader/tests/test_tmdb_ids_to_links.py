@@ -39,7 +39,8 @@ def _ok(result):
 def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=200,
                           vidfast_streams=(), vidfast_page_status=404,
                           vidlink_resp=None, videasy_seed="SEED",
-                          videasy_sources=None, videasy_seed_status=200):
+                          videasy_sources=None, videasy_seed_status=200,
+                          videasy_decoded=None):
     """四家取流源的假 Session，按域名路由。
 
     默认：vidup 按 vidup_streams 出流；vidfast 页面 404（无源）；
@@ -113,6 +114,11 @@ def _install_fake_session(monkeypatch, *, vidup_streams=(), vidup_page_status=20
                     idx = int(text.replace("ENCSTREAM", ""))
                     return _ok(site["streams"][idx])
             if url.endswith("/dec-videasy"):
+                # videasy_decoded 模拟 dec-videasy 的**解密结果**（生产代码从这里
+                # 读 subtitles[] 与媒体地址）；videasy_sources 只是转发给它的原始
+                # 响应，两者不是一回事，测字幕时要配前者。
+                if videasy_decoded is not None:
+                    return _ok(videasy_decoded)
                 return _ok((json or {}).get("_decoded", {"sources": [{"file": "https://v/a.m3u8"}]}))
             raise AssertionError(f"unexpected POST {url}")
 
@@ -222,6 +228,198 @@ def test_vidlink_returns_mp4_entries_sorted_by_quality(monkeypatch):
     assert result["urls"][0]["size"] == 1500
     # size=true 是 bool（int 子类），必须被判为非法而不是 1
     assert result["urls"][2]["size"] is None
+
+
+# -------------------------------------------------------- vidlink captions
+
+def test_vidlink_captions_are_normalized_into_result(monkeypatch):
+    """字幕是整部片的属性，必须落到结果顶层的 captions 字段供下载侧直接消费。"""
+    _install_fake_session(monkeypatch, vidlink_resp=_FakeResp(200, {
+        "stream": {"qualities": {"1080": {"url": "https://cdn/1080.mp4"}}},
+        "captions": [
+            {"url": "https://cdn/en.srt", "language": "English", "type": "srt"},
+            {"url": "https://cdn/zh.vtt", "language": "Chinese"},
+        ],
+    }))
+    status, result = m.process_tmdb_id("42", providers=["vidlink"])
+    assert status == "ok"
+    # vidlink 的字幕与 mp4 同在 hakunaymatata CDN：带任何 Referer 会 429，
+    # 必须随条目存下 okhttp UA + 显式压掉 Referer/X-Requested-With。
+    # （peakstorm 的字幕相反，它**要求** Referer，故不能在下载侧一刀切。）
+    expect_headers = {"User-Agent": "okhttp/4.9.3",
+                      "Referer": None, "X-Requested-With": None}
+    assert result["captions"] == [
+        {"url": "https://cdn/en.srt", "language": "en", "type": "srt",
+         "headers": expect_headers},
+        # type 缺失时按 url 后缀推断
+        {"url": "https://cdn/zh.vtt", "language": "zh", "type": "vtt",
+         "headers": expect_headers},
+    ]
+
+
+def test_vidlink_captions_keep_first_per_language(monkeypatch):
+    """同语种多条（不同压制组）只留第一条，避免无意义地放大存储。"""
+    _install_fake_session(monkeypatch, vidlink_resp=_FakeResp(200, {
+        "stream": {"qualities": {"1080": {"url": "https://cdn/1080.mp4"}}},
+        "captions": [
+            {"url": "https://cdn/en1.srt", "language": "English"},
+            {"url": "https://cdn/en2.srt", "language": "English"},
+        ],
+    }))
+    _, result = m.process_tmdb_id("42", providers=["vidlink"])
+    assert [c["url"] for c in result["captions"]] == ["https://cdn/en1.srt"]
+
+
+@pytest.mark.parametrize("captions", [
+    None, "nope", 123, [],
+    [{"language": "English"}],           # 缺 url
+    [{"url": "https://cdn/a.srt"}],      # 缺 language
+    [{"url": "https://cdn/a.srt", "language": "Klingon spoken here"}],
+    ["not-a-dict"],
+])
+def test_malformed_captions_never_break_fetching(monkeypatch, captions):
+    """字幕解析失败绝不能把一部有源的片拖成瞬时错误——必须退化成空列表。"""
+    _install_fake_session(monkeypatch, vidlink_resp=_FakeResp(200, {
+        "stream": {"qualities": {"1080": {"url": "https://cdn/1080.mp4"}}},
+        "captions": captions,
+    }))
+    status, result = m.process_tmdb_id("42", providers=["vidlink"])
+    assert status == "ok", "字幕异常不该影响取流成败"
+    assert result["captions"] == []
+
+
+def test_providers_without_captions_return_empty_list(monkeypatch):
+    """vidup 不提供外挂字幕，captions 必须是空列表而非缺字段/None。"""
+    _install_fake_session(
+        monkeypatch, vidup_streams=[{"url": "https://up/m.m3u8"}]
+    )
+    status, result = m.process_tmdb_id("42", providers=["vidup"])
+    assert status == "ok"
+    assert result["captions"] == []
+
+
+def test_captions_is_an_identity_key():
+    """captions 必须受保护：否则合并 movies.jsonl 静态元数据时可能被覆盖。"""
+    assert "captions" in m._IDENTITY_KEYS
+
+
+@pytest.mark.parametrize("raw,expected", [
+    # 🔑 3 字母 ISO 639-2：vidup 最常见的写法，曾被原样透传成 "eng" 而与
+    # 白名单 "en" 对不上，字幕静默丢弃（本项目真实 bug，见 §12.25）。
+    ("eng", "en"), ("zho", "zh"), ("chi", "zh"),
+    # 语言全名（videasy/cdn 与 vidup 的 label 形态）
+    ("English", "en"), ("english", "en"), ("Chinese", "zh"),
+    ("Chinese Simplified", "zh"), ("Swedish", "sv"), ("Spanish", "es"),
+    # 源站的拼写错误，照实映射
+    ("Protuguese (BR)", "pt"), ("Portuguese (BR)", "pt"),
+    # 2 字母代码与带地区后缀
+    ("en", "en"), ("EN", "en"), ("zh-CN", "zh"), ("zh-TW", "zh"),
+    ("pt_BR", "pt"), ("en-US", "en"),
+    # 表外的 2 字母代码直接采信
+    ("sw", "sw"),
+    # 无法识别
+    ("", None), (None, None), ("Spanish; Castilian", None), ("123", None),
+])
+def test_caption_language_code_normalization(raw, expected):
+    """语言码归一必须吃下实测的全部五种形态，否则字幕会被白名单静默过滤掉。"""
+    assert m._caption_language_code(raw) == expected
+
+
+def test_parse_captions_accepts_vidup_label_file_shape():
+    """vidup tracks[] 有两种字段形态，第二种键名完全不同（file/label）。"""
+    got = m._parse_captions([
+        {"file": "https://cdn/subs/eng.vtt", "label": "English"},
+    ])
+    assert got == [{"url": "https://cdn/subs/eng.vtt",
+                    "language": "en", "type": "vtt"}]
+
+
+def test_parse_captions_accepts_lang_url_shape():
+    """vidup/videasy 的另一种形态：lang + url。"""
+    got = m._parse_captions([
+        {"lang": "eng", "language": "eng", "url": "https://cdn/subs/eng.vtt"},
+    ])
+    assert got == [{"url": "https://cdn/subs/eng.vtt",
+                    "language": "en", "type": "vtt"}]
+
+
+def test_parse_captions_infers_srt_from_playhq_redirect():
+    """m4uhd 的字幕经 api.playhq.net 中转，格式要从被包裹的 .srt 推断。"""
+    got = m._parse_captions([
+        {"lang": "EN",
+         "url": "https://api.playhq.net/sub?url=https://s/American.Muscle.srt"},
+    ])
+    assert got[0]["language"] == "en"
+    assert got[0]["type"] == "srt"
+
+
+def test_parse_captions_multilang_dedupes_by_language():
+    """videasy/cdn 实测单片给 20+ 语种、同语种多条，按语种保留第一条。"""
+    got = m._parse_captions([
+        {"lang": "English", "url": "https://cdn/a.vtt"},
+        {"lang": "zh-CN", "url": "https://cdn/b.vtt"},
+        {"lang": "English", "url": "https://cdn/c.vtt"},   # 同语种第二条
+        {"lang": "Swedish", "url": "https://cdn/d.vtt"},
+    ])
+    assert [c["language"] for c in got] == ["en", "zh", "sv"]
+    assert got[0]["url"] == "https://cdn/a.vtt"
+
+
+def test_vidup_tracks_are_parsed_into_captions(monkeypatch):
+    """vidup 的 tracks[] 必须进 captions —— 实测它命中率 38.5%，三家最高。"""
+    _install_fake_session(monkeypatch, vidup_streams=[{
+        "url": "https://up/m.m3u8",
+        "tracks": [{"file": "https://moon/subs/eng.vtt", "label": "English"}],
+    }])
+    status, result = m.process_tmdb_id("42", providers=["vidup"])
+    assert status == "ok"
+    assert result["captions"] == [
+        {"url": "https://moon/subs/eng.vtt", "language": "en", "type": "vtt"}
+    ]
+
+
+def test_videasy_subtitles_are_parsed_into_captions(monkeypatch):
+    """videasy 的 subtitles[] 会被 _find_media_urls 的 m3u8|mp4 正则漏掉，
+    必须单独解析（这正是此前拿不到字幕的根因）。"""
+    _install_fake_session(
+        monkeypatch,
+        videasy_sources=_FakeResp(200, text="PAYLOAD"),
+        videasy_decoded={
+            "sources": [{"quality": "1080p", "url": "https://vd/index.m3u8"}],
+            "subtitles": [
+                {"lang": "English", "url": "https://moon/a.vtt"},
+                {"lang": "zh-CN", "url": "https://moon/b.vtt"},
+            ],
+        },
+    )
+    status, result = m.process_tmdb_id("42", providers=["videasy"])
+    assert status == "ok"
+    assert [c["language"] for c in result["captions"]] == ["en", "zh"]
+
+
+def test_captions_merge_across_providers_by_language(monkeypatch):
+    """跨家按语种合并：vidup 常只给英文，videasy 能给中文，只取首家会丢中文。"""
+    _install_fake_session(
+        monkeypatch,
+        vidup_streams=[{
+            "url": "https://up/m.m3u8",
+            "tracks": [{"lang": "eng", "url": "https://up/eng.vtt"}],
+        }],
+        videasy_sources=_FakeResp(200, text="PAYLOAD"),
+        videasy_decoded={
+            "sources": [{"quality": "1080p", "url": "https://vd/index.m3u8"}],
+            "subtitles": [
+                {"lang": "English", "url": "https://vd/en.vtt"},   # 重复语种
+                {"lang": "zh-CN", "url": "https://vd/zh.vtt"},     # 独有
+            ],
+        },
+    )
+    status, result = m.process_tmdb_id("42", providers=["vidup", "videasy"])
+    assert status == "ok"
+    assert [c["language"] for c in result["captions"]] == ["en", "zh"]
+    # 同语种保留先出现的那家（vidup 在 providers 顺序里更靠前）
+    assert result["captions"][0]["url"] == "https://up/eng.vtt"
+    assert result["captions"][1]["url"] == "https://vd/zh.vtt"
 
 
 def test_vidlink_null_body_is_nosource(monkeypatch):

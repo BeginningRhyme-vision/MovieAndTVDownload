@@ -24,9 +24,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "SUCCESS_LOG", str(tmp_path / "success.jsonl"))
     monkeypatch.setattr(d, "FAILED_LOG", str(tmp_path / "failed.jsonl"))
     monkeypatch.setattr(d, "UPLOAD_PENDING_LOG", str(tmp_path / "pending.jsonl"))
-    monkeypatch.setattr(d, "FOLDER_PREFIX", "movie_")
-    monkeypatch.setattr(d, "START_FOLDER_INDEX", 1)
-    monkeypatch.setattr(d, "_current_folder_index", 1)
+    monkeypatch.setattr(d, "FOLDER_PREFIX", "movies")
     monkeypatch.setattr(d, "processing_ids", set())
     os.makedirs(d.TEMP_DIR, exist_ok=True)
     return tmp_path
@@ -369,52 +367,67 @@ def test_variant_sampling_continues_after_failure(sandbox, monkeypatch):
     assert job["resolution"] == "1280x720"
 
 
-# ------------------------------------------------------ 落点目录：占位 + 锁外移动
+# ------------------------------------------------ 落点目录：{prefix}/{year}/{tmdbId}/
 
-def test_move_places_holder_inside_lock_then_moves_outside(sandbox, monkeypatch):
-    """移动必须在锁外执行，锁内只落 0 字节占位定名额。
+def test_move_places_file_in_per_movie_dir(sandbox):
+    """成品必须落到 {prefix}/{year}/{tmdbId}/{tmdbId}.mp4。
 
-    base_dir 与 temp_dir 跨盘时 shutil.move 是 copy+delete，一部片几十秒；
-    若在锁内做，所有转封装 worker 会被这把全局锁完全串行化。
+    这是本地与 R2 同构的基础：R2 对象键用同一段相对路径，故 local_path 与
+    s3_key 可以互相换算，字幕/元信息也据此落在同一目录下。
     """
-    seen = {}
-
-    def fake_move(src, dst):
-        # 移动进行时锁必须是空闲的（可被别的线程拿到）；同时占位文件已存在。
-        seen["lock_free"] = d.folder_lock.acquire(blocking=False)
-        if seen["lock_free"]:
-            d.folder_lock.release()
-        seen["holder_exists"] = os.path.exists(dst)
-        seen["holder_size"] = os.path.getsize(dst)
-        os.replace(src, dst)
-
-    monkeypatch.setattr(d.shutil, "move", fake_move)
     src = os.path.join(d.TEMP_DIR, "temp_55.mp4")
     with open(src, "wb") as fh:
         fh.write(b"data")
 
-    final_path = d.move_to_target_folder(src, "55")
-    assert seen["lock_free"] is True
-    assert seen["holder_exists"] is True and seen["holder_size"] == 0
+    final_path = d.move_to_target_folder(src, "55", 2000)
+    assert final_path == os.path.join(
+        d.BASE_DIR, "movies", "2000", "55", "55.mp4"
+    )
     assert os.path.getsize(final_path) == 4
 
 
-def test_holder_counts_toward_folder_capacity(sandbox, monkeypatch):
-    """占位文件必须被目录容量计数算进去，否则并发下同一目录会超容量。"""
-    monkeypatch.setattr(d, "MAX_VIDEOS_PER_FOLDER", 1)
-    # 第一次移动卡在锁外（模拟慢速跨盘拷贝未完成），此时只有占位文件在目录里。
-    monkeypatch.setattr(d.shutil, "move", lambda src, dst: None)
-    src = os.path.join(d.TEMP_DIR, "temp_1.mp4")
+def test_move_and_s3_key_share_the_same_relative_path(sandbox, monkeypatch):
+    """本地路径与 R2 对象键必须严格同构，否则两者无法互相换算。"""
+    monkeypatch.setattr(d, "S3_PREFIX", "")
+    src = os.path.join(d.TEMP_DIR, "temp_55.mp4")
     open(src, "wb").close()
-    first = d.move_to_target_folder(src, "1")
 
-    # 第二部片必须落到下一个目录，而不是与占位文件挤在同一个已满目录里。
-    second = d.move_to_target_folder(src, "2")
-    assert os.path.dirname(first) != os.path.dirname(second)
+    final_path = d.move_to_target_folder(src, "55", 2000)
+    s3_key = d.build_s3_key("55", 2000)
+
+    assert s3_key == "movies/2000/55/55.mp4"
+    assert os.path.relpath(final_path, d.BASE_DIR) == s3_key
 
 
-def test_failed_move_removes_holder(sandbox, monkeypatch):
-    """移动失败要清掉占位/半成品，否则它既非成品又白占目录名额。"""
+def test_missing_year_falls_back_to_unknown_year(sandbox):
+    """year 缺失/脏数据不能拼出畸形路径，且两侧必须用同一套兜底规则。"""
+    src = os.path.join(d.TEMP_DIR, "temp_55.mp4")
+    open(src, "wb").close()
+
+    final_path = d.move_to_target_folder(src, "55", None)
+    assert final_path == os.path.join(
+        d.BASE_DIR, "movies", "unknown_year", "55", "55.mp4"
+    )
+    # 含 '/' 的脏 year 不能拼出多层意外目录。
+    assert d.year_segment("20/00") == "2000"
+    assert d.year_segment("") == "unknown_year"
+
+
+def test_s3_key_supports_sibling_assets(sandbox, monkeypatch):
+    """meta.json 与字幕必须与视频同前缀，前端才能一次列举取全。"""
+    monkeypatch.setattr(d, "S3_PREFIX", "")
+    assert d.build_s3_key("55", 2000, "meta.json") == "movies/2000/55/meta.json"
+    assert d.build_s3_key("55", 2000, "subs/en.srt") == \
+        "movies/2000/55/subs/en.srt"
+
+
+def test_s3_prefix_is_prepended_without_double_slash(sandbox, monkeypatch):
+    monkeypatch.setattr(d, "S3_PREFIX", "prod")
+    assert d.build_s3_key("55", 2000) == "prod/movies/2000/55/55.mp4"
+
+
+def test_failed_move_removes_partial_file(sandbox, monkeypatch):
+    """移动失败要清掉半成品，否则它既非成品、又不在任何清理表里，会成孤儿。"""
     def boom(src, dst):
         with open(dst, "wb") as fh:
             fh.write(b"partial")
@@ -425,25 +438,27 @@ def test_failed_move_removes_holder(sandbox, monkeypatch):
     open(src, "wb").close()
 
     with pytest.raises(OSError):
-        d.move_to_target_folder(src, "55")
+        d.move_to_target_folder(src, "55", 2000)
 
-    folder = os.path.join(d.BASE_DIR, "movie_000001")
+    folder = os.path.join(d.BASE_DIR, "movies", "2000", "55")
     assert os.listdir(folder) == []
 
 
 # ---------------------------------------------------------- 0 字节孤儿清理
 
 def test_scan_removes_zero_byte_orphans(sandbox):
-    """0 字节 mp4 是占位后进程被杀留下的残骸：既要清掉，也绝不能算已下载。
+    """0 字节 mp4 是移动中断留下的残骸：既要清掉，也绝不能算已下载。
 
-    若只跳过不删，它会永久占住目录名额；若算作已下载，该片会被永久跳过、
-    再也不会被重新下载。
+    若算作已下载，该片会被永久跳过、再也不会被重新下载。
     """
-    folder = os.path.join(d.BASE_DIR, "movie_000001")
-    os.makedirs(folder)
-    orphan = os.path.join(folder, "11.mp4")
+    orphan_dir = os.path.join(d.BASE_DIR, "movies", "2000", "11")
+    os.makedirs(orphan_dir)
+    orphan = os.path.join(orphan_dir, "11.mp4")
     open(orphan, "wb").close()
-    real = os.path.join(folder, "22.mp4")
+
+    real_dir = os.path.join(d.BASE_DIR, "movies", "2000", "22")
+    os.makedirs(real_dir)
+    real = os.path.join(real_dir, "22.mp4")
     with open(real, "wb") as fh:
         fh.write(b"x")
 
@@ -452,6 +467,37 @@ def test_scan_removes_zero_byte_orphans(sandbox):
     assert dups == {}
     assert not os.path.exists(orphan)
     assert os.path.exists(real)
+
+
+def test_scan_ignores_non_video_assets(sandbox):
+    """只有 meta.json / 字幕、没有视频的目录不算已下载，否则该片永不会被下载。"""
+    movie_dir = os.path.join(d.BASE_DIR, "movies", "2000", "33")
+    os.makedirs(os.path.join(movie_dir, "subs"))
+    with open(os.path.join(movie_dir, "meta.json"), "w") as fh:
+        fh.write("{}")
+    with open(os.path.join(movie_dir, "subs", "en.srt"), "w") as fh:
+        fh.write("x")
+
+    ids, dups = d.scan_downloaded_mp4_ids()
+    assert ids == set()
+    assert dups == {}
+
+
+def test_scan_reports_same_id_in_multiple_year_dirs(sandbox):
+    """同一 ID 落在不同 year 目录（如 year 数据被修正过）只报告、不自动删除。"""
+    paths = []
+    for year in ("1999", "2000"):
+        folder = os.path.join(d.BASE_DIR, "movies", year, "44")
+        os.makedirs(folder)
+        path = os.path.join(folder, "44.mp4")
+        with open(path, "wb") as fh:
+            fh.write(b"x")
+        paths.append(path)
+
+    ids, dups = d.scan_downloaded_mp4_ids()
+    assert ids == {"44"}
+    assert sorted(dups["44"]) == sorted(paths)
+    assert all(os.path.exists(p) for p in paths)
 
 
 # ------------------------------------------------ 就地重取流（直链过期自愈）
@@ -1224,7 +1270,9 @@ def test_finalize_writes_probed_resolution_into_success_info(
 ):
     """端到端：补探结果要真的落进 success_info，而不只是函数返回值。"""
     monkeypatch.setattr(d, "convert_ts_to_mp4", lambda src, dst: True)
-    monkeypatch.setattr(d, "move_to_target_folder", lambda p, i: "/out/55.mp4")
+    monkeypatch.setattr(
+        d, "move_to_target_folder", lambda p, i, y=None: "/out/55.mp4"
+    )
     monkeypatch.setattr(d, "probe_resolution", lambda p: (1280, 720))
 
     job = {
@@ -1245,6 +1293,402 @@ def test_finalize_writes_probed_resolution_into_success_info(
     assert info["resolution"] == "1280x720", (
         "success.jsonl 里必须是补探到的真实分辨率，不能还是占位文案"
     )
+
+
+# ------------------------------------------------ 旁车资产：meta.json 与字幕
+
+_SRT_SAMPLE = (
+    "1\n00:00:01,000 --> 00:00:03,500\nHello\n\n"
+    "2\n00:00:04,000 --> 00:00:06,000\nWorld\n"
+)
+
+
+def test_srt_to_vtt_adds_header_and_dot_milliseconds():
+    """浏览器原生 <track> 只认 WebVTT：必须有头、毫秒分隔符必须是点。"""
+    out = d.srt_to_vtt(_SRT_SAMPLE)
+    assert out.startswith("WEBVTT\n")
+    assert "00:00:01.000 --> 00:00:03.500" in out
+    assert "," not in out.split("-->")[0].split("\n")[-1]
+
+
+def test_srt_to_vtt_pads_short_milliseconds():
+    """野生字幕存在 "00:00:01,5" 这种非标准毫秒，补零否则播放器解析失败。"""
+    out = d.srt_to_vtt("1\n00:00:01,5 --> 00:00:03,50\nHi\n")
+    assert "00:00:01.500 --> 00:00:03.500" in out
+
+
+@pytest.mark.parametrize("timecode", [
+    "00:34,958 --> 00:36,542",              # MM:SS,mmm 省略小时
+    "00:00:34,958 --> 00:00:36,542",        # HH:MM:SS,mmm
+    "1:02:03,958 --> 1:02:05,000",          # 单位数小时
+])
+def test_srt_to_vtt_handles_both_timecode_shapes(timecode):
+    """🔑 同一个文件里会混用两段式与三段式时间轴（实测 1303 + 1083 行）。
+
+    早先正则写死 `\\d{1,2}:\\d{2}:\\d{2}` 三段式，省略小时的那一半匹配不到、
+    分隔符没被替换，那批字幕在播放器里全部失效。两种形态都必须转。
+    """
+    out = d.srt_to_vtt(f"1\n{timecode}\nHi\n")
+    assert "," not in out.split("\n")[2], f"时间轴未转换: {out!r}"
+    assert "-->" in out
+
+
+@pytest.mark.parametrize("timecode", [
+    "00:34.958 --> 00:36.542",
+    "00:00:34.958 --> 00:00:36.542",
+    "1:02:03.958 --> 1:02:05.000",
+])
+def test_vtt_to_srt_handles_both_timecode_shapes(timecode):
+    """反向同理：两段式的点号也必须换成逗号，否则 SRT 不合法。"""
+    out = d.vtt_to_srt(f"WEBVTT\n\n{timecode}\nHi\n")
+    line = [ln for ln in out.split("\n") if "-->" in ln][0]
+    assert "." not in line, f"毫秒分隔符未转成逗号: {line!r}"
+    assert "," in line
+
+
+def test_timecode_conversion_leaves_body_decimals_alone():
+    """正文里的小数（价格/比分等）不能被当成时间轴改掉。"""
+    out = d.vtt_to_srt(
+        "WEBVTT\n\n00:01.000 --> 00:02.000\nIt costs 1.500 dollars\n"
+    )
+    assert "1.500 dollars" in out
+    assert "00:01,000 --> 00:02,000" in out
+
+
+def test_srt_to_vtt_is_idempotent_for_vtt_input():
+    """已经是 VTT 的内容不能再套一层头。"""
+    vtt = "WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.000\nHi\n"
+    assert d.srt_to_vtt(vtt).count("WEBVTT") == 1
+
+
+def test_vtt_to_srt_strips_metadata_blocks_and_restores_comma():
+    """VTT 的 WEBVTT/NOTE/STYLE 块在 SRT 里没有对应物，必须去掉。"""
+    vtt = (
+        "WEBVTT\n\nNOTE something\n\nSTYLE\n::cue { color: red }\n\n"
+        "00:00:01.000 --> 00:00:02.000\nHi\n"
+    )
+    out = d.vtt_to_srt(vtt)
+    assert "WEBVTT" not in out and "NOTE" not in out and "STYLE" not in out
+    assert "00:00:01,000 --> 00:00:02,000" in out
+    # 无 cue 标识时要补序号，SRT 要求序号必须存在。
+    assert out.lstrip().startswith("1\n")
+
+
+class _FakeCaptionResp:
+    """模拟流式响应：字幕下载走 stream=True + iter_content。"""
+
+    def __init__(self, content=b"", status_ok=True):
+        self._content = content
+        self._status_ok = status_ok
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def raise_for_status(self):
+        if not self._status_ok:
+            raise OSError("HTTP error")
+
+    def iter_content(self, chunk_size=65536):
+        for i in range(0, len(self._content), chunk_size):
+            yield self._content[i:i + chunk_size]
+
+
+def test_save_subtitles_writes_both_formats_from_single_download(
+    sandbox, monkeypatch,
+):
+    """一份源转出两种格式：同语种绝不重复下载。"""
+    calls = []
+    seen_headers = {}
+
+    class FakeSession:
+        def get(self, url, timeout=None, headers=None, stream=False):
+            calls.append(url)
+            seen_headers["headers"] = headers
+            return _FakeCaptionResp(_SRT_SAMPLE.encode("utf-8"))
+
+    monkeypatch.setattr(d, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en", "zh"])
+    monkeypatch.setattr(d, "SUBTITLE_FORMATS", ["vtt", "srt"])
+
+    saved = d.save_subtitles("55", 2000, [
+        {"url": "https://cdn/en.srt", "language": "en", "type": "srt"},
+    ])
+
+    assert sorted(saved) == ["subs/en.srt", "subs/en.vtt"]
+    assert len(calls) == 1, "两种格式必须由同一次下载转换而来"
+    # peakstorm 的字幕**要求** vidup Referer（去掉会 403），故默认头必须沿用：
+    # 条目没给 headers 时不能塞任何覆盖值进去。
+    assert not seen_headers.get("headers"), \
+        "默认应沿用 Session 的取流站头，不做任何覆盖"
+    subs = os.path.join(d.BASE_DIR, "movies", "2000", "55", "subs")
+    assert open(os.path.join(subs, "en.vtt")).read().startswith("WEBVTT")
+    assert "00:00:01,000" in open(os.path.join(subs, "en.srt")).read()
+
+
+def test_caption_entry_headers_override_defaults(sandbox, monkeypatch):
+    """条目自带的 headers 覆盖默认值。
+
+    vidlink 的 CDN 与 peakstorm 鉴权方向相反（前者拒绝 Referer、后者要求），
+    取流侧已把每条字幕该用的头存进条目，这里必须原样透传。
+    """
+    seen = {}
+
+    class FakeSession:
+        def get(self, url, timeout=None, headers=None, stream=False):
+            seen["headers"] = headers
+            return _FakeCaptionResp(_SRT_SAMPLE.encode("utf-8"))
+
+    monkeypatch.setattr(d, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en"])
+    monkeypatch.setattr(d, "SUBTITLE_FORMATS", ["vtt"])
+
+    d.save_subtitles("55", 2000, [{
+        "url": "https://cdn/en.srt", "language": "en", "type": "srt",
+        "headers": {"User-Agent": "okhttp/4.9.3", "Referer": None},
+    }])
+    assert seen["headers"]["User-Agent"] == "okhttp/4.9.3"
+    # None 值让 requests 不发送该头，从而压掉 Session 的 vidup Referer
+    assert seen["headers"]["Referer"] is None
+
+
+def test_save_subtitles_filters_by_language_whitelist(sandbox, monkeypatch):
+    """白名单外的语种必须丢弃，否则单片会存下十几种语言。"""
+    monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en"])
+    monkeypatch.setattr(d, "SUBTITLE_FORMATS", ["vtt"])
+
+    class FakeSession:
+        def get(self, url, timeout=None):
+            raise AssertionError(f"白名单外语种不该被下载: {url}")
+
+    monkeypatch.setattr(d, "get_session", lambda: FakeSession())
+
+    assert d.save_subtitles("55", 2000, [
+        {"url": "https://cdn/fr.srt", "language": "fr"},
+        {"url": "https://cdn/de.srt", "language": "de"},
+    ]) == []
+
+
+def test_save_subtitles_one_language_failure_does_not_block_others(
+    sandbox, monkeypatch,
+):
+    """单条字幕失败只跳过它自己，其它语种照常保存。"""
+    class FakeSession:
+        def get(self, url, timeout=None, headers=None, stream=False):
+            if "en" in url:
+                raise OSError("network down")
+            return _FakeCaptionResp(_SRT_SAMPLE.encode("utf-8"))
+
+    monkeypatch.setattr(d, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en", "zh"])
+    monkeypatch.setattr(d, "SUBTITLE_FORMATS", ["vtt"])
+
+    saved = d.save_subtitles("55", 2000, [
+        {"url": "https://cdn/en.srt", "language": "en"},
+        {"url": "https://cdn/zh.srt", "language": "zh"},
+    ])
+    assert saved == ["subs/zh.vtt"]
+
+
+def test_save_subtitles_rejects_oversized_payload(sandbox, monkeypatch):
+    """源站塞来视频/错误页时必须拒收，且**下载过程中**就中断。
+
+    检查若发生在 response.content 之后，几 GB 的响应会先整个进内存，
+    8 个转封装线程并发即 OOM —— 上限检查必须流式生效。
+    """
+    delivered = []
+
+    class CountingResp(_FakeCaptionResp):
+        def iter_content(self, chunk_size=65536):
+            # 每块 8 字节，上限 10 字节：第 2 块就该触发中断。
+            for i in range(0, 100, 8):
+                delivered.append(i)
+                yield b"x" * 8
+
+    class FakeSession:
+        def get(self, url, timeout=None, headers=None, stream=False):
+            return CountingResp()
+
+    monkeypatch.setattr(d, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en"])
+    monkeypatch.setattr(d, "SUBTITLE_MAX_BYTES", 10)
+
+    assert d.save_subtitles("55", 2000, [
+        {"url": "https://cdn/en.srt", "language": "en"},
+    ]) == []
+    assert len(delivered) <= 2, "超限后必须立刻停止拉取，不能把整个响应读完"
+
+
+def test_build_meta_carries_probed_video_params(sandbox):
+    """meta.json 要带上本次实测的技术参数，而非取流侧的声明值。"""
+    meta = d.build_meta(
+        {"imdb_id": "tt1", "original_title": "O", "runtime_minutes": 100,
+         "genres": ["Drama"], "title_type": "movie"},
+        {"tmdbId": "55", "title": "T", "year": 2000,
+         "resolution": "1920x1080", "bitrate_kbps": 3000,
+         "missing_segment_count": 0},
+        ["subs/en.vtt"],
+    )
+    assert meta["tmdbId"] == "55" and meta["imdbId"] == "tt1"
+    assert meta["video"] == {
+        "file": "55.mp4", "resolution": "1920x1080",
+        "bitrateKbps": 3000, "missingSegmentCount": 0,
+    }
+    assert meta["subtitles"] == [
+        {"language": "en", "format": "vtt", "path": "subs/en.vtt"}
+    ]
+
+
+def test_save_meta_writes_into_movie_dir(sandbox):
+    path = d.save_meta("55", 2000, {"tmdbId": "55"})
+    assert path == os.path.join(d.BASE_DIR, "movies", "2000", "55", "meta.json")
+    assert json.load(open(path))["tmdbId"] == "55"
+
+
+def test_asset_failure_does_not_fail_the_movie(sandbox, monkeypatch):
+    """字幕/meta 失败绝不能把一部已落地的成品判成失败并重跑整个下载。"""
+    monkeypatch.setattr(d, "convert_ts_to_mp4", lambda src, dst: True)
+    monkeypatch.setattr(
+        d, "move_to_target_folder", lambda p, i, y=None: "/out/55.mp4"
+    )
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(d, "save_subtitles", boom)
+    monkeypatch.setattr(d, "save_meta", boom)
+
+    job = {
+        "tmdbId": "55", "normalized_id": "55", "title": "T", "year": 2000,
+        "url": "https://a/1.m3u8",
+        "final_ts": os.path.join(str(sandbox), "t.ts"),
+        "temp_mp4": os.path.join(str(sandbox), "t.mp4"),
+        "cleanup_paths": [],
+        "bitrate_kbps": 2000,
+        "resolution": "1920x1080",
+        "missing_segment_count": 0,
+        "missing_segment_indices": [],
+        "captions": [{"url": "https://cdn/en.srt", "language": "en"}],
+        "entry": {},
+    }
+
+    _, ok, info = d.finalize_one_entry(job, set())
+    assert ok is True, "资产失败不该影响整片成败"
+    assert info["final_path"] == "/out/55.mp4"
+
+
+def test_sidecar_assets_upload_to_same_prefix_as_video(sandbox, monkeypatch):
+    """资产对象键必须与视频同前缀，前端才能按同前缀一次列举取全。"""
+    monkeypatch.setattr(d, "S3_PREFIX", "")
+    folder = os.path.join(d.BASE_DIR, "movies", "2000", "55")
+    os.makedirs(os.path.join(folder, "subs"))
+    for rel in ("meta.json", "subs/en.vtt"):
+        with open(os.path.join(folder, *rel.split("/")), "w") as fh:
+            fh.write("x")
+
+    uploads = []
+    monkeypatch.setattr(
+        d, "upload_to_r2",
+        lambda local, key: (uploads.append(key), (True, None))[1],
+    )
+
+    keys = d.upload_sidecar_assets({
+        "tmdbId": "55", "year": 2000,
+        "subtitle_files": ["subs/en.vtt"], "has_meta": True,
+    })
+    assert sorted(keys) == ["movies/2000/55/meta.json",
+                            "movies/2000/55/subs/en.vtt"]
+    assert d.build_s3_key("55", 2000).rsplit("/", 1)[0] == "movies/2000/55"
+
+
+def test_sidecar_upload_failure_is_swallowed(sandbox, monkeypatch):
+    """资产上传失败只跳过，不抛异常、不影响视频的上传结论。"""
+    folder = os.path.join(d.BASE_DIR, "movies", "2000", "55")
+    os.makedirs(folder)
+    with open(os.path.join(folder, "meta.json"), "w") as fh:
+        fh.write("x")
+
+    monkeypatch.setattr(
+        d, "upload_to_r2", lambda local, key: (False, "503 slow down")
+    )
+    assert d.upload_sidecar_assets({
+        "tmdbId": "55", "year": 2000, "has_meta": True,
+    }) == []
+    # 失败的资产必须留在本地等补传，不能被删
+    assert os.path.isfile(os.path.join(folder, "meta.json"))
+
+
+def test_uploaded_assets_are_removed_locally(sandbox, monkeypatch):
+    """资产进 R2 后删本地副本：几十万部规模下小文件会耗尽 inode，
+    而 disk_guard 只看空间占用、对 inode 完全失明。"""
+    folder = os.path.join(d.BASE_DIR, "movies", "2000", "55")
+    os.makedirs(os.path.join(folder, "subs"))
+    for rel in ("meta.json", "subs/en.vtt"):
+        with open(os.path.join(folder, *rel.split("/")), "w") as fh:
+            fh.write("x")
+
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    monkeypatch.setattr(d, "upload_to_r2", lambda local, key: (True, None))
+    d.upload_sidecar_assets({
+        "tmdbId": "55", "year": 2000,
+        "subtitle_files": ["subs/en.vtt"], "has_meta": True,
+    })
+    assert not os.path.exists(os.path.join(folder, "meta.json"))
+    assert not os.path.exists(os.path.join(folder, "subs", "en.vtt"))
+
+
+def test_cleanup_only_removes_empty_dirs(sandbox):
+    """只删空目录：还有文件说明有资产没传成功，必须留着等 reupload。"""
+    folder = os.path.join(d.BASE_DIR, "movies", "2000", "55")
+    os.makedirs(os.path.join(folder, "subs"))
+    with open(os.path.join(folder, "subs", "en.vtt"), "w") as fh:
+        fh.write("x")
+
+    d._cleanup_movie_dir(folder)
+    assert os.path.isdir(folder), "有残留文件时不能删目录"
+
+    os.remove(os.path.join(folder, "subs", "en.vtt"))
+    d._cleanup_movie_dir(folder)
+    assert not os.path.exists(folder), "全空时应回收目录"
+
+
+def test_collect_assets_falls_back_to_directory_scan(sandbox):
+    """pending 记录（旧版本）没有 subtitle_files/has_meta 字段时，
+    必须能自己扫出资产，否则 reupload 会漏传。"""
+    folder = os.path.join(d.BASE_DIR, "movies", "2000", "55")
+    os.makedirs(os.path.join(folder, "subs"))
+    for rel in ("meta.json", "subs/en.vtt", "subs/zh.srt"):
+        with open(os.path.join(folder, *rel.split("/")), "w") as fh:
+            fh.write("x")
+    # 视频不该被当成旁车资产
+    with open(os.path.join(folder, "55.mp4"), "w") as fh:
+        fh.write("video")
+
+    got = d.collect_sidecar_assets({"tmdbId": "55", "year": 2000})
+    assert sorted(got) == ["meta.json", "subs/en.vtt", "subs/zh.srt"]
+
+
+def test_pending_record_carries_asset_manifest(sandbox, monkeypatch):
+    """视频上传失败时资产也还没传，pending 必须记下清单供 reupload 补。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "upload_to_r2", lambda local, key: (False, "boom"))
+    folder = os.path.join(d.BASE_DIR, "movies", "2000", "55")
+    os.makedirs(folder)
+    video = os.path.join(folder, "55.mp4")
+    with open(video, "w") as fh:
+        fh.write("v")
+
+    d.upload_one_entry({
+        "tmdbId": "55", "year": 2000, "title": "T", "final_path": video,
+        "subtitle_files": ["subs/en.vtt"], "has_meta": True,
+    })
+
+    pending = [json.loads(ln) for ln in
+               open(d.UPLOAD_PENDING_LOG, encoding="utf-8") if ln.strip()]
+    assert pending[-1]["subtitle_files"] == ["subs/en.vtt"]
+    assert pending[-1]["has_meta"] is True
 
 
 def test_unknown_resolution_constant_matches_literals():

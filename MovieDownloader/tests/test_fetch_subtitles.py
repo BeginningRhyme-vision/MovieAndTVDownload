@@ -1,0 +1,275 @@
+"""fetch_subtitles.py 的离线用例。
+
+核心约束：**字幕是"可有可无"的附属物** —— 取不到、出错、缺配置都不能让
+流程失败或以非零码退出。这些用例专门锁死这条原则，防止日后改动把它破坏。
+"""
+
+import io
+import json
+import os
+import re
+import zipfile
+
+import pytest
+
+import fetch_subtitles as f
+
+
+def _zip_bytes(files):
+    """构造一个内存 zip：{文件名: 文本内容}。"""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        for name, text in files.items():
+            archive.writestr(name, text)
+    return buffer.getvalue()
+
+
+class _FakeZipResp:
+    """模拟流式响应：SubDL zip 下载走 stream=True + iter_content。"""
+
+    def __init__(self, content=b""):
+        self._content = content
+
+    def iter_content(self, chunk_size=65536):
+        for i in range(0, len(self._content), chunk_size):
+            yield self._content[i:i + chunk_size]
+
+    def close(self):
+        pass
+
+
+_SRT = "1\n00:00:01,000 --> 00:00:03,500\nHello\n"
+
+
+@pytest.fixture
+def sandbox(tmp_path, monkeypatch):
+    """把落盘目录指到 tmp_path，并给定固定的语种/格式。"""
+    monkeypatch.setattr(f.dm, "BASE_DIR", str(tmp_path / "downloads"))
+    monkeypatch.setattr(f.dm, "FOLDER_PREFIX", "movies")
+    monkeypatch.setattr(f, "SUBTITLE_LANGUAGES", ["en", "zh"])
+    monkeypatch.setattr(f, "SUBTITLE_FORMATS", ["vtt", "srt"])
+    monkeypatch.setattr(f, "SUBDL_API_KEY", "TESTKEY")
+    monkeypatch.setattr(f, "STATE_LOG", str(tmp_path / "subtitles.jsonl"))
+    return tmp_path
+
+
+# ------------------------------------------------ 目录结构与下载侧保持同构
+
+def test_subs_dir_sits_next_to_the_video(sandbox):
+    """字幕必须落在影片目录下的 subs/，与视频、meta.json 同级。"""
+    assert f.subs_dir("55", 2000) == os.path.join(
+        f.dm.BASE_DIR, "movies", "2000", "55", "subs"
+    )
+
+
+def test_subs_dir_uses_same_year_fallback_as_downloader(sandbox):
+    """year 缺失时两侧必须落到同一个 unknown_year，否则字幕与视频分家。"""
+    assert f.subs_dir("55", None).startswith(f.dm.movie_dir("55", None))
+    assert "unknown_year" in f.subs_dir("55", None)
+
+
+# ---------------------------------------------- 「可有可无」：不因字幕而失败
+
+def test_missing_api_key_exits_quietly(monkeypatch, capsys):
+    """没配 API Key 只跳过，不能抛 SystemExit —— 否则 cron/&& 串联会中断。"""
+    monkeypatch.setattr(f, "SUBDL_API_KEY", "")
+    f.main()   # 不抛异常即通过
+    assert "跳过字幕补全" in capsys.readouterr().out
+
+
+def test_missing_success_log_returns_empty(sandbox, monkeypatch, capsys):
+    """success.jsonl 不存在是正常状态（还没下过片），不是错误。"""
+    monkeypatch.setattr(f, "SUCCESS_LOG", str(sandbox / "nope.jsonl"))
+    assert f.load_entries() == []
+    assert "无需补字幕" in capsys.readouterr().out
+
+
+def test_search_failure_does_not_raise(sandbox, monkeypatch):
+    """SubDL 查询失败只标记该片，不抛异常。"""
+    def boom(_):
+        raise RuntimeError("SubDL 503")
+
+    monkeypatch.setattr(f, "search_subtitles", boom)
+    tmdb_id, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert tmdb_id == "55"
+    assert result["status"] == "search_failed"
+
+
+def test_one_language_failure_keeps_the_other(sandbox, monkeypatch):
+    """单语种下载失败不影响另一语种。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+        {"language": "ZH", "url": "/zh.zip"},
+    ])
+
+    def fake_request(method, url, **kwargs):
+        if "/en.zip" in url:
+            raise OSError("network down")
+        return _FakeZipResp(_zip_bytes({"movie.srt": _SRT}))
+
+    monkeypatch.setattr(f, "request_with_retry", fake_request)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "ok"
+    assert result["missing"] == ["en"]
+    assert sorted(result["saved"]) == ["zh.srt", "zh.vtt"]
+
+
+def test_no_subtitle_found_is_not_an_error(sandbox, monkeypatch):
+    """源站没有该片字幕是常态，状态仍是 ok、只记 missing。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [])
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "ok"
+    assert sorted(result["missing"]) == ["en", "zh"]
+    assert result["saved"] == []
+
+
+def test_worker_exception_does_not_kill_the_batch(sandbox, monkeypatch, capsys):
+    """某片抛异常时整批必须继续跑完。"""
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "1", "title": "A", "year": 2000},
+        {"tmdbId": "2", "title": "B", "year": 2000},
+    ])
+
+    def flaky(entry):
+        if entry["tmdbId"] == "1":
+            raise RuntimeError("boom")
+        return "2", {"status": "ok", "saved": ["en.vtt"], "missing": []}
+
+    monkeypatch.setattr(f, "download_one", flaky)
+    f.main()
+    out = capsys.readouterr().out
+    assert "异常（已跳过）" in out
+    assert "完成。字幕文件 1 个" in out
+
+
+def test_state_log_failure_is_swallowed(sandbox, monkeypatch, capsys):
+    """状态日志写不进去也不能影响主流程。"""
+    monkeypatch.setattr(f, "STATE_LOG", "/nonexistent-dir/subtitles.jsonl")
+    f.write_state({"tmdbId": "55"})
+    assert "状态日志写入失败" in capsys.readouterr().out
+
+
+# ------------------------------------------------------ 只补缺口、不重复抓
+
+def test_languages_already_present_are_skipped(sandbox, monkeypatch):
+    """下载侧已取到的语种直接跳过，不再请求 SubDL。"""
+    target = f.subs_dir("55", 2000)
+    os.makedirs(target)
+    for name in ("en.vtt", "en.srt", "zh.vtt", "zh.srt"):
+        open(os.path.join(target, name), "w").close()
+
+    def boom(_):
+        raise AssertionError("已有字幕不该再查 SubDL")
+
+    monkeypatch.setattr(f, "search_subtitles", boom)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "skipped"
+
+
+def test_only_missing_language_is_fetched(sandbox, monkeypatch):
+    """只补缺的那个语种：en 已存在时只查 zh。"""
+    target = f.subs_dir("55", 2000)
+    os.makedirs(target)
+    open(os.path.join(target, "en.vtt"), "w").close()
+
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "ZH", "url": "/zh.zip"},
+    ])
+
+    monkeypatch.setattr(f, "request_with_retry",
+                        lambda *a, **k: _FakeZipResp(
+                            _zip_bytes({"movie.srt": _SRT})))
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    # en 已有 -> 不在 pending；zh 被补齐
+    assert sorted(result["saved"]) == ["zh.srt", "zh.vtt"]
+    assert result["missing"] == []
+
+
+# -------------------------------------------------------- 落盘格式与下载侧一致
+
+def test_srt_source_is_written_as_both_formats(sandbox):
+    """SubDL 给的 srt 要同时落 vtt + srt，与下载侧口径一致。"""
+    target = f.subs_dir("55", 2000)
+    os.makedirs(target)
+    saved = f._write_variants(target, "en", _SRT, "srt")
+    assert sorted(saved) == ["en.srt", "en.vtt"]
+    vtt = open(os.path.join(target, "en.vtt")).read()
+    assert vtt.startswith("WEBVTT")
+    assert "00:00:01.000 --> 00:00:03.500" in vtt
+
+
+def test_ass_is_kept_as_is(sandbox):
+    """ass/ssa 的结构与 srt/vtt 完全不同，不做转换、原样保存。
+
+    ⚠️ 参数必须与生产调用一致：download_one 传的是 `extension.lstrip(".")`，
+    即**不带点**的扩展名。早先本用例传 ".ass"（带点），与 srt 用例传 "srt"
+    （不带点）自相矛盾，掩盖了拼出 "enass"（无扩展名）的真实 bug。
+    """
+    target = f.subs_dir("55", 2000)
+    os.makedirs(target)
+    saved = f._write_variants(target, "en", "[Script Info]\n", "ass")
+    assert saved == ["en.ass"]
+    assert os.path.isfile(os.path.join(target, "en.ass"))
+
+
+def test_ass_filename_matches_skip_pattern(sandbox):
+    """原样保存的文件名必须能被"已存在语种"正则认出。
+
+    否则每次运行都会重新抓一遍并再写一个同样的坏文件名。
+    """
+    target = f.subs_dir("55", 2000)
+    os.makedirs(target)
+    f._write_variants(target, "en", "[Script Info]\n", "ass")
+    names = os.listdir(target)
+    assert any(re.fullmatch(r"en\.\w+", n) for n in names), names
+
+
+def test_oversized_zip_is_rejected(sandbox, monkeypatch):
+    """源站返回异常大的内容时拒收，且**下载过程中**就中断。"""
+    delivered = []
+
+    class CountingResp(_FakeZipResp):
+        def iter_content(self, chunk_size=65536):
+            for i in range(0, 100, 8):
+                delivered.append(i)
+                yield b"x" * 8
+
+    monkeypatch.setattr(f, "MAX_ZIP_BYTES", 10)
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+    ])
+    monkeypatch.setattr(f, "request_with_retry", lambda *a, **k: CountingResp())
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert "en" in result["missing"]
+    assert result["saved"] == []
+    assert len(delivered) <= 2, "超限后必须立刻停止拉取"
+
+
+def test_pick_best_matches_language_case_insensitively():
+    """内部用小写代码，SubDL 返回大写，比较必须不区分大小写。"""
+    subs = [{"language": "EN", "url": "/a.zip"}]
+    assert f.pick_best(subs, "en") is not None
+    assert f.pick_best(subs, "zh") is None
+
+
+def test_pick_best_skips_full_season_packs():
+    subs = [
+        {"language": "EN", "url": "/season.zip", "full_season": True},
+        {"language": "EN", "url": "/movie.zip"},
+    ]
+    assert f.pick_best(subs, "en")["url"] == "/movie.zip"
+
+
+def test_load_entries_dedupes_and_keeps_year(sandbox, monkeypatch):
+    """success.jsonl 同片多条时取最后一条；year 必须带出来（拼目录要用）。"""
+    path = sandbox / "success.jsonl"
+    path.write_text(
+        json.dumps({"tmdbId": "55", "title": "A", "year": 1999}) + "\n"
+        + json.dumps({"tmdbId": "55", "title": "A2", "year": 2000}) + "\n"
+        + json.dumps({"title": "无 id"}) + "\n"
+        + "坏行不是 json\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(f, "SUCCESS_LOG", str(path))
+    entries = f.load_entries()
+    assert entries == [{"tmdbId": "55", "title": "A2", "year": 2000}]
