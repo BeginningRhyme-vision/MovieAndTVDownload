@@ -1993,10 +1993,15 @@ def _fetch_caption_text(caption):
     if not raw.strip():
         raise ValueError("字幕内容为空")
     text = _decode_subtitle(raw)
-    fmt = caption.get("type")
-    # 声明格式不可信时按内容判断：有 WEBVTT 头就是 vtt，否则按 srt 处理。
-    if fmt not in ("srt", "vtt"):
-        fmt = "vtt" if text.lstrip().upper().startswith("WEBVTT") else "srt"
+    # 一律按**内容**判定格式，不信源站声明的 type。
+    #
+    # 2026-09-11 实测：subs.api9str25.cfd 的条目声明 type="vtt"，正文却是标准
+    # SRT（首行是序号 "1"，时间轴用逗号）。旧逻辑只在 type 不是 srt/vtt 时才
+    # 嗅探内容，于是这批被当成 vtt 原样存进 .vtt —— 而 WebVTT 规范要求文件必须
+    # 以 "WEBVTT" 开头，缺了它浏览器 <track> 直接拒绝加载。R2 实测 42 个 vtt
+    # 里有 8 个（19%）是这样的废文件。
+    # 内容是事实，声明只是传闻，冲突时信事实。
+    fmt = "vtt" if text.lstrip().upper().startswith("WEBVTT") else "srt"
     return text, fmt
 
 

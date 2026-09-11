@@ -511,3 +511,59 @@ def test_local_mode_still_takes_every_downloaded_movie(sandbox, monkeypatch):
 def test_language_extraction_is_shared_by_both_modes(name, expected):
     """R2 与本地两侧必须用同一套语种判据，否则同一部片在两种模式下结论不同。"""
     assert f._language_of(name) == expected
+
+
+def test_vtt_named_file_holding_srt_is_converted(sandbox):
+    """zip 里名为 .vtt 但正文是 SRT 的文件，必须按内容转换而非原样存。
+
+    与 download_movies._fetch_caption_text 同款防御：扩展名只是提示，
+    缺 WEBVTT 头的 .vtt 会被浏览器 <track> 直接拒绝加载。
+    """
+    target = f.subs_dir("55", 2000)
+    os.makedirs(target)
+    f._write_variants(target, "en", _SRT, "vtt")   # 谎称 vtt
+
+    vtt = open(os.path.join(target, "en.vtt"), encoding="utf-8").read()
+    srt = open(os.path.join(target, "en.srt"), encoding="utf-8").read()
+    assert vtt.startswith("WEBVTT")
+    assert "00:00:01.000" in vtt      # 点号
+    assert "00:00:01,000" in srt      # 逗号
+
+
+_ASS = (
+    "[Script Info]\nTitle: x\n\n[Events]\n"
+    "Dialogue: 0,0:00:01.00,0:00:03.50,Default,,0,0,0,,Hi\n"
+)
+_VTT = "WEBVTT\n\n1\n00:00:01.000 --> 00:00:03.500\nHi\n"
+
+
+@pytest.mark.parametrize("text,declared,expected", [
+    # 正文说了算，声明一律让路
+    (_SRT, "vtt", "srt"),
+    (_SRT, "ass", "srt"),
+    (_SRT, "srt", "srt"),
+    (_VTT, "srt", "vtt"),
+    (_VTT, "vtt", "vtt"),
+    (_ASS, "srt", "ass"),      # ASS 被谎称 srt：必须识破
+    (_ASS, "ass", "ass"),
+    (_ASS, "ssa", "ssa"),      # 保留 ssa 以便区分
+    # 正文认不出时才退回声明值
+    ("看不懂的内容", "srt", "srt"),
+])
+def test_sniff_format_trusts_content_over_extension(text, declared, expected):
+    assert f._sniff_format(text, declared) == expected
+
+
+def test_ass_body_declared_as_srt_is_not_written_as_srt(sandbox):
+    """ASS 正文若被当成 srt 处理，会连 .srt 带 .vtt 一起写废。
+
+    ASS 是带样式的富文本，srt_to_vtt 对它毫无意义 —— 只会把
+    "[Script Info]" 这种节标题原样搬进两个文件，两份全不可用。
+    """
+    target = f.subs_dir("55", 2000)
+    os.makedirs(target)
+    saved = f._write_variants(target, "en", _ASS, "srt")   # 谎称 srt
+
+    assert saved == ["en.ass"], "必须识破并按 ass 原样保存"
+    assert not os.path.exists(os.path.join(target, "en.srt"))
+    assert not os.path.exists(os.path.join(target, "en.vtt"))

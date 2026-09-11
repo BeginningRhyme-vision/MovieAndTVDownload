@@ -1454,6 +1454,64 @@ def test_caption_entry_headers_override_defaults(sandbox, monkeypatch):
     assert seen["headers"]["Referer"] is None
 
 
+def test_subtitle_format_follows_content_not_declared_type(
+    sandbox, monkeypatch,
+):
+    """源站声明 type=vtt 但正文是 SRT 时，必须按 SRT 处理。
+
+    真实事故（2026-09-11，R2 实测 42 个 vtt 里 8 个中招）：
+    subs.api9str25.cfd 的条目写 type="vtt"，正文却是标准 SRT（首行序号 "1"、
+    时间轴用逗号）。旧逻辑信了声明，把它原样存进 .vtt —— 缺 WEBVTT 头，
+    浏览器 <track> 直接拒绝加载，等于这份字幕白抓。
+    """
+    class FakeSession:
+        def get(self, url, timeout=None, headers=None, stream=False):
+            return _FakeCaptionResp(_SRT_SAMPLE.encode("utf-8"))
+
+    monkeypatch.setattr(d, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en"])
+    monkeypatch.setattr(d, "SUBTITLE_FORMATS", ["vtt", "srt"])
+
+    # 注意 type 谎称 vtt
+    d.save_subtitles("55", 2000, [
+        {"url": "https://cdn/en.vtt", "language": "en", "type": "vtt"},
+    ])
+
+    subs = os.path.join(d.BASE_DIR, "movies", "2000", "55", "subs")
+    vtt = open(os.path.join(subs, "en.vtt"), encoding="utf-8").read()
+    srt = open(os.path.join(subs, "en.srt"), encoding="utf-8").read()
+    # .vtt 必须被补上 WEBVTT 头并转成点号时间轴
+    assert vtt.startswith("WEBVTT"), "谎称 vtt 的 SRT 必须被转成真正的 VTT"
+    assert "00:00:01.000" in vtt
+    # .srt 保持逗号时间轴
+    assert "00:00:01,000" in srt
+
+
+def test_declared_srt_that_is_really_vtt_is_also_handled(sandbox, monkeypatch):
+    """反向同理：声明 srt 但正文带 WEBVTT 头时，按 vtt 处理。"""
+    vtt_body = "WEBVTT\n\n1\n00:00:01.000 --> 00:00:03.500\nHello\n"
+
+    class FakeSession:
+        def get(self, url, timeout=None, headers=None, stream=False):
+            return _FakeCaptionResp(vtt_body.encode("utf-8"))
+
+    monkeypatch.setattr(d, "get_session", lambda: FakeSession())
+    monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en"])
+    monkeypatch.setattr(d, "SUBTITLE_FORMATS", ["vtt", "srt"])
+
+    d.save_subtitles("55", 2000, [
+        {"url": "https://cdn/en.srt", "language": "en", "type": "srt"},
+    ])
+
+    subs = os.path.join(d.BASE_DIR, "movies", "2000", "55", "subs")
+    assert open(os.path.join(subs, "en.vtt"), encoding="utf-8").read(
+    ).startswith("WEBVTT")
+    # srt 里不能残留 WEBVTT 头，时间轴要转成逗号
+    srt = open(os.path.join(subs, "en.srt"), encoding="utf-8").read()
+    assert "WEBVTT" not in srt
+    assert "00:00:01,000" in srt
+
+
 def test_save_subtitles_filters_by_language_whitelist(sandbox, monkeypatch):
     """白名单外的语种必须丢弃，否则单片会存下十几种语言。"""
     monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en"])

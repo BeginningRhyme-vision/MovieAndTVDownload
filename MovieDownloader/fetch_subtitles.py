@@ -34,6 +34,7 @@
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -107,6 +108,13 @@ state_lock = threading.Lock()
 
 # 是否把字幕写进 R2。下载侧开了上传就必须走 R2 —— 本地影片目录早被删了。
 REMOTE_MODE = dm.S3_ENABLED
+
+# SRT/VTT 的时间轴特征：两个时间戳夹一个 -->。秒与毫秒之间 SRT 用逗号、
+# VTT 用点号，两者都认；小时段可有可无（源站两种写法都出现过）。
+# 用于 _sniff_format 在没有 WEBVTT 头、也没有 ASS 节标题时确认这是字幕正文。
+_SRT_CUE_RE = re.compile(
+    r"\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3}\s*-->\s*\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3}"
+)
 
 
 def subs_dir(tmdb_id, year):
@@ -348,20 +356,50 @@ def decode_subtitle(raw):
     return dm._decode_subtitle(raw)
 
 
+def _sniff_format(text, declared):
+    """按**正文**判定字幕格式，扩展名只在正文认不出时兜底。
+
+    返回 "vtt" / "srt" / 其它（原样保存的富文本格式，如 ass/ssa）。
+
+    为什么不能信扩展名（2026-09-11 实测，两个方向都出过事）：
+      - 源站把 SRT 正文塞进声明 type="vtt" 的条目 —— 按 vtt 原样存下会得到
+        一个缺 WEBVTT 头的 .vtt，浏览器 <track> 直接拒绝加载（R2 上 42 个
+        vtt 里 8 个中招）；
+      - SubDL 的 zip 里也有文件名与内容对不上的情况 —— ASS 正文若被当成 srt
+        处理，会连 .srt 带 .vtt 一起写废。
+    正文特征是事实，文件名只是传闻。
+    """
+    head = (text or "").lstrip()
+    if head.upper().startswith("WEBVTT"):
+        return "vtt"
+    # ASS/SSA 的节标题是硬特征，任何合法文件都必有 [Script Info] 或 [V4+ Styles]
+    upper = head[:400].upper()
+    if "[SCRIPT INFO]" in upper or "[V4+ STYLES]" in upper or "[V4 STYLES]" in upper:
+        fallback = str(declared or "").strip().lower().lstrip(".")
+        # 保留原扩展名以便区分 ass/ssa；认不出就统一叫 ass。
+        return fallback if fallback in ("ass", "ssa") else "ass"
+    # 有 "digits --> digits" 时间轴的就是 SRT（VTT 已在上面被 WEBVTT 头拦下）。
+    if _SRT_CUE_RE.search(text or ""):
+        return "srt"
+    # 正文认不出：退回声明值，至少保住原有行为。
+    return str(declared or "").strip().lower().lstrip(".")
+
+
 def _write_variants(target_dir, language, text, source_format):
     """把一份字幕按 SUBTITLE_FORMATS 落盘（vtt / srt），返回已写文件名。
 
     与下载侧同一套转换逻辑（dm.srt_to_vtt / dm.vtt_to_srt），保证无论字幕来自
     源站还是 SubDL，最终落盘的格式与命名完全一致。
-    source_format 是**不带点**的扩展名（srt / vtt / ass ...）。
+    source_format 是**不带点**的扩展名（srt / vtt / ass ...），仅作兜底提示 ——
+    真正的判据是正文（见 _sniff_format）。
     ass/ssa 是带样式的富文本格式，转换规则与 srt/vtt 完全不同，不做转换，
     按原扩展名原样保存（前端可自行决定是否使用）。
     """
-    fmt = str(source_format or "").strip().lower().lstrip(".")
+    fmt = _sniff_format(text, source_format)
     if fmt not in ("srt", "vtt"):
         # 未知格式原样存。必须显式补点号：调用方传进来的是已去点的扩展名，
         # 直接拼会得到 "enass" 这种无扩展名的文件——它既不能被播放器识别，
-        # 也匹配不上"已存在语种"的正则，导致每次运行都重新抓一遍。
+        # 也匹配不上"已存在语种"的判据，导致每次运行都重新抓一遍。
         path = os.path.join(target_dir, f"{language}.{fmt}" if fmt else language)
         with open(path, "w", encoding="utf-8", newline="") as fh:
             fh.write(text)
