@@ -4259,51 +4259,71 @@ def main():
             f"低水位 {DISK_LOW_WATERMARK:.0%} 恢复，每 {DISK_CHECK_INTERVAL:g}s 检查一次",
             flush=True,
         )
+    # 累加器由 main() 持有、传给 _run_pipeline 就地累加，**不能**靠返回值接。
+    # 2026-09-12 实测：kill -INT 优雅退出的那次运行，日志里整段没有"本次运行
+    # 上传容量"——因为 KeyboardInterrupt 从 _run_pipeline 里抛出时返回值根本不
+    # 存在，赋值语句没执行，后面的打印又全在 try 之外。中断时"这次到底传进去
+    # 多少"恰恰是最该被看到的数字（下次重跑要据此判断进度），丢了最可惜。
+    run_volume = new_upload_volume()
     try:
-        run_volume = _run_pipeline()
-    finally:
-        # 先停监控线程并放行闸门，避免仍有线程卡在 wait_for_disk_gate 上。
-        disk_monitor_stop.set()
-        disk_gate.set()
-        if monitor_thread is not None:
-            monitor_thread.join(timeout=DISK_CHECK_INTERVAL + 1)
-        release_main_lock()
-
-    # 收尾自动补传：上传槽位超时降级留下的成品躺在 upload_pending.jsonl 里，
-    # 不会被任何后续轮次处理，只能靠人跑 `download_movies.py reupload`。此时
-    # R2 往往已经恢复，自动补一次能省掉这次人工介入。
-    # 必须放在 release_main_lock() **之后**：reupload_pending 内部有
-    # is_main_running() 守卫，锁未释放时会直接拒绝执行。
-    # 放在 finally 之外：_run_pipeline 抛异常时不补传——此时状态未知，
-    # 交给人工判断更稳妥（手动 reupload 入口始终可用）。
-    if AUTO_REUPLOAD_ENABLED and S3_ENABLED:
-        print("\n===== 收尾自动补传 =====", flush=True)
         try:
-            # 补传量并入本次运行总量。两段不会重复计数：能进补传的片，在主流程
-            # 里一定是 uploaded=False（上传失败或槽位超时降级）、从未被主流程
-            # 累加过；反之主流程已上传成功的片不会留在 pending 里。
-            merge_upload_volume(run_volume, reupload_pending())
-        except (Exception, SystemExit) as exc:
-            # 补传失败不影响主流程的成功结论：成品仍留在本地且 pending 记录还在，
-            # 随时可以手动 reupload。SystemExit 一并兜住（避免收尾动作把已经跑完
-            # 的整次运行判成失败退出），但放过 KeyboardInterrupt。
-            print(f"⚠️ 自动补传异常，成品仍留本地待手动 reupload: {exc}", flush=True)
+            _run_pipeline(run_volume)
+        finally:
+            # 先停监控线程并放行闸门，避免仍有线程卡在 wait_for_disk_gate 上。
+            disk_monitor_stop.set()
+            disk_gate.set()
+            if monitor_thread is not None:
+                monitor_thread.join(timeout=DISK_CHECK_INTERVAL + 1)
+            release_main_lock()
 
-    # 本次运行的最终口径：主流程 + 收尾补传。前面两段是分开打的，中间还隔着
-    # 一大段失败聚合日志，不给一个合并行的话，用户得自己翻日志做加法。
-    print("\n===== 本次运行上传容量 =====", flush=True)
-    if run_volume["uploaded_sized"] or run_volume["uploaded_unsized"]:
-        print_upload_volume("累计上传成功", run_volume)
-    else:
-        # 显式说"没有"，而不是留一段空白让人怀疑统计是不是又漏算了。
-        print("本次运行没有新增上传。")
-    print(
-        "提示：查看所有历次运行的累计容量，跑 "
-        "`python download_movies.py storage`"
-    )
+        # 收尾自动补传：上传槽位超时降级留下的成品躺在 upload_pending.jsonl 里，
+        # 不会被任何后续轮次处理，只能靠人跑 `download_movies.py reupload`。此时
+        # R2 往往已经恢复，自动补一次能省掉这次人工介入。
+        # 必须放在 release_main_lock() **之后**：reupload_pending 内部有
+        # is_main_running() 守卫，锁未释放时会直接拒绝执行。
+        # 放在内层 try 的正常路径上：_run_pipeline 抛异常/被中断时不补传——
+        # 此时状态未知（且用户正想让它停下），交给人工判断更稳妥
+        # （手动 reupload 入口始终可用）。
+        if AUTO_REUPLOAD_ENABLED and S3_ENABLED:
+            print("\n===== 收尾自动补传 =====", flush=True)
+            try:
+                # 补传量并入本次运行总量。两段不会重复计数：能进补传的片，在主流程
+                # 里一定是 uploaded=False（上传失败或槽位超时降级）、从未被主流程
+                # 累加过；反之主流程已上传成功的片不会留在 pending 里。
+                merge_upload_volume(run_volume, reupload_pending())
+            except (Exception, SystemExit) as exc:
+                # 补传失败不影响主流程的成功结论：成品仍留在本地且 pending 记录还在，
+                # 随时可以手动 reupload。SystemExit 一并兜住（避免收尾动作把已经跑完
+                # 的整次运行判成失败退出），但放过 KeyboardInterrupt。
+                print(f"⚠️ 自动补传异常，成品仍留本地待手动 reupload: {exc}", flush=True)
+    finally:
+        # 本次运行的最终口径：主流程 + 收尾补传。前面两段是分开打的，中间还隔着
+        # 一大段失败聚合日志，不给一个合并行的话，用户得自己翻日志做加法。
+        # ⚠️ 必须在 finally 里：Ctrl+C / kill -INT 与异常退出都要留下这一段，
+        # 打完再让异常继续向上抛（pipeline.py 靠 KeyboardInterrupt 判 130 退出码）。
+        was_interrupted = interrupted.is_set()
+        header = "本次运行上传容量（已中断，下为中断前已完成部分）" \
+            if was_interrupted else "本次运行上传容量"
+        print(f"\n===== {header} =====", flush=True)
+        if run_volume["uploaded_sized"] or run_volume["uploaded_unsized"]:
+            print_upload_volume("累计上传成功", run_volume)
+        else:
+            # 显式说"没有"，而不是留一段空白让人怀疑统计是不是又漏算了。
+            print("本次运行没有新增上传。")
+        print(
+            "提示：查看所有历次运行的累计容量，跑 "
+            "`python download_movies.py storage`"
+        )
 
 
-def _run_pipeline():
+def _run_pipeline(run_volume=None):
+    """跑完整的下载-转封装-上传流水线。
+
+    run_volume：由 main() 持有的上传容量累加器，本函数**就地**往里累加。
+    之所以不用返回值，是因为 Ctrl+C / kill -INT 会让本函数中途抛出——返回值
+    随之蒸发，调用方就没法报告"中断前已经传了多少"。传引用则无论怎么退出，
+    已累加的数字都在调用方手里。
+    """
     clean_temp_directory()
     print("已清理 temp 目录中的旧临时文件")
 
@@ -4429,7 +4449,9 @@ def _run_pipeline():
     stage_of = {}  # future -> "download" | "conversion" | "upload"
     pending = set()
     stats = {"conversions": 0, "uploads": 0}
-    stats.update(new_upload_volume())
+    # 容量累加器与计数器分开放：前者归 main() 所有（中断时也要能打印），
+    # 后者是本函数内部的进度计数。独立跑（测试/直接调用）时自备一份。
+    volume = run_volume if run_volume is not None else new_upload_volume()
     # 被拒原因聚合（观测性，仅统计下载阶段失败）：按类别计数，分确定性/可重试两组。
     # 确定性失败每片计一次；可重试失败跨轮会重复计（同片多轮重投），打印时分块标注。
     reject_permanent = {}
@@ -4680,7 +4702,7 @@ def _run_pipeline():
                 #      merge_next_batch(下载阶段失败的片)，已上传成功的片不在
                 #      任何重投桶里，根本没有第二次到达 upload 阶段的路径。
                 if info.get("uploaded"):
-                    add_upload_volume(stats, info.get("file_size_bytes"))
+                    add_upload_volume(volume, info.get("file_size_bytes"))
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as download_executor, \
             ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as conversion_executor, \
@@ -4946,7 +4968,7 @@ def _run_pipeline():
             f"三级流水线全部完成：转封装 {stats['conversions']} 部，"
             f"上传 {stats['uploads']} 部。"
         )
-        print_upload_volume("本次上传成功", stats)
+        print_upload_volume("本次上传成功", volume)
 
         # 被拒原因聚合统计（观测性）：量化各类失败占比，指导码率门槛校准。
         def _print_reject_stats(title, counter, note):
@@ -4995,9 +5017,6 @@ def _run_pipeline():
                     f"    提示：把 config.yaml 的 auto_refetch.enabled 设为 true "
                     f"可让本脚本自动完成这一步。"
                 )
-
-    # 交回给 main()：收尾补传跑完后要和补传量合并成"本次运行总量"。
-    return stats
 
 
 def reupload_pending():

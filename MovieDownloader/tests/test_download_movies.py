@@ -2028,6 +2028,123 @@ def test_reupload_early_returns_give_empty_volume(sandbox, monkeypatch):
     assert d.reupload_pending() == d.new_upload_volume()
 
 
+# --------------------------------------------------- main() 的收尾容量打印
+# 2026-09-12 真机教训：kill -INT 优雅退出的那次运行，日志里整段没有"本次运行
+# 上传容量"。根因是累加器曾靠 `run_volume = _run_pipeline()` 接返回值——中断时
+# 异常从 _run_pipeline 抛出，赋值没执行，后面的打印又全在 try 之外，整段跳过。
+# 偏偏中断时"已经传进去多少"才是最该被看到的数字。以下三例把这条路锁死。
+
+@pytest.fixture
+def main_env(sandbox, monkeypatch):
+    """把 main() 的外围依赖全部桩掉，只留"跑流水线 + 收尾打印"这条主干。"""
+    monkeypatch.setattr(d, "acquire_main_lock", lambda: None)
+    monkeypatch.setattr(d, "release_main_lock", lambda: None)
+    monkeypatch.setattr(d, "install_interrupt_handler", lambda: None)
+    monkeypatch.setattr(d, "preflight_check_ffmpeg", lambda: None)
+    monkeypatch.setattr(d, "S3_ENABLED", False)
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", False)
+    monkeypatch.setattr(d, "DISK_GUARD_ENABLED", False)
+    # 这三个是模块级共享状态，用例间必须互不残留。
+    monkeypatch.setattr(d, "interrupted", threading.Event())
+    monkeypatch.setattr(d, "disk_monitor_stop", threading.Event())
+    monkeypatch.setattr(d, "disk_gate", threading.Event())
+
+
+def test_main_prints_volume_on_keyboard_interrupt(main_env, monkeypatch, capsys):
+    """🔑 kill -INT 中断时，中断**前**已上传的容量必须照常打印。
+
+    这是本用例存在的全部理由：修复前这段整个消失，用户翻遍日志也不知道
+    这次到底传成了多少、下次该从哪儿接着跑。
+    """
+    def _boom(run_volume):
+        d.add_upload_volume(run_volume, 3_000_000_000)  # 中断前已传成 1 部
+        d.interrupted.set()                             # 信号处理器会做的事
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(d, "_run_pipeline", _boom)
+
+    # 异常必须继续向上抛：pipeline.py 靠它判 130 退出码。打印不能把它吃掉。
+    with pytest.raises(KeyboardInterrupt):
+        d.main()
+
+    out = capsys.readouterr().out
+    assert "本次运行上传容量" in out
+    assert "已中断" in out                       # 明示这不是完整跑完的数字
+    assert "累计上传成功 1 部，总大小 3.00 GB" in out
+
+
+def test_main_prints_volume_on_unexpected_exception(main_env, monkeypatch, capsys):
+    """异常崩溃同理：崩之前传成的量也要留在日志里，且异常照常上抛。"""
+    def _boom(run_volume):
+        d.add_upload_volume(run_volume, 2_000_000_000)
+        raise RuntimeError("磁盘炸了")
+
+    monkeypatch.setattr(d, "_run_pipeline", _boom)
+
+    with pytest.raises(RuntimeError):
+        d.main()
+
+    out = capsys.readouterr().out
+    assert "累计上传成功 1 部，总大小 2.00 GB" in out
+    assert "已中断" not in out                   # 没置位 interrupted，不该乱标
+
+
+def test_main_prints_volume_on_normal_finish(main_env, monkeypatch, capsys):
+    """正常跑完的路径不能被这次改动带歪。"""
+    monkeypatch.setattr(
+        d, "_run_pipeline",
+        lambda run_volume: d.add_upload_volume(run_volume, 1_000_000_000),
+    )
+
+    d.main()
+
+    out = capsys.readouterr().out
+    assert "累计上传成功 1 部，总大小 1.00 GB" in out
+    assert "已中断" not in out
+
+
+def test_main_merges_reupload_volume_into_run_total(main_env, monkeypatch, capsys):
+    """主流程 + 收尾补传 = 本次运行总量。合并行不能因这次重构丢掉。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", True)
+    monkeypatch.setattr(d, "preflight_check_s3", lambda: None)
+    monkeypatch.setattr(
+        d, "_run_pipeline",
+        lambda run_volume: d.add_upload_volume(run_volume, 1_000_000_000),
+    )
+
+    def _reupload():
+        volume = d.new_upload_volume()
+        d.add_upload_volume(volume, 2_000_000_000)
+        return volume
+
+    monkeypatch.setattr(d, "reupload_pending", _reupload)
+
+    d.main()
+
+    assert "累计上传成功 2 部，总大小 3.00 GB" in capsys.readouterr().out
+
+
+def test_main_skips_reupload_when_interrupted(main_env, monkeypatch, capsys):
+    """中断时不碰补传：用户正想让它停下，此时再开一轮上传是帮倒忙。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", True)
+    monkeypatch.setattr(d, "preflight_check_s3", lambda: None)
+
+    def _boom(run_volume):
+        raise KeyboardInterrupt()
+
+    called = []
+    monkeypatch.setattr(d, "_run_pipeline", _boom)
+    monkeypatch.setattr(d, "reupload_pending", lambda: called.append(1))
+
+    with pytest.raises(KeyboardInterrupt):
+        d.main()
+
+    assert called == []
+    assert "本次运行没有新增上传" in capsys.readouterr().out
+
+
 def test_unknown_resolution_constant_matches_literals():
     """护栏：常量与三处产出点用的必须是同一个字符串。
 
