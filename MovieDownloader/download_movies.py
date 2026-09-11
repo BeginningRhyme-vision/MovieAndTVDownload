@@ -1613,6 +1613,38 @@ def asset_rel_path(tmdb_id, year, asset=None):
     return "/".join(part for part in parts if part)
 
 
+def _file_size(path):
+    """返回文件字节数；取不到返回 None（不抛异常，调用方按缺失处理）。"""
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+def bytes_to_gb(num_bytes):
+    """字节 -> GB，**十进制 1000 进制**（1 GB = 1000^3 字节）。
+
+    刻意不用 1024：存储厂商与 R2 的计费口径都是十进制，用 1024 算出来的数
+    比账单小约 7%，对不上账。要 1024 进制的话那个单位叫 GiB，不是 GB。
+    """
+    if not num_bytes:
+        return 0.0
+    return num_bytes / 1_000_000_000
+
+
+def format_size(num_bytes):
+    """把字节数格式化成便于阅读的十进制单位字符串。"""
+    if not num_bytes:
+        return "0 B"
+    units = ("B", "KB", "MB", "GB", "TB", "PB")
+    value = float(num_bytes)
+    for unit in units:
+        if value < 1000 or unit == units[-1]:
+            return f"{value:.2f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1000
+    return f"{value:.2f} PB"
+
+
 def build_s3_key(tmdb_id, year=None, asset=None):
     """把一部影片的某个资产映射为 R2 对象键。
 
@@ -1994,6 +2026,7 @@ def build_meta(entry, success_info, subtitle_files):
             "file": f"{tmdb_id}.mp4",
             "resolution": success_info.get("resolution"),
             "bitrateKbps": success_info.get("bitrate_kbps"),
+            "sizeBytes": success_info.get("file_size_bytes"),
             "missingSegmentCount": success_info.get("missing_segment_count"),
         },
         "subtitles": [
@@ -3810,6 +3843,9 @@ def finalize_one_entry(conversion_job, processed_ids):
             "year": conversion_job.get("year"),
             "url": conversion_job["url"],
             "final_path": final_path,
+            # 成品字节数。必须在这里取——上传成功后本地文件就删了，事后再想
+            # 统计总容量只能去 R2 查。取不到时记 None，不影响成片。
+            "file_size_bytes": _file_size(final_path),
             "bitrate_kbps": conversion_job["bitrate_kbps"],
             "resolution": _resolve_final_resolution(
                 conversion_job["resolution"], final_path, tmdb_id
@@ -3992,6 +4028,9 @@ def upload_one_entry(success_info):
             "year": success_info.get("year"),
             "local_path": local_path,
             "s3_key": s3_key,
+            # 成品字节数：补传时本地文件还在、可以现测，但记下来更省事，
+            # 也让 pending 自身就能回答"待补传的量有多大"。
+            "file_size_bytes": success_info.get("file_size_bytes"),
             # 资产清单随 pending 一起持久化：视频上传失败时旁车资产**也还没传**
             # （它们在上面的 ok 分支里），reupload 必须知道要补哪些，否则这些
             # 资产永远不会进 R2。
@@ -4013,6 +4052,7 @@ def upload_one_entry(success_info):
                 "year": success_info.get("year"),
                 "local_path": local_path,
                 "s3_key": success_info.get("s3_key", ""),
+                "file_size_bytes": success_info.get("file_size_bytes"),
                 "subtitle_files": success_info.get("subtitle_files") or [],
                 "has_meta": bool(success_info.get("has_meta")),
                 "fail_reason": reason,
@@ -4317,7 +4357,8 @@ def _run_pipeline():
     # 失败片天然不相交）。仅在全部轮次结束后统一排空剩余在途任务。
     stage_of = {}  # future -> "download" | "conversion" | "upload"
     pending = set()
-    stats = {"conversions": 0, "uploads": 0}
+    stats = {"conversions": 0, "uploads": 0, "uploaded_bytes": 0,
+             "uploaded_sized": 0, "uploaded_unsized": 0}
     # 被拒原因聚合（观测性，仅统计下载阶段失败）：按类别计数，分确定性/可重试两组。
     # 确定性失败每片计一次；可重试失败跨轮会重复计（同片多轮重投），打印时分块标注。
     reject_permanent = {}
@@ -4484,6 +4525,7 @@ def _run_pipeline():
                             "year": info.get("year"),
                             "local_path": info.get("final_path"),
                             "s3_key": "",
+                            "file_size_bytes": info.get("file_size_bytes"),
                             "subtitle_files": info.get("subtitle_files") or [],
                             "has_meta": bool(info.get("has_meta")),
                             "fail_reason": degrade_reason,
@@ -4557,6 +4599,20 @@ def _run_pipeline():
                     "stage": "upload",
                 })
                 print(f"上传失败: {tmdb_id}: {info.get('error', '未知错误')}")
+            else:
+                # 只累加真正进了 R2 的成品。两个坑：
+                #   1. stats["uploads"] 是提交上传任务时自增的，含最终失败的片，
+                #      不能拿它当分母；
+                #   2. S3_ENABLED=False 时 upload_one_entry 也返回 True（纯本地
+                #      模式），但压根没传，靠 uploaded 标志排除。
+                if info.get("uploaded"):
+                    size = info.get("file_size_bytes")
+                    if size:
+                        stats["uploaded_bytes"] += size
+                        stats["uploaded_sized"] += 1
+                    else:
+                        # 取大小失败（罕见）单独计数，避免总量被悄悄少算而无人察觉。
+                        stats["uploaded_unsized"] += 1
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as download_executor, \
             ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as conversion_executor, \
@@ -4822,6 +4878,18 @@ def _run_pipeline():
             f"三级流水线全部完成：转封装 {stats['conversions']} 部，"
             f"上传 {stats['uploads']} 部。"
         )
+        if stats["uploaded_sized"] or stats["uploaded_unsized"]:
+            total_bytes = stats["uploaded_bytes"]
+            print(
+                f"本次上传成功 {stats['uploaded_sized']} 部，"
+                f"总大小 {bytes_to_gb(total_bytes):.2f} GB"
+                f"（{format_size(total_bytes)}，十进制 1 GB = 1000³ 字节）"
+            )
+            if stats["uploaded_unsized"]:
+                print(
+                    f"  ⚠️ 另有 {stats['uploaded_unsized']} 部未能取到文件大小，"
+                    f"未计入上述总量"
+                )
 
         # 被拒原因聚合统计（观测性）：量化各类失败占比，指导码率门槛校准。
         def _print_reject_stats(title, counter, note):
@@ -4925,6 +4993,7 @@ def reupload_pending():
     success_count = 0
     orphan_count = 0
     fail_count = 0
+    reuploaded_bytes = 0
 
     for tmdb_id in order:
         record = latest_by_id[tmdb_id]
@@ -4946,9 +5015,14 @@ def reupload_pending():
             print(f"  [{tmdb_id}] 本地视频不存在，跳过并移除 pending: {local_path}")
             continue
 
+        # 必须在删本地之前取大小；旧 pending 记录没有这个字段，就地补测。
+        file_size = record.get("file_size_bytes") or _file_size(local_path)
+
         print(f"  [{tmdb_id}] 补传中 -> {s3_key}")
         ok, reason = upload_to_r2(local_path, s3_key)
         if ok:
+            if file_size:
+                reuploaded_bytes += file_size
             # 视频进 R2 后，旁车资产也要跟着补 —— 它们在首次上传时因为视频失败
             # 而被整段跳过，这里是唯一的补救点。
             try:
@@ -4967,6 +5041,7 @@ def reupload_pending():
                 "year": record.get("year"),
                 "final_path": local_path,
                 "s3_key": s3_key,
+                "file_size_bytes": file_size,
                 "uploaded": True,
                 "reupload": True,
             })
@@ -4994,11 +5069,88 @@ def reupload_pending():
         f"补传完成：成功 {success_count}，仍失败 {fail_count}，"
         f"孤儿(本地已无)清理 {orphan_count}；pending 剩余 {len(remaining)} 条。"
     )
+    if reuploaded_bytes:
+        print(
+            f"本次补传上传 {bytes_to_gb(reuploaded_bytes):.2f} GB"
+            f"（{format_size(reuploaded_bytes)}）"
+        )
+
+
+def report_storage():
+    """汇总 success.jsonl，打印已上传成品的累计容量（十进制 GB）。
+
+    只读，不碰任何文件。同一 tmdbId 多条记录（补传会覆盖写）按最后一条计，
+    避免把同一部片算两遍。
+    """
+    if not os.path.exists(SUCCESS_LOG):
+        print(f"找不到 {SUCCESS_LOG}，无可统计的成品。")
+        return
+
+    latest = {}
+    bad_lines = 0
+    with open(SUCCESS_LOG, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                bad_lines += 1
+                continue
+            tmdb_id = record.get("tmdbId")
+            if tmdb_id is not None:
+                latest[str(tmdb_id)] = record
+
+    uploaded_bytes = uploaded_count = uploaded_sized = 0
+    local_bytes = local_count = 0
+    unsized = 0
+    for record in latest.values():
+        size = record.get("file_size_bytes")
+        if not size:
+            unsized += 1
+        if record.get("uploaded"):
+            uploaded_count += 1
+            if size:
+                uploaded_bytes += size
+                uploaded_sized += 1
+        else:
+            # 下载成功但还没进 R2（上传失败待补传，或 s3.enabled=false）
+            local_count += 1
+            if size:
+                local_bytes += size
+
+    print(f"===== 成品容量统计（{SUCCESS_LOG}）=====")
+    print(f"影片总数: {len(latest)}")
+    print(
+        f"已上传 R2: {uploaded_count} 部，"
+        f"{bytes_to_gb(uploaded_bytes):.2f} GB（{format_size(uploaded_bytes)}）"
+    )
+    if local_count:
+        print(
+            f"仅在本地: {local_count} 部，"
+            f"{bytes_to_gb(local_bytes):.2f} GB（{format_size(local_bytes)}）"
+        )
+        total = uploaded_bytes + local_bytes
+        print(f"合计: {bytes_to_gb(total):.2f} GB（{format_size(total)}）")
+    if uploaded_sized:
+        # 分母只用"有大小记录的已上传片"，否则平均值会被无大小的片拉低。
+        print(f"平均每部: {bytes_to_gb(uploaded_bytes / uploaded_sized):.2f} GB")
+    print("注: 采用十进制单位，1 GB = 1000³ 字节（与云存储计费口径一致）")
+    if unsized:
+        print(
+            f"⚠️ {unsized} 部没有 file_size_bytes 字段（本功能上线前下载的），"
+            f"未计入容量"
+        )
+    if bad_lines:
+        print(f"⚠️ 跳过 {bad_lines} 行无法解析的记录")
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reupload":
         reupload_pending()
+    elif len(sys.argv) > 1 and sys.argv[1] == "storage":
+        report_storage()
     else:
         # 沿用既有的裸 sys.argv 分派风格（本文件一直没有引入 argparse）。
         # 两个开关可叠加：--retry-only --retry-dead。
@@ -5011,6 +5163,7 @@ if __name__ == "__main__":
             print(f"错误: 无法识别的参数 {' '.join(sorted(_unknown))}")
             print("用法: python download_movies.py [--retry-only] [--retry-dead]")
             print("      python download_movies.py reupload")
+            print("      python download_movies.py storage")
             raise SystemExit(2)
         if RETRY_ONLY_MODE:
             print(

@@ -1528,13 +1528,15 @@ def test_build_meta_carries_probed_video_params(sandbox):
          "genres": ["Drama"], "title_type": "movie"},
         {"tmdbId": "55", "title": "T", "year": 2000,
          "resolution": "1920x1080", "bitrate_kbps": 3000,
+         "file_size_bytes": 1_500_000_000,
          "missing_segment_count": 0},
         ["subs/en.vtt"],
     )
     assert meta["tmdbId"] == "55" and meta["imdbId"] == "tt1"
     assert meta["video"] == {
         "file": "55.mp4", "resolution": "1920x1080",
-        "bitrateKbps": 3000, "missingSegmentCount": 0,
+        "bitrateKbps": 3000, "sizeBytes": 1_500_000_000,
+        "missingSegmentCount": 0,
     }
     assert meta["subtitles"] == [
         {"language": "en", "format": "vtt", "path": "subs/en.vtt"}
@@ -1689,6 +1691,111 @@ def test_pending_record_carries_asset_manifest(sandbox, monkeypatch):
                open(d.UPLOAD_PENDING_LOG, encoding="utf-8") if ln.strip()]
     assert pending[-1]["subtitle_files"] == ["subs/en.vtt"]
     assert pending[-1]["has_meta"] is True
+
+
+# ---------------------------------------------------- 容量统计（十进制 GB）
+
+@pytest.mark.parametrize("num_bytes,expected", [
+    # 🔑 十进制：1 GB = 1000³ 字节。用 1024³ 会算出 0.93，与云存储账单对不上。
+    (1_000_000_000, 1.0),
+    (2_500_000_000, 2.5),
+    (1_073_741_824, 1.073741824),   # 正好是 1 GiB，十进制下 > 1 GB
+    (0, 0.0),
+    (None, 0.0),
+])
+def test_bytes_to_gb_uses_decimal_units(num_bytes, expected):
+    assert d.bytes_to_gb(num_bytes) == pytest.approx(expected)
+
+
+def test_one_gib_is_more_than_one_gb():
+    """护栏：若有人改回 1024 进制，这条会立刻红。"""
+    assert d.bytes_to_gb(1024 ** 3) > 1.0
+    assert d.bytes_to_gb(1000 ** 3) == 1.0
+
+
+@pytest.mark.parametrize("num_bytes,expected", [
+    (0, "0 B"),
+    (512, "512 B"),
+    (1_500, "1.50 KB"),
+    (2_000_000, "2.00 MB"),
+    (3_500_000_000, "3.50 GB"),
+    (1_200_000_000_000, "1.20 TB"),
+])
+def test_format_size_is_decimal(num_bytes, expected):
+    assert d.format_size(num_bytes) == expected
+
+
+def test_finalize_records_file_size(sandbox, monkeypatch):
+    """成品字节数必须在 finalize 阶段落进 success_info —— 上传成功后本地文件
+    就删了，事后再想统计只能去 R2 查。"""
+    monkeypatch.setattr(d, "convert_ts_to_mp4", lambda src, dst: True)
+    video = os.path.join(str(sandbox), "out.mp4")
+    with open(video, "wb") as fh:
+        fh.write(b"x" * 12345)
+    monkeypatch.setattr(
+        d, "move_to_target_folder", lambda p, i, y=None: video
+    )
+
+    job = {
+        "tmdbId": "55", "normalized_id": "55", "title": "T", "year": 2000,
+        "url": "https://a/1.m3u8",
+        "final_ts": os.path.join(str(sandbox), "t.ts"),
+        "temp_mp4": os.path.join(str(sandbox), "t.mp4"),
+        "cleanup_paths": [], "bitrate_kbps": 2000,
+        "resolution": "1920x1080",
+        "missing_segment_count": 0, "missing_segment_indices": [],
+        "captions": [], "entry": {},
+    }
+    _, ok, info = d.finalize_one_entry(job, set())
+    assert ok is True
+    assert info["file_size_bytes"] == 12345
+
+
+def test_report_storage_sums_uploaded_only(sandbox, capsys):
+    """只统计已上传的；同一 tmdbId 多条记录按最后一条计，不重复累加。"""
+    with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
+        for record in [
+            {"tmdbId": "1", "uploaded": True, "file_size_bytes": 1_000_000_000},
+            {"tmdbId": "2", "uploaded": True, "file_size_bytes": 500_000_000},
+            # 未上传：单独归到"仅在本地"，不进 R2 总量
+            {"tmdbId": "3", "uploaded": False, "file_size_bytes": 900_000_000},
+            # 同一部片的补传记录，应覆盖而非叠加
+            {"tmdbId": "1", "uploaded": True, "file_size_bytes": 1_000_000_000},
+            "坏行不是 json",
+        ]:
+            fh.write((record if isinstance(record, str)
+                      else json.dumps(record)) + "\n")
+
+    d.report_storage()
+    out = capsys.readouterr().out
+    assert "影片总数: 3" in out
+    assert "已上传 R2: 2 部，1.50 GB" in out
+    assert "仅在本地: 1 部，0.90 GB" in out
+    assert "合计: 2.40 GB" in out
+    assert "平均每部: 0.75 GB" in out
+    assert "跳过 1 行" in out
+
+
+def test_report_storage_flags_legacy_records(sandbox, capsys):
+    """本功能上线前的旧记录没有 file_size_bytes，必须显式提示而非静默少算。"""
+    with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "1", "uploaded": True}) + "\n")
+        fh.write(json.dumps({
+            "tmdbId": "2", "uploaded": True, "file_size_bytes": 2_000_000_000,
+        }) + "\n")
+
+    d.report_storage()
+    out = capsys.readouterr().out
+    assert "已上传 R2: 2 部，2.00 GB" in out
+    assert "1 部没有 file_size_bytes" in out
+    # 平均值分母只算有大小的那部，不被旧记录拉低
+    assert "平均每部: 2.00 GB" in out
+
+
+def test_report_storage_without_log(sandbox, monkeypatch, capsys):
+    monkeypatch.setattr(d, "SUCCESS_LOG", str(sandbox / "nope.jsonl"))
+    d.report_storage()
+    assert "无可统计的成品" in capsys.readouterr().out
 
 
 def test_unknown_resolution_constant_matches_literals():
