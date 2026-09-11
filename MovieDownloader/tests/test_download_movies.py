@@ -1856,6 +1856,131 @@ def test_report_storage_without_log(sandbox, monkeypatch, capsys):
     assert "无可统计的成品" in capsys.readouterr().out
 
 
+# ------------------------------------------ success.jsonl 的落库时间戳
+# 没有它的话，"某一次运行传了多少"只能靠日志留存，日志一丢就永久无法复原：
+# success.jsonl 按片去重覆盖写，里面只有终态，看不出哪条属于哪次运行。
+# 2026-09-12 排查 run4 时实测踩过这个坑。
+
+def _write_success(records):
+    with open(d.SUCCESS_LOG, "w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+
+
+def test_upload_stamps_logged_at_on_every_path(sandbox, monkeypatch):
+    """三条写入路径都要盖章：未开上传 / 上传成功 / 上传失败。
+
+    漏掉任何一条，那部分片就永远落在时间过滤之外，统计口径直接失真。
+    """
+    monkeypatch.setattr(d, "SUCCESS_LOG", str(sandbox / "s.jsonl"))
+    video = os.path.join(str(sandbox), "v.mp4")
+    with open(video, "wb") as fh:
+        fh.write(b"x")
+
+    # 路径一：没开 S3
+    monkeypatch.setattr(d, "S3_ENABLED", False)
+    _, _, info = d.upload_one_entry(
+        {"tmdbId": "1", "final_path": video, "year": 2000}
+    )
+    assert isinstance(info["logged_at"], int)
+
+    # 路径二：上传成功
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "upload_to_r2", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(d, "upload_sidecar_assets", lambda *a, **k: [])
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", False)
+    _, _, info = d.upload_one_entry(
+        {"tmdbId": "2", "final_path": video, "year": 2000}
+    )
+    assert isinstance(info["logged_at"], int)
+
+    # 路径三：上传失败。这条路返回的是 {"error": ...} 而非 success_info，
+    # 所以要去 SUCCESS_LOG 里查——真正要紧的是**落库的那条记录**有没有盖章。
+    monkeypatch.setattr(d, "upload_to_r2", lambda *a, **k: (False, "boom"))
+    monkeypatch.setattr(d, "write_pending", lambda record: None)
+    d.upload_one_entry({"tmdbId": "3", "final_path": video, "year": 2000})
+
+    with open(d.SUCCESS_LOG, encoding="utf-8") as fh:
+        written = [json.loads(line) for line in fh if line.strip()]
+    assert len(written) == 3, "三条路径都该落库"
+    for record in written:
+        assert isinstance(record["logged_at"], int), record["tmdbId"]
+
+
+def test_report_storage_filters_by_days(sandbox, capsys):
+    """🔑 按天过滤：这是"上次那批传了多少"的唯一复原途径。"""
+    now = int(time.time())
+    _write_success([
+        {"tmdbId": "1", "uploaded": True, "file_size_bytes": 1_000_000_000,
+         "logged_at": now - 3600},              # 1 小时前
+        {"tmdbId": "2", "uploaded": True, "file_size_bytes": 2_000_000_000,
+         "logged_at": now - 10 * 86400},        # 10 天前
+    ])
+
+    d.report_storage(since_days=1)
+    out = capsys.readouterr().out
+    assert "最近 1 天" in out
+    assert "已上传 R2: 1 部，1.00 GB" in out, "10 天前那部不该被算进来"
+
+
+def test_report_storage_without_days_keeps_all_history(sandbox, capsys):
+    """不给天数就是全量，行为与加时间戳之前完全一致。"""
+    now = int(time.time())
+    _write_success([
+        {"tmdbId": "1", "uploaded": True, "file_size_bytes": 1_000_000_000,
+         "logged_at": now - 3600},
+        {"tmdbId": "2", "uploaded": True, "file_size_bytes": 2_000_000_000,
+         "logged_at": now - 10 * 86400},
+    ])
+
+    d.report_storage()
+    out = capsys.readouterr().out
+    assert "全部历史" in out
+    assert "已上传 R2: 2 部，3.00 GB" in out
+
+
+def test_report_storage_excludes_undated_records_from_time_window(
+    sandbox, capsys
+):
+    """🔑 缺 logged_at 的老记录必须排除，并显式报数。
+
+    把它们算进"最近 N 天"会让这个口径变成谎话——它们的落库时间根本无从得知，
+    默默计入等于凭空给这次运行加量。
+    """
+    now = int(time.time())
+    _write_success([
+        {"tmdbId": "1", "uploaded": True, "file_size_bytes": 1_000_000_000,
+         "logged_at": now - 3600},
+        {"tmdbId": "2", "uploaded": True, "file_size_bytes": 5_000_000_000},
+    ])
+
+    d.report_storage(since_days=1)
+    out = capsys.readouterr().out
+    assert "已上传 R2: 1 部，1.00 GB" in out
+    assert "1 部没有 logged_at 字段" in out
+
+
+def test_reupload_stamps_its_own_time(reupload_env, capsys):
+    """补传要记补传发生的时刻，不能沿用原下载时间。
+
+    否则按时间段统计时，这部片会被算进当初那次下载运行里，
+    而它其实是这次才补上去的。
+    """
+    path = _make_local_video(reupload_env, "1", 100)
+    _write_pending([
+        {"tmdbId": "1", "local_path": path, "year": 2000,
+         "file_size_bytes": 1_000_000_000},
+    ])
+
+    before = int(time.time())
+    d.reupload_pending()
+
+    with open(d.SUCCESS_LOG, encoding="utf-8") as fh:
+        record = json.loads(fh.read().strip())
+    assert record["reupload"] is True
+    assert record["logged_at"] >= before
+
+
 # ------------------------------------------ 容量累加器（跨重试/跨阶段不漏不重）
 
 def test_add_upload_volume_splits_sized_and_unsized():

@@ -4044,6 +4044,14 @@ def upload_one_entry(success_info):
     """
     tmdb_id = success_info["tmdbId"]
     local_path = success_info["final_path"]
+    # 落库时间戳（Unix 秒）。在这里统一盖章，下面三条写入路径
+    # （未开上传 / 上传成功 / 上传失败）就都带上了，不会漏。
+    #
+    # 为什么需要它：没有时间戳的话，"某一次运行传了多少"只能靠日志留存，
+    # 日志一丢就**永久无法复原**——success.jsonl 是按片去重覆盖写的，
+    # 里面只有终态，看不出哪条属于哪次运行。2026-09-12 实测踩过这个坑。
+    # 用 int 秒而非格式化字符串：与 dead_at 同口径，便于直接做区间比较。
+    success_info["logged_at"] = int(time.time())
     if not S3_ENABLED:
         success_info["uploaded"] = False
         write_log(SUCCESS_LOG, success_info)
@@ -4312,7 +4320,8 @@ def main():
             print("本次运行没有新增上传。")
         print(
             "提示：查看所有历次运行的累计容量，跑 "
-            "`python download_movies.py storage`"
+            "`python download_movies.py storage`；"
+            "只看最近一天的，跑 `... storage 1`"
         )
 
 
@@ -5126,6 +5135,10 @@ def reupload_pending():
                 "file_size_bytes": file_size,
                 "uploaded": True,
                 "reupload": True,
+                # 补传是独立于主流程的一次落库，时间戳要按**补传发生的时刻**记，
+                # 而不是沿用原下载时间——否则按时间段统计容量时，这部片会被
+                # 算进当初那次下载运行里，而它其实是这次补上去的。
+                "logged_at": int(time.time()),
             })
             remove_upload_failure_from_log(tmdb_id)
             success_count += 1
@@ -5155,11 +5168,14 @@ def reupload_pending():
     return volume
 
 
-def report_storage():
+def report_storage(since_days=None):
     """汇总 success.jsonl，打印已上传成品的累计容量（十进制 GB）。
 
     只读，不碰任何文件。同一 tmdbId 多条记录（补传会覆盖写）按最后一条计，
     避免把同一部片算两遍。
+
+    since_days 给定时只统计最近 N 天落库的片（按 logged_at）。这是给
+    "上次那批到底传了多少"用的——日志滚掉之后，这里是唯一的复原途径。
     """
     if not os.path.exists(SUCCESS_LOG):
         print(f"找不到 {SUCCESS_LOG}，无可统计的成品。")
@@ -5181,6 +5197,21 @@ def report_storage():
             if tmdb_id is not None:
                 latest[str(tmdb_id)] = record
 
+    # 时间过滤：缺 logged_at 的老记录一律排除（它们的落库时间无从得知，
+    # 放进来会让"最近 N 天"这个口径变成谎话），并单独报数说明排除了多少。
+    undated = 0
+    if since_days is not None:
+        cutoff = time.time() - since_days * 86400
+        kept = {}
+        for tmdb_id, record in latest.items():
+            stamp = record.get("logged_at")
+            if not isinstance(stamp, (int, float)):
+                undated += 1
+                continue
+            if stamp >= cutoff:
+                kept[tmdb_id] = record
+        latest = kept
+
     uploaded_bytes = uploaded_count = uploaded_sized = 0
     local_bytes = local_count = 0
     unsized = 0
@@ -5199,7 +5230,9 @@ def report_storage():
             if size:
                 local_bytes += size
 
-    print(f"===== 成品容量统计（{SUCCESS_LOG}）=====")
+    # 天数用 :g 格式化：整数天显示 "1" 而不是 "1.0"，半天仍能显示 "0.5"。
+    scope = f"最近 {since_days:g} 天" if since_days is not None else "全部历史"
+    print(f"===== 成品容量统计（{SUCCESS_LOG}，{scope}）=====")
     print(f"影片总数: {len(latest)}")
     print(
         f"已上传 R2: {uploaded_count} 部，"
@@ -5221,6 +5254,11 @@ def report_storage():
             f"⚠️ {unsized} 部没有 file_size_bytes 字段（本功能上线前下载的），"
             f"未计入容量"
         )
+    if undated:
+        print(
+            f"⚠️ {undated} 部没有 logged_at 字段（本功能上线前下载的），"
+            f"无法判断落库时间，未纳入本次时间范围"
+        )
     if bad_lines:
         print(f"⚠️ 跳过 {bad_lines} 行无法解析的记录")
 
@@ -5229,7 +5267,19 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reupload":
         reupload_pending()
     elif len(sys.argv) > 1 and sys.argv[1] == "storage":
-        report_storage()
+        # 可选的天数过滤：`storage 1` = 只看最近 1 天落库的片。
+        # 参数非法就直接拒绝，不静默退回全量——那会让人把全量数字当成单次运行量。
+        _since = None
+        if len(sys.argv) > 2:
+            try:
+                _since = float(sys.argv[2])
+                if _since <= 0:
+                    raise ValueError
+            except ValueError:
+                print(f"错误: 天数必须是正数，收到 {sys.argv[2]!r}")
+                print("用法: python download_movies.py storage [天数]")
+                raise SystemExit(2)
+        report_storage(_since)
     else:
         # 沿用既有的裸 sys.argv 分派风格（本文件一直没有引入 argparse）。
         # 两个开关可叠加：--retry-only --retry-dead。
@@ -5242,7 +5292,7 @@ if __name__ == "__main__":
             print(f"错误: 无法识别的参数 {' '.join(sorted(_unknown))}")
             print("用法: python download_movies.py [--retry-only] [--retry-dead]")
             print("      python download_movies.py reupload")
-            print("      python download_movies.py storage")
+            print("      python download_movies.py storage [天数]")
             raise SystemExit(2)
         if RETRY_ONLY_MODE:
             print(
