@@ -567,3 +567,33 @@ def test_ass_body_declared_as_srt_is_not_written_as_srt(sandbox):
     assert saved == ["en.ass"], "必须识破并按 ass 原样保存"
     assert not os.path.exists(os.path.join(target, "en.srt"))
     assert not os.path.exists(os.path.join(target, "en.vtt"))
+
+
+# ------------------------------------------------------- API Key 的读取来源
+
+def test_config_api_key_is_read_when_env_is_absent(tmp_path, monkeypatch):
+    """.env 没配时回退读 config.yaml 的 fetch_subtitles.subdl_api_key。"""
+    (tmp_path / "config.yaml").write_text(
+        "fetch_subtitles:\n  subdl_api_key: \"from-config\"\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(f, "_SCRIPT_DIR", tmp_path)
+    assert f._config_api_key() == "from-config"
+
+
+@pytest.mark.parametrize("content", [
+    "fetch_subtitles:\n  subdl_api_key: \"\"\n",   # 留空（推荐写法）
+    "fetch_subtitles: {}\n",                        # 没有该键
+    "download_movies:\n  base_dir: x\n",            # 整段都不存在
+    "这不是 : : 合法的 yaml : [\n",                  # 坏文件
+])
+def test_config_api_key_degrades_quietly(tmp_path, monkeypatch, content):
+    """配置缺失/损坏一律当没配，绝不抛异常 —— 字幕是可有可无的步骤。"""
+    (tmp_path / "config.yaml").write_text(content, encoding="utf-8")
+    monkeypatch.setattr(f, "_SCRIPT_DIR", tmp_path)
+    assert f._config_api_key() == ""
+
+
+def test_missing_config_file_is_not_an_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(f, "_SCRIPT_DIR", tmp_path / "nowhere")
+    assert f._config_api_key() == ""

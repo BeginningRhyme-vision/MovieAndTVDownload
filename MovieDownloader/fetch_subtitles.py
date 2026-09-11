@@ -44,6 +44,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
+import yaml
 
 from pathlib import Path
 
@@ -77,16 +78,35 @@ _load_dotenv(str(Path(__file__).with_name(".env")))
 # 脚本所在目录（MovieDownloader/），作为相对路径与默认目录的根。
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
+
+def _config_api_key():
+    """从 config.yaml 的 fetch_subtitles 段读 key，作为 .env 缺失时的回退。
+
+    刻意不复用 dm.load_config()：那个函数写死了只返回 download_movies 段。
+    读不到/格式坏掉一律当没配，绝不因为配置文件问题让整个脚本崩掉 ——
+    字幕本就是可有可无的附属步骤。
+    """
+    try:
+        with open(_SCRIPT_DIR / "config.yaml", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        section = data.get("fetch_subtitles") or {}
+        return str(section.get("subdl_api_key") or "").strip()
+    except Exception:  # noqa: BLE001 - 配置读不到不是错误
+        return ""
+
+
 # ========== 配置 ==========
-# SubDL API Key：敏感项，优先环境变量 SUBDL_API_KEY（同目录 .env）。
-# 在 https://subdl.com/panel/api 免费申请后填入 .env。
-SUBDL_API_KEY = os.environ.get("SUBDL_API_KEY", "").strip()
+# SubDL API Key：敏感项。环境变量 / 同目录 .env 优先，config.yaml 仅作本地
+# 调试回退 —— config.yaml 会进版本库，填在那里等于把 key 公开推到远端。
+# 免费申请：https://subdl.com/panel/api
+SUBDL_API_KEY = os.environ.get("SUBDL_API_KEY", "").strip() or _config_api_key()
 
 SUCCESS_LOG = dm.SUCCESS_LOG
 STATE_LOG = str(_SCRIPT_DIR / "subtitles.jsonl")
 
-# 目录结构、语种白名单、输出格式全部复用 download_movies（单一事实来源）。
-# 语种白名单来自 config.yaml 的 assets.subtitle_languages。
+# 目录结构、语种白名单、输出格式全部复用 download_movies（单一事实来源）：
+# 补来的字幕必须与下载侧落在同一个地方、用同一套格式，否则前端按同前缀
+# 列举时会拿到对不上的东西。要改语种/格式请改 download_movies.assets 段。
 SUBTITLE_LANGUAGES = dm.SUBTITLE_LANGUAGES
 SUBTITLE_FORMATS = dm.SUBTITLE_FORMATS
 
