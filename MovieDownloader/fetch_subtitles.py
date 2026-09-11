@@ -129,6 +129,45 @@ state_lock = threading.Lock()
 # 是否把字幕写进 R2。下载侧开了上传就必须走 R2 —— 本地影片目录早被删了。
 REMOTE_MODE = dm.S3_ENABLED
 
+# SubDL 免费账号每天只能**下载** 50 个字幕（搜索不受限）。额度用尽后所有下载
+# 一律 429，且当天不会恢复。2026-09-12 实测响应体：
+#   {"error":"api_download_limit_exceeded","limit":50,
+#    "retryAfterSeconds":13728,"resetAt":"2026-09-12T00:00:00.000Z"}
+# 这是**确定性**失败，必须与"源站没这个语种"严格区分开（见 QuotaExhausted）。
+QUOTA_ERROR_CODE = "api_download_limit_exceeded"
+
+# 一旦确认"继续请求也没意义"就置位，所有还没开跑的片直接跳过。
+# 两种触发原因：下载额度耗尽、搜索接口持续限流（重试完仍 429）。
+# 不置位的话：剩下几十部会各自再发若干次注定失败的 HTTP，还要被
+# request_with_retry 各重试 3 次、白等 9 秒，最后把接口问题记成"源站没字幕"。
+stop_fetching = threading.Event()
+
+# 置位原因，供 download_one 如实报告跳过的理由（而不是笼统说"额度耗尽"）。
+# 只在第一次置位时写入，之后只读；配 stop_reason_lock 防并发下写花。
+stop_reason = {}
+stop_reason_lock = threading.Lock()
+
+
+def _signal_stop(status, error, reset_at=None):
+    """记录停止原因并置位全局闸门。重复调用只保留第一个原因。"""
+    with stop_reason_lock:
+        if not stop_reason:
+            stop_reason.update({"status": status, "error": error})
+            if reset_at:
+                stop_reason["quotaResetAt"] = reset_at
+    stop_fetching.set()
+
+
+def _redact(text):
+    """把日志里的 api_key 抹掉。
+
+    ⚠️ 不是可选的洁癖：requests 的 HTTPError 消息里**带完整请求 url**，而
+    搜索接口的 key 就在 query 里。2026-09-12 实测，一条 429 报错就把
+    `api_key=subdl_xxx` 原样写进了日志文件——日志经常要贴出来排查，等于泄露
+    凭证。所有对外打印的异常文本都必须过这一道。
+    """
+    return re.sub(r"(api_key=)[^&\s\"']+", r"\1REDACTED", str(text))
+
 # SRT/VTT 的时间轴特征：两个时间戳夹一个 -->。秒与毫秒之间 SRT 用逗号、
 # VTT 用点号，两者都认；小时段可有可无（源站两种写法都出现过）。
 # 用于 _sniff_format 在没有 WEBVTT 头、也没有 ASS 节标题时确认这是字幕正文。
@@ -300,19 +339,87 @@ def load_entries():
     return list(entries.values())
 
 
+class QuotaExhausted(Exception):
+    """SubDL 当日下载额度已用尽。
+
+    单列一个异常类型，是为了让这类失败在日志里**与"源站没这个语种"彻底分开**。
+    2026-09-12 的教训：两者当时都落进 result["missing"]，打印出来都是
+    「已保存 [] 缺失 ['zh']」，完全同形。结果一次额度耗尽的空跑被误判成
+    "补字幕功能坏了"，排查了很久才发现是配额问题。
+
+    它还是**确定性**失败：重试、换片、等几分钟都没用，当天就是没额度了。
+    故：不重试、立刻置位全局标志、让主流程尽快收尾。
+    """
+
+    def __init__(self, message, retry_after=None, reset_at=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.reset_at = reset_at
+
+
+class SearchThrottled(Exception):
+    """搜索接口被持续限流（重试用尽后仍是 429）。
+
+    与 QuotaExhausted 是同一个病的两处发作，处置也相同（停下来、明确报告），
+    但**成因不同**，故单列一类：
+      - QuotaExhausted：下载额度 50/天 用尽，当天绝不恢复；
+      - SearchThrottled：api.subdl.com 的速率限制，性质上可能过一阵就好。
+
+    2026-09-12 实测：下载额度耗尽后，搜索接口也开始返 429。它走的是
+    raise_for_status，于是被归进 search_failed —— 和真正的"SubDL 库里没有这个
+    tmdb_id"（错误消息 can't find movie or tv）混在一起，把那个统计数字弄脏了。
+    """
+
+
+def _parse_quota_error(response):
+    """从 429 响应里辨认「当日额度用尽」，是则返回 QuotaExhausted，否则 None。
+
+    只认 SubDL 明确给出的 error 码，不靠状态码猜——429 也可能是短时并发限流
+    （那种等一会儿就能恢复，该走正常重试）。两者处置方式相反，不能混为一谈。
+    """
+    if response is None or response.status_code != 429:
+        return None
+    try:
+        data = response.json()
+    except Exception:  # noqa: BLE001 - 不是 JSON 就不是这个错误
+        return None
+    if not isinstance(data, dict) or data.get("error") != QUOTA_ERROR_CODE:
+        return None
+    return QuotaExhausted(
+        data.get("message") or "SubDL 当日下载额度已用尽",
+        retry_after=data.get("retryAfterSeconds"),
+        reset_at=data.get("resetAt"),
+    )
+
+
 def request_with_retry(method, url, **kwargs):
     last_error = None
+    last_status = None
     for attempt in range(RETRY_MAX):
         try:
             response = requests.request(
                 method, url, timeout=REQUEST_TIMEOUT, **kwargs
             )
+            # 额度耗尽要在 raise_for_status 之前拦截：一旦抛成普通 HTTPError，
+            # 就会被当作可重试的瞬时错误，白白重试 3 次。
+            quota = _parse_quota_error(response)
+            if quota is not None:
+                response.close()
+                raise quota
+            last_status = response.status_code
             response.raise_for_status()
             return response
+        except QuotaExhausted:
+            # 确定性失败，重试毫无意义，直接上抛让调用方停下来。
+            raise
         except Exception as exc:
             last_error = exc
             if attempt < RETRY_MAX - 1:
                 time.sleep(RETRY_DELAY * (attempt + 1))
+    # 重试全部用尽仍是 429：这不是瞬时抖动，而是真的被限流了。
+    # 单列一类上抛，调用方才能与"这个片源站没有"区分开（后者是 404/业务错误）。
+    if last_status == 429:
+        raise SearchThrottled(_redact(last_error))
     raise last_error
 
 
@@ -349,6 +456,18 @@ def pick_best(subtitles, language):
         if item.get("url"):
             return item
     return None
+
+
+def _download_params(url):
+    """决定下载请求要不要再带 api_key。
+
+    SubDL 返回的 `url` 字段**已经自带** `?api_key=...`（2026-09-12 实测）。
+    再通过 params 追加一个，最终请求会变成
+        /subtitle/xxx.zip?api_key=K&api_key=K
+    —— 重复的鉴权参数，服务端目前容忍，但这是明确的错误拼装，且让日志里的
+    url 长得离谱、排查时极难阅读。故：自带就不再追加。
+    """
+    return None if "api_key=" in url else {"api_key": SUBDL_API_KEY}
 
 
 def extract_srt(zip_bytes):
@@ -457,6 +576,12 @@ def download_one(entry):
     tmdb_id = entry["tmdbId"]
     year = entry.get("year")
 
+    # 全局闸门已落：后面的片一律直接跳过。继续跑只会让每部片各发若干次注定
+    # 失败的请求，白等重试间隔，还会把接口问题记成「源站缺这个语种」。
+    # 如实沿用置位时的原因（额度耗尽 / 搜索限流），不笼统归成一种。
+    if stop_fetching.is_set():
+        return tmdb_id, dict(stop_reason) or {"status": "quota_exhausted"}
+
     # 第一步：确定还缺哪些语种。R2 模式下**必须问 R2** —— 本地影片目录在
     # 视频上传成功那一刻就被删了，扫本地只会得到空集，把每部片都当成缺口。
     if REMOTE_MODE:
@@ -498,8 +623,24 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
     """把 pending 里各语种的字幕抓进 target_dir；R2 模式下再上传并更新 meta。"""
     try:
         subtitles = search_subtitles(tmdb_id)
+    except SearchThrottled as exc:
+        # 搜索被限流：这一部**压根没查成**，与"SubDL 库里没有这个 tmdb_id"
+        # 完全不同。混进 search_failed 会把那个统计弄脏（真查不到的片
+        # 值得从待办里剔除，被限流的片下次还要再试）。同样要让整批停下来 ——
+        # 限流是全局状态，继续跑只是把剩下的片一部部撞死在同一面墙上。
+        _signal_stop("search_throttled", str(exc))
+        return {"status": "search_throttled", "error": str(exc),
+                "unattempted": list(pending)}
+    except QuotaExhausted as exc:
+        # 搜索接口也可能直接给出额度错误，按额度耗尽处置。
+        _signal_stop("quota_exhausted", str(exc), exc.reset_at)
+        result = {"status": "quota_exhausted", "error": str(exc),
+                  "saved": [], "missing": [], "unattempted": list(pending)}
+        if exc.reset_at:
+            result["quotaResetAt"] = exc.reset_at
+        return result
     except Exception as exc:  # noqa: BLE001 - 查询失败只跳过这一部
-        return {"status": "search_failed", "error": str(exc)}
+        return {"status": "search_failed", "error": _redact(exc)}
 
     result = {"status": "ok", "saved": [], "missing": []}
 
@@ -510,10 +651,11 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
             result["missing"].append(language)
             continue
 
+        download_url = DOWNLOAD_BASE + picked["url"]
         try:
             response = request_with_retry(
-                "GET", DOWNLOAD_BASE + picked["url"],
-                params={"api_key": SUBDL_API_KEY},
+                "GET", download_url,
+                params=_download_params(picked["url"]),
                 stream=True,
             )
             # 流式累加 + 超限即断：字幕 zip 正常几十 KB，若源站给回一个大文件，
@@ -544,9 +686,38 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
                 result["saved"].extend(saved)
             else:
                 result["missing"].append(language)
+        except QuotaExhausted as exc:
+            # 额度耗尽：置位全局闸门让后续影片直接跳过，并**立刻停止本片**剩下
+            # 的语种——它们同样一个都拿不到。
+            # 绝不把这个语种记进 missing：missing 的语义是"源站没有"，而这里是
+            # "我们没额度取"。混进去就等于把配额问题伪装成源站缺字幕，下次运行
+            # 会以为已经查过了（实际压根没查成），这正是本次排查踩的坑。
+            _signal_stop("quota_exhausted", str(exc), exc.reset_at)
+            result["status"] = "quota_exhausted"
+            result["error"] = str(exc)
+            if exc.reset_at:
+                result["quotaResetAt"] = exc.reset_at
+            # 本片未取到的语种要如实标出来，供下次运行继续尝试。
+            result["unattempted"] = [
+                lang for lang in pending
+                if lang not in result["missing"]
+                and not any(s.startswith(f"{lang}.") for s in result["saved"])
+            ]
+            break
+        except SearchThrottled as exc:
+            # 下载接口被持续限流，处置同上：停下来、如实标注未尝试的语种。
+            _signal_stop("search_throttled", str(exc))
+            result["status"] = "search_throttled"
+            result["error"] = str(exc)
+            result["unattempted"] = [
+                lang for lang in pending
+                if lang not in result["missing"]
+                and not any(s.startswith(f"{lang}.") for s in result["saved"])
+            ]
+            break
         except Exception as exc:  # noqa: BLE001 - 单语种失败不影响其它语种
             result["missing"].append(language)
-            result.setdefault("errors", []).append(f"{language}: {exc}")
+            result.setdefault("errors", []).append(f"{language}: {_redact(exc)}")
 
     if REMOTE_MODE and result["saved"]:
         uploaded = _upload_subtitles(tmdb_id, year, target_dir, result["saved"])
@@ -555,7 +726,9 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
         result["saved"] = uploaded
         if uploaded:
             result["metaUpdated"] = _update_remote_meta(tmdb_id, year, uploaded)
-        else:
+        elif result["status"] == "ok":
+            # 只在还没有更要紧的结论时才改写：额度耗尽是全局性的，
+            # 不该被一次上传失败盖掉（否则日志里看不出该停了）。
             result["status"] = "upload_failed"
 
     return result
@@ -611,6 +784,12 @@ def main():
 
     stats = {}
     saved_count = 0
+    stop_announced = False
+    # 收尾提示要用的两项，从**结果**里取而不是读 stop_reason：
+    # stop_reason 只有在本进程内真正触发过 _signal_stop 时才有值，而结果字典
+    # 是每条记录自带的，两者不总是同步（例如首片就被拦下的极端时序）。
+    quota_reset_at = None
+    blocked_kinds = set()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(download_one, entry): entry for entry in entries}
@@ -620,9 +799,9 @@ def main():
                 tmdb_id, result = future.result()
             except Exception as exc:  # noqa: BLE001 - 单片异常不能带塌整批
                 tmdb_id = entry.get("tmdbId")
-                result = {"status": "failed", "error": str(exc)}
-                print(f"[{index}/{len(entries)}] {tmdb_id} 异常（已跳过）: {exc}",
-                      flush=True)
+                result = {"status": "failed", "error": _redact(exc)}
+                print(f"[{index}/{len(entries)}] {tmdb_id} 异常（已跳过）: "
+                      f"{_redact(exc)}", flush=True)
 
             stats[result["status"]] = stats.get(result["status"], 0) + 1
             saved_count += len(result.get("saved", []))
@@ -641,8 +820,46 @@ def main():
                     f"{result['error']}",
                     flush=True,
                 )
+            elif result["status"] in ("quota_exhausted", "search_throttled"):
+                blocked_kinds.add(result["status"])
+                if result.get("quotaResetAt"):
+                    quota_reset_at = result["quotaResetAt"]
+                # 只在第一次撞上时刷一条醒目提示。后续都是被闸门拦下的静默跳过，
+                # 每部都打一遍只会把真正有用的信息冲掉。
+                if not stop_announced and result.get("error"):
+                    stop_announced = True
+                    if result["status"] == "quota_exhausted":
+                        what = "SubDL 当日下载额度已用尽"
+                        when = (f"额度重置时间(UTC): "
+                                f"{result.get('quotaResetAt') or '未提供'}")
+                    else:
+                        what = "SubDL 接口持续限流（重试已用尽）"
+                        when = "稍后重试即可（限流通常会自行恢复）"
+                    print(
+                        f"\n🛑 [{index}/{len(entries)}] {what}，剩余影片全部跳过。\n"
+                        f"   原因: {result['error']}\n"
+                        f"   {when}\n"
+                        f"   ⚠️ 这不是「源站没有字幕」——这些片一个都没查成，"
+                        f"恢复后再跑一次本脚本即可继续补。",
+                        flush=True,
+                    )
 
     print(f"\n完成。字幕文件 {saved_count} 个，统计: {stats}", flush=True)
+
+    # 把"因接口不可用而没补上"单独结账。它和 missing 完全是两件事，
+    # 混在一起看会让人误以为这些片在源站没有字幕、从此不再重试。
+    blocked = stats.get("quota_exhausted", 0) + stats.get("search_throttled", 0)
+    if blocked:
+        if "quota_exhausted" in blocked_kinds:
+            reason = f"当日额度耗尽，额度重置(UTC): {quota_reset_at or '未提供'}"
+        else:
+            reason = "接口限流，稍后重试即可"
+        print(
+            f"⚠️ 其中 {blocked} 部因 SubDL 接口不可用而未处理（{reason}）。\n"
+            f"   SubDL 免费账号每天 50 个下载；要一次补完更多片需升级 Pro，"
+            f"或每天跑一次本脚本逐步补齐。",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":

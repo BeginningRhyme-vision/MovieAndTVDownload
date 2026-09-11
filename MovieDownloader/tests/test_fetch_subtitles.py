@@ -8,9 +8,11 @@ import io
 import json
 import os
 import re
+import threading
 import zipfile
 
 import pytest
+import requests
 
 import fetch_subtitles as f
 
@@ -55,6 +57,11 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(f, "SUBDL_API_KEY", "TESTKEY")
     monkeypatch.setattr(f, "STATE_LOG", str(tmp_path / "subtitles.jsonl"))
     monkeypatch.setattr(f, "REMOTE_MODE", False)
+    # 停止闸门与其原因都是模块级共享状态。不换新的话，一旦某个用例把它置位，
+    # 后面所有用例的 download_one 都会直接返回跳过 —— 用例间互相污染，
+    # 且失败原因极难看出。
+    monkeypatch.setattr(f, "stop_fetching", threading.Event())
+    monkeypatch.setattr(f, "stop_reason", {})
     return tmp_path
 
 
@@ -597,3 +604,387 @@ def test_config_api_key_degrades_quietly(tmp_path, monkeypatch, content):
 def test_missing_config_file_is_not_an_error(tmp_path, monkeypatch):
     monkeypatch.setattr(f, "_SCRIPT_DIR", tmp_path / "nowhere")
     assert f._config_api_key() == ""
+
+
+# --------------------------------------------- SubDL 当日下载额度耗尽（50/天）
+# 2026-09-12 真机教训：一次运行 101 部、0 产出，日志里每部都写
+# 「已保存 [] 缺失 ['zh']」——与"源站没有中文字幕"完全同形，被误判成功能坏了。
+# 实际是免费额度 50/天 用尽：{"error":"api_download_limit_exceeded",...}。
+# 这组用例锁住三件事：识别、不重试、不污染 missing。
+
+def _quota_response():
+    """构造一个 SubDL 额度耗尽的 429 响应。"""
+    class _Resp:
+        status_code = 429
+
+        def json(self):
+            return {
+                "error": "api_download_limit_exceeded",
+                "message": "Free daily download limit reached (50/day).",
+                "limit": 50,
+                "retryAfterSeconds": 13728,
+                "resetAt": "2026-09-12T00:00:00.000Z",
+            }
+
+        def close(self):
+            pass
+
+    return _Resp()
+
+
+def test_quota_error_is_recognized_from_the_response_body():
+    """靠 error 码认，不靠状态码猜。"""
+    exc = f._parse_quota_error(_quota_response())
+    assert isinstance(exc, f.QuotaExhausted)
+    assert exc.retry_after == 13728
+    assert exc.reset_at == "2026-09-12T00:00:00.000Z"
+
+
+def test_plain_429_is_not_treated_as_quota_exhaustion():
+    """🔑 普通 429（短时并发限流）等一会儿就恢复，必须走正常重试。
+
+    把它误判成"额度耗尽"会让整批运行直接停摆——一次偶发抖动就报废全场。
+    """
+    class _Resp:
+        status_code = 429
+
+        def json(self):
+            return {"error": "rate_limited"}
+
+        def close(self):
+            pass
+
+    assert f._parse_quota_error(_Resp()) is None
+
+
+def test_non_json_429_is_not_treated_as_quota_exhaustion():
+    class _Resp:
+        status_code = 429
+
+        def json(self):
+            raise ValueError("not json")
+
+        def close(self):
+            pass
+
+    assert f._parse_quota_error(_Resp()) is None
+
+
+def test_quota_exhaustion_is_not_retried(sandbox, monkeypatch):
+    """额度耗尽是确定性失败，重试 3 次纯属白等 9 秒。"""
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(url)
+        return _quota_response()
+
+    monkeypatch.setattr(f.requests, "request", fake_request)
+    monkeypatch.setattr(f.time, "sleep", lambda _: pytest.fail("不该重试等待"))
+
+    with pytest.raises(f.QuotaExhausted):
+        f.request_with_retry("GET", "https://dl.subdl.com/x.zip")
+    assert len(calls) == 1, "只该发一次请求"
+
+
+def test_quota_exhaustion_does_not_pollute_missing(sandbox, monkeypatch):
+    """🔑 额度耗尽绝不能记进 missing。
+
+    missing 的语义是"源站没有这个语种"。把配额问题混进去，下次运行会以为
+    已经查过了（实际一次都没查成），这些片就永远补不上字幕了。
+    """
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+        {"language": "ZH", "url": "/zh.zip"},
+    ])
+
+    def fake_request(method, url, **kwargs):
+        raise f.QuotaExhausted("额度用尽", 13728, "2026-09-12T00:00:00.000Z")
+
+    monkeypatch.setattr(f, "request_with_retry", fake_request)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+
+    assert result["status"] == "quota_exhausted"
+    assert result["missing"] == [], "配额问题不是源站缺字幕"
+    assert sorted(result["unattempted"]) == ["en", "zh"]
+    assert result["quotaResetAt"] == "2026-09-12T00:00:00.000Z"
+
+
+def test_quota_exhaustion_stops_remaining_movies(sandbox, monkeypatch):
+    """撞上额度耗尽后，剩下的片直接跳过，不再发注定失败的请求。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+    ])
+    attempts = []
+
+    def fake_request(method, url, **kwargs):
+        attempts.append(url)
+        raise f.QuotaExhausted("额度用尽", 13728, "2026-09-12T00:00:00.000Z")
+
+    monkeypatch.setattr(f, "request_with_retry", fake_request)
+
+    _, first = f.download_one({"tmdbId": "1", "year": 2000})
+    assert first["status"] == "quota_exhausted"
+    assert len(attempts) == 1
+
+    # 第二部：标志已置位，必须一个请求都不发
+    _, second = f.download_one({"tmdbId": "2", "year": 2000})
+    assert second["status"] == "quota_exhausted"
+    assert len(attempts) == 1, "额度耗尽后不该再发请求"
+
+
+def test_quota_exhaustion_keeps_already_saved_subtitles(sandbox, monkeypatch):
+    """额度在中途用尽时，前面已经拿到的语种必须照常保留、照常落盘。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+        {"language": "ZH", "url": "/zh.zip"},
+    ])
+
+    def fake_request(method, url, **kwargs):
+        if "/en.zip" in url:
+            return _FakeZipResp(_zip_bytes({"m.srt": _SRT}))
+        raise f.QuotaExhausted("额度用尽", 13728, None)
+
+    monkeypatch.setattr(f, "request_with_retry", fake_request)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+
+    assert result["status"] == "quota_exhausted"
+    assert sorted(result["saved"]) == ["en.srt", "en.vtt"]
+    assert result["unattempted"] == ["zh"]
+    assert result["missing"] == []
+
+
+def test_quota_message_is_loud_and_counted(sandbox, monkeypatch, capsys):
+    """日志必须明确区分"没额度"与"源站没字幕"，并在收尾单独结账。"""
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "1", "title": "A", "year": 2000},
+        {"tmdbId": "2", "title": "B", "year": 2000},
+    ])
+
+    def fake_download(entry):
+        return entry["tmdbId"], {
+            "status": "quota_exhausted", "saved": [], "missing": [],
+            "error": "Free daily download limit reached (50/day).",
+            "quotaResetAt": "2026-09-12T00:00:00.000Z",
+        }
+
+    monkeypatch.setattr(f, "download_one", fake_download)
+    f.main()
+
+    out = capsys.readouterr().out
+    assert "当日下载额度已用尽" in out
+    assert "2026-09-12T00:00:00.000Z" in out
+    assert "这不是「源站没有字幕」" in out
+    assert "2 部因 SubDL 接口不可用而未处理" in out
+    assert "当日额度耗尽" in out
+
+
+# ------------------------------------------------------ 下载 url 的参数拼装
+
+def test_api_key_is_not_appended_when_url_already_has_it(sandbox):
+    """SubDL 返回的 url 自带 api_key，再追加会拼出 ?api_key=K&api_key=K。"""
+    assert f._download_params("/subtitle/1-2.zip?api_key=K") is None
+
+
+def test_api_key_is_appended_when_url_lacks_it(sandbox):
+    """url 不带 api_key 时仍要补上，否则请求不被鉴权。"""
+    assert f._download_params("/subtitle/1-2.zip") == {"api_key": "TESTKEY"}
+
+
+def test_download_request_carries_exactly_one_api_key(sandbox, monkeypatch):
+    """端到端护栏：最终请求里 api_key 只能出现一次。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/subtitle/1-2.zip?api_key=TESTKEY"},
+    ])
+    seen = {}
+
+    def fake_request(method, url, **kwargs):
+        seen["url"] = url
+        seen["params"] = kwargs.get("params")
+        return _FakeZipResp(_zip_bytes({"m.srt": _SRT}))
+
+    monkeypatch.setattr(f, "request_with_retry", fake_request)
+    f.download_one({"tmdbId": "55", "year": 2000})
+
+    assert seen["params"] is None
+    assert seen["url"].count("api_key=") == 1
+
+
+# ------------------------------------- 搜索接口被限流 ≠ 源站没有这个 tmdb_id
+# 2026-09-12 真机续集：下载额度耗尽后 api.subdl.com 也开始返 429。它走
+# raise_for_status，于是和真正的「can't find movie or tv」一起被归进
+# search_failed —— 那个统计数字从此不可信（真查不到的该剔除待办，被限流的
+# 下次还得再试）。且还白重试了 3 次。
+
+def _throttled_response():
+    """搜索接口的裸 429：没有 JSON 错误码，只有 HTTP 状态。"""
+    class _Resp:
+        status_code = 429
+
+        def json(self):
+            raise ValueError("not json")
+
+        def raise_for_status(self):
+            raise requests.HTTPError(
+                "429 Client Error: Too Many Requests for url: "
+                "https://api.subdl.com/api/v1/subtitles?api_key=subdl_SECRET"
+            )
+
+        def close(self):
+            pass
+
+    return _Resp()
+
+
+def test_persistent_429_becomes_search_throttled(sandbox, monkeypatch):
+    """重试用尽仍 429 -> SearchThrottled，而不是笼统的 HTTPError。"""
+    monkeypatch.setattr(
+        f.requests, "request", lambda *a, **k: _throttled_response()
+    )
+    monkeypatch.setattr(f.time, "sleep", lambda _: None)
+
+    with pytest.raises(f.SearchThrottled):
+        f.request_with_retry("GET", "https://api.subdl.com/api/v1/subtitles")
+
+
+def test_non_429_failure_still_raises_original_error(sandbox, monkeypatch):
+    """🔑 只有 429 才算限流。别的错误必须原样上抛，否则排查时看不到真因。"""
+    class _Resp:
+        status_code = 500
+
+        def json(self):
+            raise ValueError("not json")
+
+        def raise_for_status(self):
+            raise requests.HTTPError("500 Server Error")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(f.requests, "request", lambda *a, **k: _Resp())
+    monkeypatch.setattr(f.time, "sleep", lambda _: None)
+
+    with pytest.raises(requests.HTTPError, match="500"):
+        f.request_with_retry("GET", "https://api.subdl.com/api/v1/subtitles")
+
+
+def test_throttled_search_is_not_counted_as_search_failed(sandbox, monkeypatch):
+    """🔑 被限流的片必须与"SubDL 库里没有这个片"分开统计。
+
+    混进 search_failed 的后果：那个数字里混着两类完全不同的片，既没法据此
+    剔除真的查不到的，也看不出有多少片其实只是没查成、下次该重试。
+    """
+    def throttled(_tmdb_id):
+        raise f.SearchThrottled("429 Too Many Requests")
+
+    monkeypatch.setattr(f, "search_subtitles", throttled)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+
+    assert result["status"] == "search_throttled"
+    assert sorted(result["unattempted"]) == ["en", "zh"]
+    assert "missing" not in result or result["missing"] == []
+
+
+def test_throttled_search_stops_remaining_movies(sandbox, monkeypatch):
+    """限流是全局状态，剩下的片不该一部部撞死在同一面墙上。"""
+    calls = []
+
+    def throttled(tmdb_id):
+        calls.append(tmdb_id)
+        raise f.SearchThrottled("429 Too Many Requests")
+
+    monkeypatch.setattr(f, "search_subtitles", throttled)
+
+    _, first = f.download_one({"tmdbId": "1", "year": 2000})
+    assert first["status"] == "search_throttled"
+    assert len(calls) == 1
+
+    _, second = f.download_one({"tmdbId": "2", "year": 2000})
+    assert second["status"] == "search_throttled"
+    assert len(calls) == 1, "闸门落下后不该再查"
+
+
+def test_real_not_found_is_still_search_failed(sandbox, monkeypatch):
+    """回归护栏：真正查不到的片仍归 search_failed，没被这次改动带走。"""
+    def not_found(_tmdb_id):
+        raise RuntimeError("can't find movie or tv")
+
+    monkeypatch.setattr(f, "search_subtitles", not_found)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+
+    assert result["status"] == "search_failed"
+    assert "can't find movie or tv" in result["error"]
+
+
+def test_skipped_movies_report_the_actual_stop_reason(sandbox, monkeypatch):
+    """被闸门拦下的片要报真实原因，不能把限流笼统说成额度耗尽。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda _: (_ for _ in ()).throw(
+        f.SearchThrottled("429 Too Many Requests")
+    ))
+    f.download_one({"tmdbId": "1", "year": 2000})
+
+    _, second = f.download_one({"tmdbId": "2", "year": 2000})
+    assert second["status"] == "search_throttled"
+
+
+def test_throttle_message_distinguishes_itself_from_quota(
+    sandbox, monkeypatch, capsys
+):
+    """限流的收尾提示不能说"额度重置"——它跟额度没关系，稍后重试就行。"""
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "1", "title": "A", "year": 2000},
+    ])
+    monkeypatch.setattr(f, "download_one", lambda e: (e["tmdbId"], {
+        "status": "search_throttled", "error": "429 Too Many Requests",
+        "unattempted": ["en", "zh"],
+    }))
+    f.main()
+
+    out = capsys.readouterr().out
+    assert "持续限流" in out
+    assert "这不是「源站没有字幕」" in out
+    assert "1 部因 SubDL 接口不可用而未处理" in out
+    assert "额度重置" not in out, "限流与额度是两件事，不能混说"
+
+
+# --------------------------------------------------- 日志不得泄露 API Key
+# requests 的 HTTPError 消息里带完整请求 url，而搜索接口的 key 就在 query 里。
+# 日志经常要贴出来排查，原样打印等于泄露凭证。
+
+@pytest.mark.parametrize("text,must_not_contain", [
+    ("429 for url: https://api.subdl.com/x?api_key=subdl_SECRET", "subdl_SECRET"),
+    ("...?api_key=subdl_SECRET&tmdb_id=9794", "subdl_SECRET"),
+    ('{"url": "https://dl.subdl.com/a.zip?api_key=subdl_SECRET"}', "subdl_SECRET"),
+])
+def test_redact_removes_api_key(text, must_not_contain):
+    cleaned = f._redact(text)
+    assert must_not_contain not in cleaned
+    assert "api_key=REDACTED" in cleaned
+
+
+def test_redact_keeps_the_rest_of_the_message_intact():
+    """只抹 key，别的信息一个字都不能少——否则排查时失去线索。"""
+    cleaned = f._redact(
+        "429 Client Error: Too Many Requests for url: "
+        "https://api.subdl.com/api/v1/subtitles?api_key=subdl_X&tmdb_id=9794"
+    )
+    assert "429 Client Error: Too Many Requests" in cleaned
+    assert "tmdb_id=9794" in cleaned
+
+
+def test_search_failure_log_does_not_leak_the_key(sandbox, monkeypatch, capsys):
+    """端到端护栏：查询失败这条日志里不能出现明文 key。"""
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "1", "title": "A", "year": 2000},
+    ])
+
+    def leaky(_tmdb_id):
+        raise requests.HTTPError(
+            "429 for url: https://api.subdl.com/x?api_key=subdl_SECRET"
+        )
+
+    monkeypatch.setattr(f, "search_subtitles", leaky)
+    f.main()
+
+    out = capsys.readouterr().out
+    assert "subdl_SECRET" not in out
+    assert "api_key=REDACTED" in out
