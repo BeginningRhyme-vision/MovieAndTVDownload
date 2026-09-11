@@ -10,6 +10,7 @@ import threading
 import time
 
 import pytest
+import requests
 
 import download_movies as d
 
@@ -2335,3 +2336,445 @@ def test_download_segments_defaults_to_full_retry_budget(monkeypatch, tmp_path):
     seen.clear()
     d.download_segments(["u1"], str(out), concurrency=1, retry_max=3)
     assert seen == [3]
+
+
+# ------------------------------------------- 画质判死跨运行持久化（§12.26）
+
+def test_parse_dead_evidence_mode_b():
+    """模式 B（默认口径）的判死文案必须能抽出全部四项依据。"""
+    msg = d.bitrate_reject_message("1920x1080", "h264", 1364, 1600)
+    evidence = d.parse_dead_quality_evidence(msg)
+    assert evidence["bitrate_kbps"] == 1364
+    assert evidence["threshold_kbps"] == 1600
+    assert evidence["resolution"] == "1920x1080"
+    assert evidence["codec"] == "h264"
+
+
+def test_parse_dead_evidence_mode_a(monkeypatch):
+    """模式 A 的措辞把分辨率放在开头，同一个解析器也必须认得。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    msg = d.bitrate_reject_message("854x480", "hevc", 372, 951)
+    evidence = d.parse_dead_quality_evidence(msg)
+    assert evidence["bitrate_kbps"] == 372
+    assert evidence["threshold_kbps"] == 951
+    assert evidence["resolution"] == "854x480"
+    assert evidence["codec"] == "hevc"
+
+
+def test_parse_dead_evidence_survives_outer_summary_wrapper():
+    """真实落盘的是外层汇总文案（判死处把末节点错误嵌了进去）。
+    解析必须能穿透这层包装，否则线上一条依据都抽不出来。"""
+    inner = d.bitrate_reject_message("1280x536", "h264", 1229, 1600)
+    outer = (
+        "3 个节点中 2 个因画质不达标被确定性淘汰（≥ 阈值 0.50），"
+        "判定整片画质不达标；末节点错误：" + inner
+    )
+    evidence = d.parse_dead_quality_evidence(outer)
+    assert evidence["bitrate_kbps"] == 1229
+    assert evidence["resolution"] == "1280x536"
+
+
+def test_parse_dead_evidence_returns_none_without_bitrate():
+    """没有码率数值的判死（如分辨率红线）返回 None，不能编造依据。"""
+    assert d.parse_dead_quality_evidence("分辨率 640x360 低于红线 1080") is None
+    assert d.parse_dead_quality_evidence("") is None
+    assert d.parse_dead_quality_evidence(None) is None
+
+
+def test_is_quality_dead_requires_both_conditions():
+    """retriable=True 一律不算判死——多节点片里"某节点画质淘汰 + 某节点 502"
+    整片仍可重试，把它记进判死账本等于永久误杀。"""
+    quality_msg = d.bitrate_reject_message("640x360", "h264", 300, 1600)
+    assert d.is_quality_dead(False, quality_msg) is True
+    assert d.is_quality_dead(True, quality_msg) is False
+    # 确定性失败但与画质无关 → 不进判死账本（它们不受门槛变更影响）
+    assert d.is_quality_dead(False, "不支持的播放列表结构") is False
+    assert d.is_quality_dead(False, "缺少 tmdbId 或 urls") is False
+
+
+def test_record_and_load_dead_ids_round_trip(tmp_path, monkeypatch):
+    """落盘 → 读回，ID 必须能进跳过集，且依据字段完整。"""
+    dead_log = tmp_path / "download_dead.jsonl"
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+    msg = d.bitrate_reject_message("640x360", "h264", 300, 1600)
+
+    d.record_quality_dead("12345", "Some Movie", msg, urls=[{"url": "u"}])
+    assert d.load_dead_ids() == {"12345"}
+
+    record = json.loads(dead_log.read_text(encoding="utf-8").strip())
+    assert record["reason_class"] == "quality"
+    assert record["evidence"]["bitrate_kbps"] == 300
+    assert record["node_count"] == 1
+
+
+def test_load_dead_ids_missing_file_is_empty(tmp_path, monkeypatch):
+    """账本不存在（首次运行）不能炸，返回空集。"""
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(tmp_path / "nope.jsonl"))
+    assert d.load_dead_ids() == set()
+
+
+def test_load_dead_ids_skips_corrupt_lines(tmp_path, monkeypatch):
+    """半行/坏行（写盘中途被 kill）不能让整个账本读不出来。"""
+    dead_log = tmp_path / "dead.jsonl"
+    dead_log.write_text(
+        '{"tmdbId": "1"}\nnot json at all\n\n{"tmdbId": "2"}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+    assert d.load_dead_ids() == {"1", "2"}
+
+
+def test_retry_dead_revives_only_when_threshold_dropped_enough(
+    tmp_path, monkeypatch
+):
+    """门槛调松后才放回，且要过余量线——这是 --retry-dead 的核心语义。"""
+    dead_log = tmp_path / "dead.jsonl"
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.05)
+    # 当时实测 1364 kbps、门槛 1600（h264，1920x1080）
+    msg = d.bitrate_reject_message("1920x1080", "h264", 1364, 1600)
+    d.record_quality_dead("555", "", msg)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 2000.0})
+
+    # 门槛没变（2000×0.8=1600）→ 仍跳过
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+    assert d.load_dead_ids(d.dead_record_passes_now) == {"555"}
+
+    # 门槛 1300：1300×1.05 = 1365 > 1364，不够 → 继续跳过（防震荡）
+    monkeypatch.setattr(d, "LENIENCY", 0.65)
+    assert d.load_dead_ids(d.dead_record_passes_now) == {"555"}
+
+    # 门槛 1200：1200×1.05 = 1260 <= 1364 → 放回
+    monkeypatch.setattr(d, "LENIENCY", 0.6)
+    assert d.load_dead_ids(d.dead_record_passes_now) == set()
+
+
+def test_retry_dead_refuses_cross_mode_comparison(tmp_path, monkeypatch):
+    """跨模式复判必须拒绝：模式 A 按 (h/1080)² 缩放、模式 B 用绝对线，
+    两者门槛能差 5 倍，拿一个去复判另一个得到的结论没有意义。"""
+    dead_log = tmp_path / "dead.jsonl"
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+    monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.0)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 2000.0})
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+
+    # 在模式 B 下判死（绝对线 1600），实测 372
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    d.record_quality_dead(
+        "901", "", d.bitrate_reject_message("854x480", "h264", 372, 1600)
+    )
+
+    # 切到模式 A：门槛会变成 2000×(480/1080)²×0.8 ≈ 316 < 372，
+    # 若不做模式校验就会被放回；但那是另一套口径，必须拒绝。
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    assert d.load_dead_ids(d.dead_record_passes_now) == {"901"}, \
+        "跨模式复判未被拒绝，会按错误口径误放"
+
+    # 切回原模式：正常复判（门槛 1600 > 372，仍跳过）
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    assert d.load_dead_ids(d.dead_record_passes_now) == {"901"}
+
+
+def test_retry_dead_rejects_legacy_records_without_mode(tmp_path, monkeypatch):
+    """没有 resolution_check_enabled 字段的老记录（本次改动前落盘的）
+    无法确认口径，一律不放回。"""
+    dead_log = tmp_path / "dead.jsonl"
+    dead_log.write_text(
+        json.dumps({
+            "tmdbId": "902",
+            "evidence": {"bitrate_kbps": 300.0, "resolution": "640x360",
+                         "codec": "h264"},
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 100.0})
+    monkeypatch.setattr(d, "LENIENCY", 0.1)      # 门槛压到 10，远低于 300
+    # 门槛虽已远低于实测值，但缺模式字段 → 不放回
+    assert d.load_dead_ids(d.dead_record_passes_now) == {"902"}
+
+
+def test_retry_dead_blocks_zero_height_threshold_collapse(
+    tmp_path, monkeypatch
+):
+    """height 缺失时模式 A 的 (0/1080)²=0 会让门槛归零、恒真放回。
+    实跑中"未知分辨率"占 44%，不挡住会有大批记录被无条件放回白跑。"""
+    dead_log = tmp_path / "dead.jsonl"
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+    monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.05)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 2000.0})
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+
+    # evidence 有码率但没有 resolution（模式 B 探测失败时的真实形态）
+    dead_log.write_text(
+        json.dumps({
+            "tmdbId": "903",
+            "resolution_check_enabled": True,
+            "evidence": {"bitrate_kbps": 300.0, "codec": "h264"},
+        }, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    # 门槛若归零则 0×1.05 <= 300 恒真会放回；必须继续跳过
+    assert d.load_dead_ids(d.dead_record_passes_now) == {"903"}, \
+        "height=0 导致门槛归零，记录被无条件放回"
+
+
+def test_load_dead_ids_aggregates_by_id_not_line_order(tmp_path, monkeypatch):
+    """同一 id 的多条记录必须按合取裁决，不能让结论随追加顺序漂移：
+    任一条证明"仍不达标"就继续跳过。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.0)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 2000.0})
+    monkeypatch.setattr(d, "LENIENCY", 0.8)          # 门槛 1600
+
+    with_evidence = {
+        "tmdbId": "904",
+        "resolution_check_enabled": False,
+        # 300 kbps 远低于门槛 1600 → 这条判"仍不达标"
+        "evidence": {"bitrate_kbps": 300.0, "resolution": "640x360",
+                     "codec": "h264"},
+    }
+    without_evidence = {
+        "tmdbId": "904",
+        "resolution_check_enabled": False,
+        "evidence": {},                               # 这条判"可放回"
+    }
+
+    # 两种追加顺序，结论必须一致（都跳过）
+    for order in ([with_evidence, without_evidence],
+                  [without_evidence, with_evidence]):
+        dead_log = tmp_path / f"dead_{order.index(with_evidence)}.jsonl"
+        dead_log.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in order),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+        assert d.load_dead_ids(d.dead_record_passes_now) == {"904"}, \
+            f"结论随行序漂移了（顺序：{[bool(r['evidence']) for r in order]}）"
+        # 不复判时同样只算一个 id，不受重复行影响
+        assert d.load_dead_ids() == {"904"}
+
+
+def test_retry_dead_revives_records_without_evidence(tmp_path, monkeypatch):
+    """缺依据的记录无法证明现在仍不达标 → 放回，契合"宁可多下不误杀"。"""
+    dead_log = tmp_path / "dead.jsonl"
+    dead_log.write_text('{"tmdbId": "9", "evidence": {}}\n', encoding="utf-8")
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+    assert d.load_dead_ids() == {"9"}                          # 默认仍跳过
+    assert d.load_dead_ids(d.dead_record_passes_now) == set()   # 复判则放回
+
+
+def test_dead_log_only_covers_quality_categories():
+    """语义防混淆：判死账本只收画质类。源站故障/超时等绝不能进来，
+    否则"源站今天挂了"会被永久记成"这片不行"。"""
+    assert "画质整体不达标(判死)" in d._QUALITY_REJECT_CATEGORIES
+    assert "码率未达门槛" in d._QUALITY_REJECT_CATEGORIES
+    assert "分辨率低于红线" in d._QUALITY_REJECT_CATEGORIES
+    for category in ("源站5xx", "候选流无一入选", "确定性4xx", "超时"):
+        assert category not in d._QUALITY_REJECT_CATEGORIES
+
+
+# --------------------------------- m3u8 token 过期触发重取（§12.27）
+
+@pytest.mark.parametrize("status", [401, 403, 410])
+def test_request_with_retry_marks_expired_signature_for_refetch(
+    status, monkeypatch
+):
+    """m3u8 链路的签名过期必须带 marker，否则 --refetch-failed 挑不到它，
+    跨运行重试会因 token 大面积过期而失去意义。"""
+    monkeypatch.setattr(d, "get_session", lambda: _status_session(status))
+    with pytest.raises(RuntimeError) as excinfo:
+        d.request_with_retry("GET", "https://x/master.m3u8", retries=1)
+    message = str(excinfo.value)
+    assert d._HTTP_PERMANENT_MARKER in message
+    assert d._NEEDS_REFETCH_MARKER in message
+    assert d.needs_refetch(message)
+
+
+@pytest.mark.parametrize("status", [404, 416])
+def test_request_with_retry_does_not_mark_missing_resource(status, monkeypatch):
+    """404/416 换个新签名还是同样结果，挂 marker 只会白烧取流配额。"""
+    monkeypatch.setattr(d, "get_session", lambda: _status_session(status))
+    with pytest.raises(RuntimeError) as excinfo:
+        d.request_with_retry("GET", "https://x/seg.ts", retries=1)
+    message = str(excinfo.value)
+    assert d._HTTP_PERMANENT_MARKER in message
+    assert d._NEEDS_REFETCH_MARKER not in message
+    assert not d.needs_refetch(message)
+
+
+def test_expired_m3u8_lands_in_refetch_bucket_not_dead_log():
+    """签名过期的片必须进"要重新取流"桶，且**绝不能**被记进画质判死账本
+    （那会把一部只是 token 过期的片永久排除）。"""
+    message = (
+        "请求失败(确定性HTTP失败 HTTP 403，需重新取流): "
+        "https://sun.peakstorm.top/vd/tok/master.m3u8; 403 Client Error"
+    )
+    retriable = d._classify_failure(message)
+    should_retry, should_refetch = d.plan_retry_buckets(retriable, message)
+    assert should_refetch is True, "没进重取桶，闭环会断开"
+    assert d.is_quality_dead(not retriable, message) is False, \
+        "token 过期被误记进判死账本，会被永久排除"
+
+
+def test_expired_m3u8_respects_auto_refetch_kill_switch(monkeypatch):
+    """auto_refetch 开关对 m3u8 签名过期同样有效，且语义与既有设计一致。
+
+    §12.27 之前该 marker 只出现在 mp4 直链失败上；之后 m3u8 的 401/403/410
+    也会带上它。本用例锁住两件事：
+      1. 开关开启（默认）→ 进重取桶，走自动换链接；
+      2. 开关关闭 → 两个桶都不进，**等人工 `--refetch-failed`**
+         （config.yaml 明确写着"关掉即行为与旧版一致、等人工处理"）。
+    ⚠️ 第 2 条意味着关掉开关的代价在 §12.27 后显著变大——影响面从
+    "少量 mp4 签名过期"扩大到"所有 m3u8 的 401/403/410"。config 已补警告。
+    """
+    message = (
+        "请求失败(确定性HTTP失败 HTTP 403，需重新取流): "
+        "https://sun.peakstorm.top/vd/tok/master.m3u8; 403 Client Error"
+    )
+    retriable = d._classify_failure(message)
+    assert retriable is False, "前提变了：该文案应被判为确定性失败"
+
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    assert d.plan_retry_buckets(retriable, message) == (False, True)
+
+    # 关掉开关：回到"等人工"的旧语义，与 mp4 直链过期的处理完全一致
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", False)
+    assert d.plan_retry_buckets(retriable, message) == (False, False)
+
+
+def test_refetch_marker_does_not_revive_other_permanent_failures(monkeypatch):
+    """反向保障：其他确定性失败（画质判死、不支持的结构）不因本次改动
+    而被重新投递或送去重取，行为与改动前完全一致。"""
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    for message in (
+        d.bitrate_reject_message("640x360", "h264", 300, 1600),
+        "不支持的播放列表结构",
+        "缺少 tmdbId 或 urls",
+    ):
+        retriable = d._classify_failure(message)
+        assert d.plan_retry_buckets(retriable, message) == (False, False), \
+            f"确定性失败的路由被改变了：{message[:30]}"
+
+
+def test_no_select_summary_carries_refetch_marker():
+    """内层 except 吞掉异常原文后，汇总文案必须把 marker 带出来——
+    否则整节点采样全挂于 403 时，重取闭环静默断开。"""
+    # 带 marker：进重取桶
+    with_marker = (
+        "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
+        "；另有节点直链已失效，需重新取流"
+    )
+    assert d.needs_refetch(with_marker)
+    assert d.plan_retry_buckets(
+        d._classify_failure(with_marker), with_marker
+    )[1] is True
+
+    # 不带 marker（普通 502 全挂）：只重投，不重取，行为与改动前一致
+    plain = "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
+    assert not d.needs_refetch(plain)
+    should_retry, should_refetch = d.plan_retry_buckets(
+        d._classify_failure(plain), plain
+    )
+    assert should_retry is True
+    assert should_refetch is False
+
+
+def test_expired_token_propagates_marker_through_process_one_entry(
+    sandbox, monkeypatch
+):
+    """端到端：media playlist 报 403 → 内层留痕 → 汇总文案带 marker →
+    落盘的 error 能被 --refetch-failed 挑到。
+
+    这是本改动的**主路径**（token 过期时 playlist 必然先挂，因为它和分片
+    共用同一个 token 且请求在前）。仅测文案分桶不足以锁住内层留痕那段代码。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None, headers=None: [
+            ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        ],
+    )
+
+    # 模拟 request_with_retry 对 403 的抛法（带两个 marker）
+    def expired_media(url, headers=None):
+        raise RuntimeError(
+            f"请求失败({d._HTTP_PERMANENT_MARKER} HTTP 403，"
+            f"{d._NEEDS_REFETCH_MARKER}): {url}; 403 Client Error"
+        )
+
+    monkeypatch.setattr(d, "parse_media_playlist", expired_media)
+
+    entry = {"tmdbId": "777", "urls": ["https://cdn/master.m3u8"]}
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    error = info["error"]
+    assert d._NEEDS_REFETCH_MARKER in error, \
+        f"marker 在汇总时丢失了，--refetch-failed 会挑不到：{error}"
+    assert d.needs_refetch(error)
+    # 必须进重取桶，否则拿不到新链接
+    assert d.plan_retry_buckets(
+        info.get("retriable", True), error, info.get("needs_refetch")
+    )[1] is True
+
+
+def test_transient_failure_summary_stays_clean(sandbox, monkeypatch):
+    """反向保障：普通 502 全挂时汇总文案**不能**莫名带上 marker，
+    否则每部 502 失败片都会去白烧一次取流配额。"""
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None, headers=None: [
+            ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        ],
+    )
+    monkeypatch.setattr(
+        d, "parse_media_playlist",
+        lambda url, headers=None: (_ for _ in ()).throw(
+            RuntimeError("请求失败: 502 Server Error: Bad Gateway")
+        ),
+    )
+
+    entry = {"tmdbId": "888", "urls": ["https://cdn/master.m3u8"]}
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    assert d._NEEDS_REFETCH_MARKER not in info["error"]
+    assert not d.needs_refetch(info["error"])
+
+
+class _FakeResponse:
+    """最小可用的 response 替身：只需能被 raise_for_status 抛出带状态码的异常。"""
+
+    def __init__(self, status):
+        self.status_code = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def raise_for_status(self):
+        error = requests.HTTPError(f"{self.status_code} Client Error")
+        error.response = self
+        raise error
+
+
+class _FakeSession:
+    def __init__(self, status):
+        self._status = status
+
+    def request(self, *args, **kwargs):
+        return _FakeResponse(self._status)
+
+
+def _status_session(status):
+    return _FakeSession(status)

@@ -140,6 +140,37 @@ AUTO_REUPLOAD_ENABLED = bool(
 # 两个独立的下载态状态文件（区别于 SUCCESS_LOG/FAILED_LOG）。
 DOWNLOAD_OK_LOG = resolve_file(_CFG.get("download_ok_log"), "download_ok.jsonl")
 DOWNLOAD_FAIL_LOG = resolve_file(_CFG.get("download_fail_log"), "download_fail.jsonl")
+# 【画质判死账本】跨运行持久化"因画质被确定性判死"的片，启动时并入跳过集。
+#
+# 为什么需要它（2026-09-11 实跑复盘，§12.26）：判死只是**进程内**状态
+# （_PERMANENT_FAILURE_MARKERS 只决定"不进下一轮"，从不落盘成排除集），而下载侧
+# 的跳过集只有 success.jsonl ∪ 磁盘 mp4。于是每次重跑都会把注定失败的片重新
+# 投递、重新采样、重新判死一遍。run3 实测：74 部判死片 × 2~3 条候选流 × 10 段
+# ≈ 2000 次分片下载，结论与上次完全一致。
+#
+# 🔑 三条边界（与既有账本严格分工，勿混用）：
+#   - **只记画质判死**：其余确定性失败（不支持的结构、缺字段等）不进本账本——
+#     它们不受门槛变更影响，也没有"日后放回"的语义，混进来只会让文件失去焦点；
+#   - **与 fail.txt 语义不同**：fail.txt 是取流侧"源站明确说没这片"，本文件是
+#     "有源但画质不达标"。两者绝不可互相替代（详见 tmdb_ids_to_links.py 里
+#     load_processed_ids 对 unresolved.txt 的同类论述）；
+#   - **可被放回**：存下判定依据（实测码率/门槛/编码/分辨率），门槛调松后由
+#     `--retry-dead` 离线对比放回，无需重新采样。
+DOWNLOAD_DEAD_LOG = resolve_file(_CFG.get("download_dead_log"), "download_dead.jsonl")
+# `--retry-dead` 放回判死片时的余量系数（要求 新门槛 × 本值 <= 记录的实测码率）。
+# 1.05 = 门槛要比记录值低 5% 以上才放回。见 dead_record_passes_now 的震荡说明。
+DEAD_REVIVE_MARGIN = max(1.0, float(_CFG.get("dead_revive_margin", 1.05)))
+# 运行模式标志，由 __main__ 入口按命令行参数覆写（默认都是 False = 正常全量运行）。
+# 用模块级标志而非参数透传：_run_pipeline 到启动过滤点之间隔着好几层，
+# 且 pipeline.py 会 import 本模块后直接调 main()，标志比改签名更不侵入。
+#
+#   RETRY_DEAD_MODE：对 DOWNLOAD_DEAD_LOG 里的片按当前门槛复判，够格的放回重试。
+#   RETRY_ONLY_MODE：仅作语义标记与日志提示。**它不改变任何筛选逻辑**——
+#     下载侧本来就是"输入 results.jsonl、跳过 success.jsonl ∪ 磁盘 ∪ 判死"，
+#     这恰好就是"只重试未成功的片"。加这个开关是为了让意图在命令行里显式可见
+#     （适合挂定时任务），并避免误以为要重跑 pipeline.py 才能重试。
+RETRY_DEAD_MODE = False
+RETRY_ONLY_MODE = False
 BASE_DIR = resolve_dir(_CFG.get("base_dir"), "downloads")
 FOLDER_PREFIX = _CFG.get("folder_prefix", "movie_")
 MAX_VIDEOS_PER_FOLDER = _CFG.get("max_videos_per_folder", 1000)
@@ -570,6 +601,15 @@ _NO_RETRY_HTTP_STATUS = frozenset({401, 403, 404, 410, 416})
 # 上述状态码抛出的错误统一带此标记，供各重试层快速短路（不必解析 HTTP 文案，
 # 也不依赖 requests/urllib3 的具体措辞，跨层稳定）。
 _HTTP_PERMANENT_MARKER = "确定性HTTP失败"
+# 确定性失败里**属于"签名过期、换条新链接就能救"**的那部分（2026-09-11，§12.27）。
+# request_with_retry 对这几个额外挂 _NEEDS_REFETCH_MARKER，使 m3u8 链路也能
+# 进重取流闭环——此前该 marker 只在 mp4 直链的两个函数里挂，m3u8 的 token
+# 过期后会被判成普通确定性失败，`--refetch-failed` 永远挑不到它。
+#
+# 为什么是这三个而不是全部五个：
+#   401/403 鉴权失败、410 已删除 → 签名过期的典型表现，重取有意义；
+#   404 资源真不存在、416 Range 越界 → 换新签名仍是同样结果，重取纯浪费配额。
+_REFETCHABLE_HTTP_STATUS = frozenset({401, 403, 410})
 
 
 def _status_of(exc):
@@ -652,6 +692,19 @@ def request_with_retry(
     确定性 HTTP 失败（401/403/404/410/416）不重试：这类结果重试必然复现，
     白等十几分钟退避只会拖慢换下一个取流节点。抛出的错误带确定性标记，
     供上层继续短路。
+
+    🔑 其中 401/403/410 额外挂 `_NEEDS_REFETCH_MARKER`（2026-09-11，§12.27）：
+    本函数是 **m3u8 链路全部 HTTP 请求的唯一入口**（master playlist /
+    media playlist / 分片下载三处），而 peakstorm 系的 m3u8 地址是
+    `.../vd/<token>/master.m3u8` 这种带签名 token 的形式，**token 会过期**。
+    过期后整条链路只会报"确定性失败"，`--refetch-failed` 挑不到它 ——
+    跨运行重试间隔若是几天，大批片会因 token 过期而永久卡死，重试完全失去意义。
+    挂上 marker 后，这些片能走既有的重取流闭环换到新链接。
+
+    为什么只挑 401/403/410 而不含 404/416：
+      - 401/403 鉴权失败、410 资源已删除 → 典型的签名过期表现，重取有意义；
+      - 404 分片真不存在、416 Range 越界 → 换个新签名还是同样结果，
+        重取纯属浪费取流配额（`needs_refetch` 的文档也是这个口径）。
     """
     session = get_session()
     kwargs.setdefault("timeout", 30)
@@ -679,8 +732,15 @@ def request_with_retry(
             if status in (403, 429, 503):
                 record_block_status(status)
             if status in _NO_RETRY_HTTP_STATUS:
+                # 签名过期型（401/403/410）额外挂重取 marker，让 m3u8 链路
+                # 也能进重取流闭环（见本函数文档）。404/416 有意不挂。
+                suffix = (
+                    f"，{_NEEDS_REFETCH_MARKER}"
+                    if status in _REFETCHABLE_HTTP_STATUS else ""
+                )
                 raise RuntimeError(
-                    f"请求失败({_HTTP_PERMANENT_MARKER} HTTP {status}): {url}; {exc}"
+                    f"请求失败({_HTTP_PERMANENT_MARKER} HTTP {status})"
+                    f"{suffix}: {url}; {exc}"
                 ) from exc
             if attempt == retries - 1:
                 break
@@ -954,6 +1014,205 @@ def classify_reject_reason(error_msg):
     return "其他"
 
 
+# ---------- 画质判死的跨运行持久化（DOWNLOAD_DEAD_LOG） ----------
+# 从判死文案里回抽实测码率与门槛。两种措辞都由 bitrate_reject_message 生成：
+#   模式 A：分辨率 854x480 流（h264）码率未达到门槛：372 kbps < 1600 kbps
+#   模式 B：码率未达到门槛：372 kbps < 1600 kbps（h264，实测 854x480）
+# 故一条正则同时覆盖两者：只锚定"码率未达到门槛：N kbps < M kbps"这段公共前缀。
+#
+# ⚠️ 抽出来的是**末节点**的数值。外层判死文案只嵌 `末节点错误`（见判死处注释），
+# 前面节点的实测值在落盘时已不存在。这让 --retry-dead 偏保守（多节点片可能漏救
+# 几部），但绝不会误救——不会把仍不达标的片放回去白跑。
+_DEAD_BITRATE_RE = re.compile(
+    r"码率未达到门槛[：:]\s*([0-9.]+)\s*kbps\s*<\s*([0-9.]+)\s*kbps"
+)
+# 实测分辨率与编码：模式 B 写在尾部括号里，模式 A 写在开头。两条各自可选。
+_DEAD_RESOLUTION_RE = re.compile(r"实测 (\d+x\d+)")
+_DEAD_MODE_A_RE = re.compile(r"分辨率 (\d+x\d+) 流（([^）]+)）")
+_DEAD_CODEC_B_RE = re.compile(r"kbps（([^，]+)，实测")
+
+
+def parse_dead_quality_evidence(error_msg):
+    """从画质判死文案里抽出判定依据，供门槛变更后离线复判。
+
+    返回 dict（可能只含部分键）或 None（文案里没有码率数值）。
+    没有数值的判死——例如"分辨率低于红线"、或全部节点都只报"候选流无一入选"
+    的汇总——一律返回 None：没有依据可存，`--retry-dead` 对它们只能整片放回。
+    """
+    if not error_msg:
+        return None
+    match = _DEAD_BITRATE_RE.search(error_msg)
+    if not match:
+        return None
+    evidence = {
+        "bitrate_kbps": float(match.group(1)),
+        "threshold_kbps": float(match.group(2)),
+    }
+    mode_a = _DEAD_MODE_A_RE.search(error_msg)
+    if mode_a:
+        evidence["resolution"] = mode_a.group(1)
+        evidence["codec"] = mode_a.group(2)
+    else:
+        resolution = _DEAD_RESOLUTION_RE.search(error_msg)
+        if resolution:
+            evidence["resolution"] = resolution.group(1)
+        codec = _DEAD_CODEC_B_RE.search(error_msg)
+        if codec:
+            evidence["codec"] = codec.group(1)
+    return evidence
+
+
+# 画质类的归类名（取自 _REJECT_REASON_RULES 的类目名，改那边要同步改这里）。
+# 用类目名而非裸 marker：判据演进时 _REJECT_REASON_RULES 是唯一改动点。
+_QUALITY_REJECT_CATEGORIES = frozenset({
+    "画质整体不达标(判死)",
+    "分辨率低于红线",
+    "码率未达门槛",
+})
+
+
+def is_quality_dead(retriable, error_msg):
+    """这条失败是否属于"因画质被确定性判死"。
+
+    两个条件都要满足：确定性失败（retriable=False）**且**文案是画质类。
+    只看文案不够——可重试失败的文案里也可能带画质 marker（多节点片里某个节点
+    画质淘汰、另一个节点 502，整片仍可重试）；只看 retriable 更不够，会把
+    "不支持的播放列表结构"这类与门槛无关的确定性失败也记进来。
+    """
+    if retriable:
+        return False
+    return classify_reject_reason(error_msg) in _QUALITY_REJECT_CATEGORIES
+
+
+def load_dead_ids(threshold_fn=None):
+    """读 DOWNLOAD_DEAD_LOG，返回要跳过的 tmdbId 集合。
+
+    threshold_fn 为 None（默认，正常运行）：全部判死片一律跳过。
+    传入函数时（`--retry-dead`）：对每条记录用当前门槛复判，
+    **该 id 的全部记录都判定"可以放回"时才放回**（合取语义）。
+
+    🔑 为什么必须按 id 聚合（2026-09-11 代码审查发现）：
+    账本是纯追加的，同一部片可能有多行（重取换链接后再次判死、
+    `--retry-dead` 放回后又判死）。原先逐行 add/discard 处理，
+    **同一 id 的结果取决于哪一行排在最后** —— 一行有依据判"不放回"、
+    另一行空依据判"放回"，最终结论随追加顺序漂移，不确定。
+    改成合取后：只要有任何一条记录证明它现在仍不达标，就继续跳过。
+    这与"宁可多下不误杀"不冲突——那条口径针对的是**无依据**的记录，
+    而这里是"有依据且证明不达标"。
+
+    缺依据的记录（parse_dead_quality_evidence 返回 None 时落盘的那些）在
+    `--retry-dead` 下一律放回——没有依据就无法证明它现在仍不达标。
+    """
+    if not os.path.exists(DOWNLOAD_DEAD_LOG):
+        return set()
+
+    # 先按 id 归拢全部记录，再统一裁决——避免逐行覆盖带来的行序依赖。
+    records_by_id = {}
+    with open(DOWNLOAD_DEAD_LOG, "r", encoding="utf-8") as file:
+        for line in file:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tmdb_id = normalize_tmdb_id(record.get("tmdbId"))
+            if not tmdb_id:
+                continue
+            records_by_id.setdefault(tmdb_id, []).append(record)
+
+    if threshold_fn is None:
+        return set(records_by_id)
+
+    dead = set()
+    revived = 0
+    for tmdb_id, records in records_by_id.items():
+        # 合取：任一条记录判定"仍不达标"，该片就继续跳过。
+        if all(threshold_fn(record) for record in records):
+            revived += 1
+        else:
+            dead.add(tmdb_id)
+    if revived:
+        print(f"[判死复判] {revived} 个 ID 在当前门槛下不再判死，已放回重试队列")
+    return dead
+
+
+def dead_record_passes_now(record):
+    """当前配置门槛下，这条判死记录是否该被放回重试。
+
+    口径：用记录里的**实测码率**对比**现在算出来的**门槛。门槛按记录的
+    分辨率高度与编码重算（而非沿用记录里的旧门槛），这样 bitrate_* 与
+    leniency 任一处改动都能被识别到。
+
+    ⚠️ 留 DEAD_REVIVE_MARGIN 余量：实测码率是**那次采样窗口**的值，本身有波动。
+    门槛恰好压在记录值上时放回，重新采样很可能测出略低的值又被判死一次，
+    形成来回震荡、每轮都白跑。要求"新门槛 × 余量 <= 记录值"才放回。
+
+    🔴 两个必须挡住的坑（2026-09-11 代码审查发现）：
+
+    1. **跨模式复判**：`bitrate_threshold` 的行为由 RESOLUTION_CHECK_ENABLED
+       决定（模式 A 按 (h/1080)² 缩放、模式 B 用绝对线），两者门槛能差 5 倍。
+       拿当前模式去复判另一个模式下判死的记录，结论没有意义。
+       故记录里存了判死当时的模式，**不一致就不放回**（保守）。
+       老记录没有该字段 → 视为未知 → 同样不放回，避免按错误口径误放。
+
+    2. **height 缺失时门槛归零**：模式 B 下探测不到分辨率会写成"未知分辨率"，
+       正则抽不出 `\\d+x\\d+`，height 落为 0。此时模式 A 的
+       `(0/1080)² = 0` 会让门槛恒为 0，`0 × 余量 <= 任何码率` **恒真** ——
+       这批记录会被无条件放回。而实跑中"未知分辨率"占比高达 44%（§12.18），
+       量级不小。故 height 缺失时在模式 A 下**一律不放回**。
+    """
+    evidence = record.get("evidence") or {}
+    bitrate = evidence.get("bitrate_kbps")
+    if bitrate is None:
+        # 没有依据 → 无法证明现在仍不达标，放回（见 load_dead_ids 文档）。
+        return True
+
+    # 坑 1：判死时的模式必须与当前一致，否则门槛口径不可比。
+    recorded_mode = record.get("resolution_check_enabled")
+    if recorded_mode is None or bool(recorded_mode) != RESOLUTION_CHECK_ENABLED:
+        return False
+
+    resolution = str(evidence.get("resolution") or "")
+    height = 0
+    if "x" in resolution:
+        try:
+            height = int(resolution.split("x")[1])
+        except (ValueError, IndexError):
+            height = 0
+    # 坑 2：模式 A 下 height=0 会让门槛归零 → 恒真放回。保守起见不放回。
+    if height <= 0 and RESOLUTION_CHECK_ENABLED:
+        return False
+
+    current = bitrate_threshold(height, evidence.get("codec"))
+    return current * DEAD_REVIVE_MARGIN <= float(bitrate)
+
+
+def record_quality_dead(tmdb_id, title, error_msg, urls=None):
+    """把一部画质判死片记进 DOWNLOAD_DEAD_LOG（纯追加）。
+
+    同一片可能在不同运行里被记多次（例如 --retry-dead 放回后再次判死、
+    或重取换链接后新节点仍不达标）。不做去重：写入端保持纯追加，
+    **合并规则放在读取端** `load_dead_ids`（按 tmdbId 聚合），
+    避免去重要重写整个文件、与多线程共用的 write_log 冲突。
+
+    `resolution_check_enabled` 必须落盘：画质门槛的计算方式完全由它决定，
+    不记下来就无法判断日后的复判是否同口径（见 dead_record_passes_now）。
+    """
+    write_log(DOWNLOAD_DEAD_LOG, {
+        "tmdbId": tmdb_id,
+        "title": title or "",
+        "dead_at": int(time.time()),
+        "reason_class": "quality",
+        # 判死当时的画质判定模式，复判时用来确认口径可比。
+        "resolution_check_enabled": RESOLUTION_CHECK_ENABLED,
+        "error": error_msg,
+        "evidence": parse_dead_quality_evidence(error_msg) or {},
+        "node_count": len(urls or []),
+    })
+
+
 # ---------- 轮次间就地重取流（直链过期自愈） ----------
 def needs_refetch(error_msg):
     """该失败是否属于"换一条新直链就能救回"。
@@ -979,6 +1238,15 @@ def plan_retry_buckets(retriable, error_msg, refetch_flag=None):
     refetch_flag：调用方逐节点统计出的显式结论。传 None 表示"没有该信息"，
     此时回退到按 error_msg 文案判断。之所以要这个参数——error_msg 只保留
     **最后一个**节点的错误，过期节点排在非末位时文案里根本没有过期 marker。
+
+    ⚠️ `auto_refetch.enabled: false` 时两个桶都会是空的（§12.27 D）：
+    `_NEEDS_REFETCH_MARKER` 同时在 `_PERMANENT_FAILURE_MARKERS` 里，故带
+    marker 的失败 retriable=False；重取再一关，这批片当轮就既不重投也不重取。
+    **这是该开关有意的语义**——config 里写明"关掉即等人工 `--refetch-failed`
+    处理"，此处不做自动兜底，以免把"人工介入"的选择悄悄改掉。
+    但 §12.27 给 m3u8 链路也挂上 marker 后，受影响面从"少量 mp4 签名过期"
+    扩大到"所有 m3u8 的 401/403/410"，**关掉该开关的代价比以前大得多**，
+    config.yaml 的 auto_refetch 处已补上对应警告。
     """
     if refetch_flag is None:
         refetch_flag = needs_refetch(error_msg)
@@ -2757,6 +3025,9 @@ def process_one_entry(entry, processed_ids):
         # 无一入选、第 5 个节点成功"，故这里绝不能把网络抖动也算成画质淘汰。
         quality_rejected_streams = 0
         other_failed_streams = 0
+        # 本节点是否出现过"签名过期"（401/403/410）。汇总文案会覆盖单条异常的
+        # 原文，marker 必须在这里留痕才能带进落盘文案（§12.27）。
+        stream_needs_refetch = False
 
         for resolution, playlist_url, _declared_bandwidth, size in candidates:
             # 候选已按声明高度降序排列。走到"声明高度严格低于已选中流"的候选时，
@@ -2912,6 +3183,11 @@ def process_one_entry(entry, processed_ids):
             except Exception as exc:
                 remove_file(sample_path)
                 other_failed_streams += 1
+                # 签名过期（401/403/410）要单独记住：下面的汇总文案会覆盖掉
+                # 本条异常的原文，marker 若不在这里留痕就会彻底丢失，
+                # `--refetch-failed` 也就挑不到这部片（§12.27）。
+                if needs_refetch(str(exc)):
+                    stream_needs_refetch = True
                 print(f"  处理流 {resolution} 失败: {exc}")
 
         if not best_selected:
@@ -2929,8 +3205,15 @@ def process_one_entry(entry, processed_ids):
                 )
             # 混合情形（存在瞬时异常）：无法断定是"真不达标"还是"采样抖动全挂"，
             # 落默认「可重试」交由多轮重采兜底，契合"宁可多下不误杀"。
+            #
+            # 若其中有签名过期，把 marker 带进汇总文案：这条文案会原样落进
+            # failed.jsonl，是 `--refetch-failed` 唯一的筛选依据（§12.27）。
+            refetch_note = (
+                f"；另有节点直链已失效，{_NEEDS_REFETCH_MARKER}"
+                if stream_needs_refetch else ""
+            )
             raise RuntimeError(
-                "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
+                f"本轮候选流无一入选（各流原因见上方日志），下一轮重采{refetch_note}"
             )
 
         # 模式 B 下 best_resolution 可能是 "未知分辨率"（探测失败），此时码率才是
@@ -3470,10 +3753,15 @@ def _run_pipeline():
 
     logged_ids = load_success_log_ids()
     disk_ids, duplicate_files = scan_downloaded_mp4_ids()
-    processed_ids = logged_ids | disk_ids
+    # 画质判死片：默认一律跳过；--retry-dead 下按当前门槛复判，够格的放回。
+    dead_ids = load_dead_ids(
+        dead_record_passes_now if RETRY_DEAD_MODE else None
+    )
+    processed_ids = logged_ids | disk_ids | dead_ids
     print(
         f"成功日志中有 {len(logged_ids)} 个 ID，"
-        f"目标目录中有 {len(disk_ids)} 个已下载 ID；"
+        f"目标目录中有 {len(disk_ids)} 个已下载 ID，"
+        f"画质判死 {len(dead_ids)} 个 ID；"
         f"合并去重后将跳过 {len(processed_ids)} 个 ID"
     )
 
@@ -3669,6 +3957,15 @@ def _run_pipeline():
                 "error": error_msg,
                 "retriable": retriable,
             })
+            # 画质判死：持久化到 DOWNLOAD_DEAD_LOG，下次运行直接跳过，
+            # 不再重新采样求证同一个结论（见 DOWNLOAD_DEAD_LOG 的注释）。
+            if is_quality_dead(retriable, error_msg):
+                record_quality_dead(
+                    tmdb_id,
+                    entry.get("title"),
+                    error_msg,
+                    entry.get("urls"),
+                )
             print(
                 f"下载失败: {tmdb_id}: {error_msg}"
                 f"（{'可重试' if retriable else '确定性失败,不重试'}）"
@@ -4235,4 +4532,26 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reupload":
         reupload_pending()
     else:
+        # 沿用既有的裸 sys.argv 分派风格（本文件一直没有引入 argparse）。
+        # 两个开关可叠加：--retry-only --retry-dead。
+        _args = set(sys.argv[1:])
+        RETRY_ONLY_MODE = "--retry-only" in _args
+        RETRY_DEAD_MODE = "--retry-dead" in _args
+        _unknown = _args - {"--retry-only", "--retry-dead"}
+        if _unknown:
+            # 静默忽略拼错的开关最危险：会让人以为跳过逻辑已生效、实际在跑全量。
+            print(f"错误: 无法识别的参数 {' '.join(sorted(_unknown))}")
+            print("用法: python download_movies.py [--retry-only] [--retry-dead]")
+            print("      python download_movies.py reupload")
+            raise SystemExit(2)
+        if RETRY_ONLY_MODE:
+            print(
+                "[重试模式] 只重试 results.jsonl 里尚未成功的片"
+                "（跳过 success.jsonl、磁盘已有成品、画质判死）"
+            )
+        if RETRY_DEAD_MODE:
+            print(
+                f"[判死复判] 将按当前门槛复判 {DOWNLOAD_DEAD_LOG} 里的片，"
+                f"余量系数 {DEAD_REVIVE_MARGIN:.2f}"
+            )
         main()

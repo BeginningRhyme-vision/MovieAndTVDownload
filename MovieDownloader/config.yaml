@@ -234,6 +234,17 @@ download_movies:
   #   - 末轮不重取（拿到新链接也没有轮次去用了）。
   # enabled: false 时行为与旧版一致（只在收尾打印提示，等人工处理）。
   # 手动入口始终保留：python tmdb_ids_to_links.py --refetch-failed
+  #
+  # 🔴 2026-09-11 起关掉它的代价显著变大（§12.27）：
+  # 此前"需重新取流"只出现在 **mp4 直链**的 403/410 上，量很小。现在 m3u8 链路
+  # （master playlist / media playlist / 分片）的 401/403/410 也会挂这个标记——
+  # 因为 m3u8 的地址同样带时效 token，过期后不挂标记就永远进不了重取闭环，
+  # 跨运行重试会因大批 token 过期而失去意义。
+  # 副作用：该标记同时在 _PERMANENT_FAILURE_MARKERS 里 → 带它的失败 retriable=False。
+  # 于是 enabled: false 时，**m3u8 的 401/403/410 会当轮直接放弃**（既不重投也不
+  # 重取），只能靠人工跑 --refetch-failed 捞回。而 403 有时只是源站临时风控、
+  # 冷却一轮就恢复。
+  # → 除非你确实要把过期处理完全交给人工，否则**保持 enabled: true**。
   auto_refetch:
     enabled: true
     max_per_movie: 2        # 单部片整次运行中最多就地重取几次（防"取流-过期-重取"空转）
@@ -263,6 +274,21 @@ download_movies:
   #   download_fail_log —— 每轮开头清空重写，只记本轮“下载”失败的影片
   download_ok_log: "download_ok.jsonl"
   download_fail_log: "download_fail.jsonl"
+  # 【画质判死账本】累计追加，记"因画质被确定性判死"的片 + 当时的判定依据。
+  # 启动时并入跳过集，避免每次重跑都把注定失败的片重新采样、重新判死一遍
+  # （2026-09-11 实跑：74 部判死片白跑约 2000 次分片下载，结论与上次完全一致）。
+  #
+  # ⚠️ 与 fail.txt 语义完全不同，勿混用：
+  #   fail.txt          = 取流侧"源站明确说没有这部片"，永久排除；
+  #   download_dead_log = "有源但画质不达标"，门槛调松后可用 --retry-dead 放回。
+  #
+  # 想让全部判死片重新参与下载：删掉此文件，或用 --retry-dead 按新门槛自动筛。
+  download_dead_log: "download_dead.jsonl"
+  # --retry-dead 放回判死片的余量系数：要求 新门槛 × 本值 <= 当时实测码率。
+  # 为什么要留余量：实测码率是"那次采样窗口"的值、本身有波动。门槛恰好压在
+  # 记录值上就放回的话，重新采样很可能测出略低的值又被判死，形成来回震荡、
+  # 每轮都白跑。1.05 = 门槛要比记录值低 5% 以上才放回。设 1.0 = 不留余量。
+  dead_revive_margin: 1.05
   # 视频落盘根目录与临时工作目录。
   # 支持三种写法：
   #   1) 相对路径（如 downloads）—— 以脚本所在目录 MovieDownloader/ 为根，
