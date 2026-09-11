@@ -2750,9 +2750,102 @@ def test_transient_failure_summary_stays_clean(sandbox, monkeypatch):
     assert not d.needs_refetch(info["error"])
 
 
+# ------------------- 签名过期伪装成 200 响应（§12.29）
+
+@pytest.mark.parametrize("body,label", [
+    ("error time check", "videasy token 过期的真实响应"),
+    ("", "空响应体"),
+    (None, "None"),
+    ("<!DOCTYPE html><html><body>blocked</body></html>", "HTML 验证页"),
+    ('{"error":"expired"}', "JSON 报错"),
+])
+def test_non_m3u8_body_is_flagged_for_refetch(body, label):
+    """源站用 200 + 非 m3u8 正文表达"签名过期"时必须挂重取标记。
+
+    实测 videasy：token 过期不回 403/410，而是
+        HTTP 200 | text/html | 16 字节 | 正文 "error time check"
+    §12.27 按状态码挂 marker 的做法拦不住它（那是 200），结果空变体被抛成
+    "没有找到媒体播放列表"——该文案在 _PERMANENT_FAILURE_MARKERS 里，
+    于是只是 token 过期的片被永久淘汰。实测一轮丢掉 22 部。
+    """
+    with pytest.raises(RuntimeError) as excinfo:
+        d._assert_playlist_body(body, "https://x/master.m3u8")
+    message = str(excinfo.value)
+    assert d._NEEDS_REFETCH_MARKER in message, f"{label} 未挂重取标记"
+    assert d.needs_refetch(message)
+    # 必须进重取桶，否则换不到新链接
+    assert d.plan_retry_buckets(d._classify_failure(message), message)[1] is True
+    # 绝不能被记进画质判死账本（那会永久排除）
+    assert d.is_quality_dead(False, message) is False
+
+
+@pytest.mark.parametrize("body", [
+    "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\na.m3u8",
+    "#extm3u\n#EXTINF:4.0,\na.ts",          # 标签大小写不敏感
+    "  \n#EXTM3U\n#EXTINF:4.0,\na.ts",      # 前导空白
+])
+def test_valid_m3u8_body_passes(body):
+    """合法 m3u8 一律放行，不能把正常响应误判成过期。"""
+    d._assert_playlist_body(body, "https://x/master.m3u8")
+
+
+def test_empty_master_without_variants_stays_permanent(sandbox, monkeypatch):
+    """反向保障：响应**是** m3u8 但确实没有变体 → 真的没有媒体列表，
+    保持确定性失败、**不**去烧取流配额。这是与上一组用例的关键分界。"""
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(
+        d, "request_with_retry",
+        lambda *a, **kw: "#EXTM3U\n#EXT-X-VERSION:3\n",   # 合法但空
+    )
+    entry = {"tmdbId": "601", "urls": ["https://cdn/master.m3u8"]}
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    error = info["error"]
+    assert "没有找到媒体播放列表" in error
+    assert d._NEEDS_REFETCH_MARKER not in error, "空 master 不该触发重取"
+    assert d.plan_retry_buckets(
+        info.get("retriable", True), error, info.get("needs_refetch")
+    ) == (False, False)
+
+
+def test_expired_token_body_reaches_refetch_bucket_end_to_end(
+    sandbox, monkeypatch
+):
+    """端到端：master 返回 "error time check" → 整片进重取桶。
+
+    这是 §12.29 要修的主路径，仅测 _assert_playlist_body 不足以覆盖
+    "marker 能否一路传到落盘文案"。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(
+        d, "request_with_retry", lambda *a, **kw: "error time check"
+    )
+    entry = {"tmdbId": "602", "urls": ["https://cdn/master.m3u8"]}
+    _, ok, info = d.process_one_entry(entry, set())
+
+    assert ok is False
+    error = info["error"]
+    assert d._NEEDS_REFETCH_MARKER in error, \
+        f"marker 没传到落盘文案，--refetch-failed 会挑不到：{error}"
+    assert d.plan_retry_buckets(
+        info.get("retriable", True), error, info.get("needs_refetch")
+    )[1] is True
+
+
+def test_media_playlist_also_guards_expired_body(monkeypatch):
+    """master 与 media 用同一个 token，前者过了不代表后者也过 ——
+    media playlist 这一路同样要挡住。"""
+    monkeypatch.setattr(
+        d, "request_with_retry", lambda *a, **kw: "error time check"
+    )
+    with pytest.raises(RuntimeError) as excinfo:
+        d.parse_media_playlist("https://cdn/1080.m3u8")
+    assert d._NEEDS_REFETCH_MARKER in str(excinfo.value)
+
+
 class _FakeResponse:
     """最小可用的 response 替身：只需能被 raise_for_status 抛出带状态码的异常。"""
-
     def __init__(self, status):
         self.status_code = status
 

@@ -1750,12 +1750,49 @@ def move_to_target_folder(temp_mp4, tmdb_id):
 
 
 # ---------- M3U8 解析 ----------
+def _assert_playlist_body(text, url):
+    """响应体必须是一份 m3u8；否则按"签名过期/源站异常"抛错并挂重取标记。
+
+    🔑 为什么必须有这一关（2026-09-11 实测，§12.29）：
+    videasy 的 m3u8 地址带时效 token，**过期后不是回 403/410，而是**
+
+        HTTP 200 | text/html | 16 字节 | 正文 "error time check"
+
+    状态码是 200，`request_with_retry` 视为成功、原样返回响应体；
+    `parse_master_playlist` 逐行找不到 `#EXT-X-STREAM-INF` 就返回空列表，
+    上层抛出"没有找到媒体播放列表或清晰度变体" —— 这条文案在
+    `_PERMANENT_FAILURE_MARKERS` 里，于是**一个只是 token 过期的片被当成
+    "源站根本没有这部片"永久淘汰，既不重投也不进重取桶**。
+    §12.27 按状态码挂 marker 的做法完全拦不住它（那是 200）。
+    实测一次跨运行重试里这样丢掉了 22 部片（占终局失败的 71%）。
+
+    判据刻意用"**是不是 m3u8**"而不是匹配 `error time check` 这个具体文案：
+    后者是某一家源站此刻的实现细节，换源站或改措辞就失效；而"拿回来的东西
+    不是播放列表"这个事实，对任何 provider 都等价于"这条 url 现在用不了"。
+
+    ⚠️ 只判"根本不是 m3u8"，**不判"是 m3u8 但没有变体"** —— 后者是真的
+    没有媒体列表（源站确实只上架了空 master），属确定性失败，保持判死。
+    """
+    stripped = (text or "").strip()
+    if stripped[:7].upper() == "#EXTM3U":
+        return
+    # 不是播放列表：可能是空体、HTML 验证页、纯文本错误码、JSON 报错。
+    # 一律视为"这条签名 url 已不可用"，交给重取流闭环换新链接。
+    preview = stripped[:60].replace("\n", " ") or "(空响应体)"
+    raise RuntimeError(
+        f"播放列表不是 m3u8（疑似签名过期或源站异常）"
+        f"，{_NEEDS_REFETCH_MARKER}: {url}; 响应开头: {preview}"
+    )
+
+
 def parse_master_playlist(master_url, retries=None, headers=None):
     """返回 [(resolution, media_playlist_url, declared_bandwidth_kbps), ...]。
 
     retries 为 None 时用默认强度 PLAYLIST_RETRY_MAX；方案C fallback 里对
     非末节点传更小的值，以便坏节点快速判定并换下一个备用节点。
     headers 为取流阶段记录的节点专属请求头，为空时用全局 HEADERS。
+
+    响应体不是 m3u8 时抛带重取标记的错误（见 `_assert_playlist_body`）。
     """
     text = request_with_retry(
         "GET", master_url, as_text=True,
@@ -1764,6 +1801,7 @@ def parse_master_playlist(master_url, retries=None, headers=None):
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
         headers=headers,
     )
+    _assert_playlist_body(text, master_url)
     lines = [line.strip() for line in text.splitlines()]
     variants = []
 
@@ -1810,6 +1848,9 @@ def parse_media_playlist(playlist_url, headers=None):
     该段必须写在所有媒体分片之前，否则产出的文件无法解码。TS 没有
     init 段，返回 None。
     headers 同 parse_master_playlist：节点专属请求头，为空时用全局 HEADERS。
+
+    响应体不是 m3u8 时抛带重取标记的错误（见 `_assert_playlist_body`）——
+    master 与 media 两次请求用的是同一个 token，前者过了不代表后者也过。
     """
     text = request_with_retry(
         "GET", playlist_url, as_text=True,
@@ -1818,6 +1859,7 @@ def parse_media_playlist(playlist_url, headers=None):
         backoff_max=PLAYLIST_RETRY_BACKOFF_MAX,
         headers=headers,
     )
+    _assert_playlist_body(text, playlist_url)
     lines = [line.strip() for line in text.splitlines()]
     init_url = None
 
