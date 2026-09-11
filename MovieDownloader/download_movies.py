@@ -1645,6 +1645,55 @@ def format_size(num_bytes):
     return f"{value:.2f} PB"
 
 
+def new_upload_volume():
+    """新建一份上传容量累加器。
+
+    三个字段各司其职，缺一不可：
+      - uploaded_bytes：已知大小的总字节；
+      - uploaded_sized：贡献了字节数的片数（**平均值的分母**）；
+      - uploaded_unsized：进了 R2 但取不到大小的片数。单列出来是为了让
+        "总量偏小"有据可查——否则少算多少、少算了几部，事后无从追溯。
+    """
+    return {"uploaded_bytes": 0, "uploaded_sized": 0, "uploaded_unsized": 0}
+
+
+def add_upload_volume(volume, size):
+    """把一部**确已进入 R2** 的成品计入累加器。size 取不到时记 unsized。"""
+    if size:
+        volume["uploaded_bytes"] += size
+        volume["uploaded_sized"] += 1
+    else:
+        volume["uploaded_unsized"] += 1
+
+
+def merge_upload_volume(target, other):
+    """累加器求和。用于把"主流程"与"收尾补传"两段合成本次运行的总量。
+
+    两段天然不相交：补传只处理主流程里 uploaded=False 的片，故直接相加
+    不会重复计数（见 main() 收尾处的说明）。
+    """
+    for key in target:
+        target[key] += other.get(key, 0)
+    return target
+
+
+def print_upload_volume(label, volume):
+    """打印一段上传容量。无任何上传（含 unsized）时整段静默，不刷屏。"""
+    if not (volume["uploaded_sized"] or volume["uploaded_unsized"]):
+        return
+    total_bytes = volume["uploaded_bytes"]
+    print(
+        f"{label} {volume['uploaded_sized']} 部，"
+        f"总大小 {bytes_to_gb(total_bytes):.2f} GB"
+        f"（{format_size(total_bytes)}，十进制 1 GB = 1000³ 字节）"
+    )
+    if volume["uploaded_unsized"]:
+        print(
+            f"  ⚠️ 另有 {volume['uploaded_unsized']} 部未能取到文件大小，"
+            f"未计入上述总量"
+        )
+
+
 def build_s3_key(tmdb_id, year=None, asset=None):
     """把一部影片的某个资产映射为 R2 对象键。
 
@@ -4206,7 +4255,7 @@ def main():
             flush=True,
         )
     try:
-        _run_pipeline()
+        run_volume = _run_pipeline()
     finally:
         # 先停监控线程并放行闸门，避免仍有线程卡在 wait_for_disk_gate 上。
         disk_monitor_stop.set()
@@ -4225,12 +4274,28 @@ def main():
     if AUTO_REUPLOAD_ENABLED and S3_ENABLED:
         print("\n===== 收尾自动补传 =====", flush=True)
         try:
-            reupload_pending()
+            # 补传量并入本次运行总量。两段不会重复计数：能进补传的片，在主流程
+            # 里一定是 uploaded=False（上传失败或槽位超时降级）、从未被主流程
+            # 累加过；反之主流程已上传成功的片不会留在 pending 里。
+            merge_upload_volume(run_volume, reupload_pending())
         except (Exception, SystemExit) as exc:
             # 补传失败不影响主流程的成功结论：成品仍留在本地且 pending 记录还在，
             # 随时可以手动 reupload。SystemExit 一并兜住（避免收尾动作把已经跑完
             # 的整次运行判成失败退出），但放过 KeyboardInterrupt。
             print(f"⚠️ 自动补传异常，成品仍留本地待手动 reupload: {exc}", flush=True)
+
+    # 本次运行的最终口径：主流程 + 收尾补传。前面两段是分开打的，中间还隔着
+    # 一大段失败聚合日志，不给一个合并行的话，用户得自己翻日志做加法。
+    print("\n===== 本次运行上传容量 =====", flush=True)
+    if run_volume["uploaded_sized"] or run_volume["uploaded_unsized"]:
+        print_upload_volume("累计上传成功", run_volume)
+    else:
+        # 显式说"没有"，而不是留一段空白让人怀疑统计是不是又漏算了。
+        print("本次运行没有新增上传。")
+    print(
+        "提示：查看所有历次运行的累计容量，跑 "
+        "`python download_movies.py storage`"
+    )
 
 
 def _run_pipeline():
@@ -4271,7 +4336,8 @@ def _run_pipeline():
     if not os.path.exists(INPUT_JSONL):
         if not streaming:
             print(f"错误: 找不到 {INPUT_JSONL}")
-            return
+            # 返回空累加器而非 None：main() 收尾要无条件与补传量相加。
+            return new_upload_volume()
         print(f"{INPUT_JSONL} 尚不存在（全新部署），等待取流侧实时产出", flush=True)
 
     entries = []
@@ -4357,8 +4423,8 @@ def _run_pipeline():
     # 失败片天然不相交）。仅在全部轮次结束后统一排空剩余在途任务。
     stage_of = {}  # future -> "download" | "conversion" | "upload"
     pending = set()
-    stats = {"conversions": 0, "uploads": 0, "uploaded_bytes": 0,
-             "uploaded_sized": 0, "uploaded_unsized": 0}
+    stats = {"conversions": 0, "uploads": 0}
+    stats.update(new_upload_volume())
     # 被拒原因聚合（观测性，仅统计下载阶段失败）：按类别计数，分确定性/可重试两组。
     # 确定性失败每片计一次；可重试失败跨轮会重复计（同片多轮重投），打印时分块标注。
     reject_permanent = {}
@@ -4600,19 +4666,16 @@ def _run_pipeline():
                 })
                 print(f"上传失败: {tmdb_id}: {info.get('error', '未知错误')}")
             else:
-                # 只累加真正进了 R2 的成品。两个坑：
+                # 只累加真正进了 R2 的成品。三个坑：
                 #   1. stats["uploads"] 是提交上传任务时自增的，含最终失败的片，
                 #      不能拿它当分母；
                 #   2. S3_ENABLED=False 时 upload_one_entry 也返回 True（纯本地
-                #      模式），但压根没传，靠 uploaded 标志排除。
+                #      模式），但压根没传，靠 uploaded 标志排除；
+                #   3. 多轮重试不会让同一部片在这里过两次——下一轮的投料只来自
+                #      merge_next_batch(下载阶段失败的片)，已上传成功的片不在
+                #      任何重投桶里，根本没有第二次到达 upload 阶段的路径。
                 if info.get("uploaded"):
-                    size = info.get("file_size_bytes")
-                    if size:
-                        stats["uploaded_bytes"] += size
-                        stats["uploaded_sized"] += 1
-                    else:
-                        # 取大小失败（罕见）单独计数，避免总量被悄悄少算而无人察觉。
-                        stats["uploaded_unsized"] += 1
+                    add_upload_volume(stats, info.get("file_size_bytes"))
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as download_executor, \
             ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as conversion_executor, \
@@ -4878,18 +4941,7 @@ def _run_pipeline():
             f"三级流水线全部完成：转封装 {stats['conversions']} 部，"
             f"上传 {stats['uploads']} 部。"
         )
-        if stats["uploaded_sized"] or stats["uploaded_unsized"]:
-            total_bytes = stats["uploaded_bytes"]
-            print(
-                f"本次上传成功 {stats['uploaded_sized']} 部，"
-                f"总大小 {bytes_to_gb(total_bytes):.2f} GB"
-                f"（{format_size(total_bytes)}，十进制 1 GB = 1000³ 字节）"
-            )
-            if stats["uploaded_unsized"]:
-                print(
-                    f"  ⚠️ 另有 {stats['uploaded_unsized']} 部未能取到文件大小，"
-                    f"未计入上述总量"
-                )
+        print_upload_volume("本次上传成功", stats)
 
         # 被拒原因聚合统计（观测性）：量化各类失败占比，指导码率门槛校准。
         def _print_reject_stats(title, counter, note):
@@ -4939,6 +4991,9 @@ def _run_pipeline():
                     f"可让本脚本自动完成这一步。"
                 )
 
+    # 交回给 main()：收尾补传跑完后要和补传量合并成"本次运行总量"。
+    return stats
+
 
 def reupload_pending():
     """手动补传：读 upload_pending.jsonl，逐条重传上传失败留在本地的成品。
@@ -4950,19 +5005,21 @@ def reupload_pending():
       3. 补传成功 -> 删本地 + 从 pending 移除（重写整个文件）+ 更新 SUCCESS_LOG
          标 uploaded:true；仍失败则保留该条 pending。
     """
+    # 四个提前返回分支一律返回空累加器（而非 None）：main() 收尾要无条件
+    # 与主流程量相加，返回 None 会让调用方每次都得判空。
     if not S3_ENABLED:
         print("s3.enabled=false，未开启远端上传，无需补传。")
-        return
+        return new_upload_volume()
     if is_main_running():
         print(
             "检测到主流程（download_movies.py）正在运行，"
             "此时手动补传会与主流程并发操作 pending 文件、可能导致记录丢失。"
             "请在主流程结束后再执行 reupload。本次补传已忽略。"
         )
-        return
+        return new_upload_volume()
     if not os.path.exists(UPLOAD_PENDING_LOG):
         print(f"未找到 pending 日志 {UPLOAD_PENDING_LOG}，无待补传文件。")
-        return
+        return new_upload_volume()
 
     # 读入全部记录，同 tmdbId 只保留最新一条。
     latest_by_id = {}
@@ -4985,7 +5042,7 @@ def reupload_pending():
 
     if not latest_by_id:
         print(f"{UPLOAD_PENDING_LOG} 中无有效待补传记录。")
-        return
+        return new_upload_volume()
 
     print(f"共 {len(latest_by_id)} 个待补传文件，开始逐条补传...")
 
@@ -4993,7 +5050,7 @@ def reupload_pending():
     success_count = 0
     orphan_count = 0
     fail_count = 0
-    reuploaded_bytes = 0
+    volume = new_upload_volume()
 
     for tmdb_id in order:
         record = latest_by_id[tmdb_id]
@@ -5021,8 +5078,9 @@ def reupload_pending():
         print(f"  [{tmdb_id}] 补传中 -> {s3_key}")
         ok, reason = upload_to_r2(local_path, s3_key)
         if ok:
-            if file_size:
-                reuploaded_bytes += file_size
+            # 口径与主流程一致：取不到大小的记 unsized 并在收尾告警，
+            # 不能静默少算（补传恰恰是最容易碰上旧记录缺字段的路径）。
+            add_upload_volume(volume, file_size)
             # 视频进 R2 后，旁车资产也要跟着补 —— 它们在首次上传时因为视频失败
             # 而被整段跳过，这里是唯一的补救点。
             try:
@@ -5069,11 +5127,8 @@ def reupload_pending():
         f"补传完成：成功 {success_count}，仍失败 {fail_count}，"
         f"孤儿(本地已无)清理 {orphan_count}；pending 剩余 {len(remaining)} 条。"
     )
-    if reuploaded_bytes:
-        print(
-            f"本次补传上传 {bytes_to_gb(reuploaded_bytes):.2f} GB"
-            f"（{format_size(reuploaded_bytes)}）"
-        )
+    print_upload_volume("本次补传上传", volume)
+    return volume
 
 
 def report_storage():

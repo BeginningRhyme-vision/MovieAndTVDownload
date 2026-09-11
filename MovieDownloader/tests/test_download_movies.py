@@ -1798,6 +1798,178 @@ def test_report_storage_without_log(sandbox, monkeypatch, capsys):
     assert "无可统计的成品" in capsys.readouterr().out
 
 
+# ------------------------------------------ 容量累加器（跨重试/跨阶段不漏不重）
+
+def test_add_upload_volume_splits_sized_and_unsized():
+    volume = d.new_upload_volume()
+    d.add_upload_volume(volume, 1_000_000_000)
+    d.add_upload_volume(volume, 500_000_000)
+    d.add_upload_volume(volume, None)   # 取不到大小
+    d.add_upload_volume(volume, 0)      # 0 字节同样按"没有大小"处理
+    assert volume["uploaded_bytes"] == 1_500_000_000
+    assert volume["uploaded_sized"] == 2
+    assert volume["uploaded_unsized"] == 2
+
+
+def test_merge_upload_volume_sums_all_fields():
+    """主流程与补传两段求和，三个字段都要合，不能只合字节数。"""
+    main = d.new_upload_volume()
+    d.add_upload_volume(main, 1_000_000_000)
+    d.add_upload_volume(main, None)
+
+    extra = d.new_upload_volume()
+    d.add_upload_volume(extra, 2_000_000_000)
+
+    merged = d.merge_upload_volume(main, extra)
+    assert merged["uploaded_bytes"] == 3_000_000_000
+    assert merged["uploaded_sized"] == 2
+    assert merged["uploaded_unsized"] == 1
+
+
+def test_merge_upload_volume_tolerates_extra_keys():
+    """主流程的 stats 还带 conversions/uploads，合并补传量时不能被污染。"""
+    stats = {"conversions": 3, "uploads": 2}
+    stats.update(d.new_upload_volume())
+    d.add_upload_volume(stats, 1_000_000_000)
+
+    d.merge_upload_volume(stats, d.new_upload_volume())
+    # 非容量字段不因合并而变动（补传量里没有这两个 key）
+    assert stats["conversions"] == 3 and stats["uploads"] == 2
+    assert stats["uploaded_bytes"] == 1_000_000_000
+
+
+def test_print_upload_volume_is_silent_when_nothing_uploaded(capsys):
+    d.print_upload_volume("本次上传成功", d.new_upload_volume())
+    assert capsys.readouterr().out == ""
+
+
+def test_print_upload_volume_warns_about_unsized(capsys):
+    volume = d.new_upload_volume()
+    d.add_upload_volume(volume, 3_000_000_000)
+    d.add_upload_volume(volume, None)
+    d.print_upload_volume("本次上传成功", volume)
+    out = capsys.readouterr().out
+    assert "本次上传成功 1 部，总大小 3.00 GB" in out
+    assert "1000³" in out                 # 十进制口径必须写在输出里
+    assert "另有 1 部未能取到文件大小" in out
+
+
+# -------------------------------------------------- reupload 补传侧的容量口径
+
+@pytest.fixture
+def reupload_env(sandbox, monkeypatch):
+    """补传所需的最小环境：开启 S3、主流程锁未占用、上传恒成功。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: (True, None))
+    monkeypatch.setattr(d, "upload_sidecar_assets", lambda info, assets=None: [])
+    monkeypatch.setattr(d, "remove_upload_failure_from_log", lambda i: None)
+    return sandbox
+
+
+def _write_pending(records):
+    with open(d.UPLOAD_PENDING_LOG, "w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record) + "\n")
+
+
+def _make_local_video(sandbox, tmdb_id, size):
+    folder = sandbox / "movie_files" / str(tmdb_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{tmdb_id}.mp4"
+    path.write_bytes(b"x" * size)
+    return str(path)
+
+
+def test_reupload_returns_volume_of_successful_uploads(reupload_env, capsys):
+    """补传成功的量必须能被 main() 取回并入本次运行总量。"""
+    path_a = _make_local_video(reupload_env, "1", 100)
+    path_b = _make_local_video(reupload_env, "2", 100)
+    _write_pending([
+        {"tmdbId": "1", "local_path": path_a, "year": 2020,
+         "file_size_bytes": 1_000_000_000},
+        {"tmdbId": "2", "local_path": path_b, "year": 2020,
+         "file_size_bytes": 2_000_000_000},
+    ])
+
+    volume = d.reupload_pending()
+    assert volume["uploaded_bytes"] == 3_000_000_000
+    assert volume["uploaded_sized"] == 2
+    assert "本次补传上传 2 部，总大小 3.00 GB" in capsys.readouterr().out
+
+
+def test_reupload_measures_size_for_legacy_records(reupload_env):
+    """旧 pending 记录没有 file_size_bytes，必须在删本地之前就地补测，
+    否则这批片的容量永远补不回来。"""
+    path = _make_local_video(reupload_env, "7", 4096)
+    _write_pending([{"tmdbId": "7", "local_path": path, "year": 2020}])
+
+    volume = d.reupload_pending()
+    assert volume["uploaded_bytes"] == 4096
+    assert volume["uploaded_sized"] == 1
+    assert volume["uploaded_unsized"] == 0
+
+
+def test_reupload_counts_unsized_instead_of_silently_dropping(
+    reupload_env, monkeypatch, capsys
+):
+    """就地补测也失败时要记 unsized 并告警，不能静默少算（与主流程同口径）。"""
+    path = _make_local_video(reupload_env, "9", 100)
+    _write_pending([{"tmdbId": "9", "local_path": path, "year": 2020}])
+    monkeypatch.setattr(d, "_file_size", lambda p: None)
+
+    volume = d.reupload_pending()
+    assert volume["uploaded_bytes"] == 0
+    assert volume["uploaded_unsized"] == 1
+    assert "另有 1 部未能取到文件大小" in capsys.readouterr().out
+
+
+def test_reupload_excludes_failed_uploads_from_volume(reupload_env, monkeypatch):
+    """补传仍失败的片不得计入容量——它根本没进 R2。"""
+    path = _make_local_video(reupload_env, "3", 100)
+    _write_pending([
+        {"tmdbId": "3", "local_path": path, "year": 2020,
+         "file_size_bytes": 5_000_000_000},
+    ])
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: (False, "503"))
+
+    volume = d.reupload_pending()
+    assert volume["uploaded_bytes"] == 0
+    assert volume["uploaded_sized"] == 0
+
+
+def test_reupload_skips_orphans_without_counting(reupload_env):
+    """本地文件已不在（此前已补传成功）：只做消解，绝不重复计容量。"""
+    _write_pending([
+        {"tmdbId": "4", "local_path": str(reupload_env / "gone.mp4"),
+         "year": 2020, "file_size_bytes": 9_000_000_000},
+    ])
+
+    volume = d.reupload_pending()
+    assert volume["uploaded_bytes"] == 0
+    assert volume["uploaded_sized"] == 0
+
+
+def test_reupload_early_returns_give_empty_volume(sandbox, monkeypatch):
+    """四个提前返回分支都要给空累加器，否则 main() 合并时会 TypeError。"""
+    monkeypatch.setattr(d, "S3_ENABLED", False)
+    assert d.reupload_pending() == d.new_upload_volume()
+
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "is_main_running", lambda: True)
+    assert d.reupload_pending() == d.new_upload_volume()
+
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    # pending 文件不存在
+    assert d.reupload_pending() == d.new_upload_volume()
+
+    # pending 文件存在但全是坏行 -> 无有效记录
+    with open(d.UPLOAD_PENDING_LOG, "w", encoding="utf-8") as fh:
+        fh.write("坏行\n")
+    assert d.reupload_pending() == d.new_upload_volume()
+
+
 def test_unknown_resolution_constant_matches_literals():
     """护栏：常量与三处产出点用的必须是同一个字符串。
 
