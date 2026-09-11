@@ -43,13 +43,18 @@ _SRT = "1\n00:00:01,000 --> 00:00:03,500\nHello\n"
 
 @pytest.fixture
 def sandbox(tmp_path, monkeypatch):
-    """把落盘目录指到 tmp_path，并给定固定的语种/格式。"""
+    """把落盘目录指到 tmp_path，并给定固定的语种/格式。
+
+    默认关掉 REMOTE_MODE：这批用例验的是抓取/转换/容错本身，走本地落盘最直接。
+    R2 模式（生产默认）的专属行为在 remote_sandbox 那组用例里单独锁。
+    """
     monkeypatch.setattr(f.dm, "BASE_DIR", str(tmp_path / "downloads"))
     monkeypatch.setattr(f.dm, "FOLDER_PREFIX", "movies")
     monkeypatch.setattr(f, "SUBTITLE_LANGUAGES", ["en", "zh"])
     monkeypatch.setattr(f, "SUBTITLE_FORMATS", ["vtt", "srt"])
     monkeypatch.setattr(f, "SUBDL_API_KEY", "TESTKEY")
     monkeypatch.setattr(f, "STATE_LOG", str(tmp_path / "subtitles.jsonl"))
+    monkeypatch.setattr(f, "REMOTE_MODE", False)
     return tmp_path
 
 
@@ -273,3 +278,236 @@ def test_load_entries_dedupes_and_keeps_year(sandbox, monkeypatch):
     monkeypatch.setattr(f, "SUCCESS_LOG", str(path))
     entries = f.load_entries()
     assert entries == [{"tmdbId": "55", "title": "A2", "year": 2000}]
+
+
+# ==================================================== R2 模式（生产默认路径）
+#
+# 下载侧上传成功后会把整个影片目录删掉，所以"本地没有字幕目录"是最正常的
+# 状态，绝不能据此判定该片缺字幕。这组用例锁死：已有语种问 R2、新字幕传 R2、
+# 本地不留残留、meta.json 同步更新。
+
+class _FakeS3:
+    """最小 S3 桩：记录 upload/put，按预置对象列表回答 list/get。"""
+
+    def __init__(self, keys=None, meta=None):
+        self.keys = list(keys or [])
+        self.meta = meta
+        self.uploaded = []      # [(local_path, key)]
+        self.put_objects = {}   # key -> bytes
+        self.list_error = None
+        self.upload_error = None
+
+    def get_paginator(self, _name):
+        outer = self
+
+        class _P:
+            def paginate(self, Bucket=None, Prefix=""):
+                if outer.list_error:
+                    raise outer.list_error
+                yield {"Contents": [{"Key": k} for k in outer.keys
+                                    if k.startswith(Prefix)]}
+        return _P()
+
+    def get_object(self, Bucket=None, Key=None):
+        if self.meta is None:
+            raise RuntimeError("NoSuchKey")
+        return {"Body": io.BytesIO(json.dumps(self.meta).encode("utf-8"))}
+
+    def put_object(self, Bucket=None, Key=None, Body=None, **kwargs):
+        self.put_objects[Key] = Body
+
+
+@pytest.fixture
+def remote_sandbox(sandbox, monkeypatch):
+    """R2 模式：REMOTE_MODE=True，S3 client 换成可断言的假对象。"""
+    monkeypatch.setattr(f, "REMOTE_MODE", True)
+    monkeypatch.setattr(f.dm, "S3_BUCKET", "test-bucket")
+    monkeypatch.setattr(f.dm, "S3_PREFIX", "")
+    fake = _FakeS3()
+    monkeypatch.setattr(f.dm, "get_s3_client", lambda: fake)
+    monkeypatch.setattr(
+        f.dm, "upload_to_r2",
+        lambda local, key: (fake.uploaded.append((local, key)), (True, None))[1],
+    )
+    return fake
+
+
+def test_remote_existing_languages_come_from_r2(remote_sandbox, monkeypatch):
+    """R2 上已有 en，就只补 zh —— 哪怕本地目录根本不存在。"""
+    remote_sandbox.keys = [
+        "movies/2000/55/subs/en.srt", "movies/2000/55/subs/en.vtt",
+    ]
+    asked = []
+    monkeypatch.setattr(
+        f, "search_subtitles", lambda i: (asked.append(i), [])[1]
+    )
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "ok"
+    # 只有 zh 进了缺口，en 被 R2 上的已有文件挡住
+    assert result["missing"] == ["zh"]
+    assert asked == ["55"]
+
+
+def test_remote_all_languages_present_skips_subdl(remote_sandbox, monkeypatch):
+    """R2 上两种语言都齐了就直接跳过，一次 SubDL 请求都不发。"""
+    remote_sandbox.keys = [
+        "movies/2000/55/subs/en.srt", "movies/2000/55/subs/zh.vtt",
+    ]
+    monkeypatch.setattr(f, "search_subtitles", _never_called)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "skipped"
+
+
+def _never_called(*_args, **_kwargs):
+    raise AssertionError("不该请求 SubDL")
+
+
+def test_remote_list_failure_skips_the_movie(remote_sandbox, monkeypatch, capsys):
+    """列举 R2 失败时跳过该片，而不是当成'没有字幕'去重抓一遍。"""
+    remote_sandbox.list_error = RuntimeError("R2 503")
+    monkeypatch.setattr(f, "search_subtitles", _never_called)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "list_failed"
+    assert "列举 R2 字幕失败" in capsys.readouterr().out
+
+
+def test_remote_uploads_subtitles_and_leaves_no_local_files(
+    remote_sandbox, monkeypatch
+):
+    """字幕必须进 R2，且本地不留任何残留（临时目录要删干净）。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+    ])
+    monkeypatch.setattr(
+        f, "request_with_retry",
+        lambda *a, **k: _FakeZipResp(_zip_bytes({"m.srt": _SRT})),
+    )
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+
+    assert result["status"] == "ok"
+    assert sorted(result["saved"]) == ["en.srt", "en.vtt"]
+    keys = sorted(k for _, k in remote_sandbox.uploaded)
+    assert keys == ["movies/2000/55/subs/en.srt", "movies/2000/55/subs/en.vtt"]
+    # 本地影片目录不该被重新造出来
+    assert not os.path.exists(f.dm.movie_dir("55", 2000))
+    # 临时目录也必须清掉
+    for local, _ in remote_sandbox.uploaded:
+        assert not os.path.exists(local)
+
+
+def test_remote_upload_failure_is_not_reported_as_saved(
+    remote_sandbox, monkeypatch
+):
+    """上传失败的字幕不能算已保存——它并没有进 R2。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+    ])
+    monkeypatch.setattr(
+        f, "request_with_retry",
+        lambda *a, **k: _FakeZipResp(_zip_bytes({"m.srt": _SRT})),
+    )
+    monkeypatch.setattr(f.dm, "upload_to_r2", lambda l, k: (False, "403"))
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "upload_failed"
+    assert result["saved"] == []
+
+
+def test_remote_meta_json_gets_the_new_subtitles(remote_sandbox, monkeypatch):
+    """新补的字幕要并进 R2 上 meta.json 的 subtitles[]，否则前端索引不到。"""
+    remote_sandbox.meta = {
+        "tmdbId": "55",
+        "subtitles": [{"language": "fr", "format": "vtt",
+                       "path": "subs/fr.vtt"}],
+    }
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+    ])
+    monkeypatch.setattr(
+        f, "request_with_retry",
+        lambda *a, **k: _FakeZipResp(_zip_bytes({"m.srt": _SRT})),
+    )
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+
+    assert result["metaUpdated"] is True
+    written = json.loads(remote_sandbox.put_objects["movies/2000/55/meta.json"])
+    paths = sorted(e["path"] for e in written["subtitles"])
+    # 原有的 fr 保留，新增 en 的两种格式
+    assert paths == ["subs/en.srt", "subs/en.vtt", "subs/fr.vtt"]
+    assert "subtitlesUpdatedAt" in written
+
+
+def test_remote_meta_update_does_not_duplicate_entries(remote_sandbox):
+    """重复跑不该在 subtitles[] 里堆出重复条目。"""
+    remote_sandbox.meta = {
+        "subtitles": [{"language": "en", "format": "srt",
+                       "path": "subs/en.srt"}],
+    }
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) is False
+    assert remote_sandbox.put_objects == {}
+
+
+def test_remote_missing_meta_does_not_break_subtitles(
+    remote_sandbox, monkeypatch, capsys
+):
+    """meta.json 不存在时，字幕上传本身仍然算成功。"""
+    remote_sandbox.meta = None     # get_object 会抛 NoSuchKey
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+    ])
+    monkeypatch.setattr(
+        f, "request_with_retry",
+        lambda *a, **k: _FakeZipResp(_zip_bytes({"m.srt": _SRT})),
+    )
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "ok"
+    assert sorted(result["saved"]) == ["en.srt", "en.vtt"]
+    assert result["metaUpdated"] is False
+    assert "读取 meta.json 失败" in capsys.readouterr().out
+
+
+# ------------------------------- 只给"已进 R2"的片补字幕（避免畸形目录）
+
+def test_remote_skips_movies_not_yet_uploaded(sandbox, monkeypatch, capsys):
+    """uploaded=false 的片还没进 R2，给它传字幕会造出「有字幕没视频」的目录。
+
+    下载侧对上传失败/槽位超时降级的片也会写 success.jsonl(uploaded=false)，
+    等 reupload 补传。字幕要等它真正进了 R2 再补。
+    """
+    monkeypatch.setattr(f, "REMOTE_MODE", True)
+    path = sandbox / "success.jsonl"
+    path.write_text(
+        json.dumps({"tmdbId": "1", "title": "已上传", "year": 2000,
+                    "uploaded": True}) + "\n"
+        + json.dumps({"tmdbId": "2", "title": "待补传", "year": 2000,
+                      "uploaded": False}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(f, "SUCCESS_LOG", str(path))
+
+    entries = f.load_entries()
+    assert [e["tmdbId"] for e in entries] == ["1"]
+    assert "跳过 1 部尚未上传 R2 的影片" in capsys.readouterr().out
+
+
+def test_local_mode_still_takes_every_downloaded_movie(sandbox, monkeypatch):
+    """纯本地模式没有 R2 的概念，uploaded 字段不该影响取数。"""
+    path = sandbox / "success.jsonl"
+    path.write_text(
+        json.dumps({"tmdbId": "1", "year": 2000, "uploaded": False}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(f, "SUCCESS_LOG", str(path))
+    # sandbox fixture 已把 REMOTE_MODE 置 False
+    assert [e["tmdbId"] for e in f.load_entries()] == ["1"]
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("en.srt", "en"),
+    ("movies/2000/55/subs/zh.vtt", "zh"),
+    ("zh-CN.srt", "zh-cn"),          # 带地区码统一小写
+    ("EN.VTT", "en"),
+    ("noextension", None),           # 畸形残留，忽略
+])
+def test_language_extraction_is_shared_by_both_modes(name, expected):
+    """R2 与本地两侧必须用同一套语种判据，否则同一部片在两种模式下结论不同。"""
+    assert f._language_of(name) == expected
