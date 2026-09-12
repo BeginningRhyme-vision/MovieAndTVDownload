@@ -22,6 +22,7 @@ TVDownloader/probe_sources.py
 # 运行期产物，不纳入 git 跟踪
 MovieDownloader/download_movies.main.lock
 MovieDownloader/tmdb_ids_to_links.main.lock
+MovieDownloader/fetch_subtitles.lock
 MovieDownloader/upload_pending.jsonl
 TVDownloader/download_tv.main.lock
 TVDownloader/upload_pending.jsonl

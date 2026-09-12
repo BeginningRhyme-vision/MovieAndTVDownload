@@ -7,7 +7,7 @@
 import io
 import json
 import os
-import re
+import shutil
 import threading
 import zipfile
 
@@ -64,6 +64,12 @@ def sandbox(tmp_path, monkeypatch):
     # 且失败原因极难看出。
     monkeypatch.setattr(f, "stop_fetching", threading.Event())
     monkeypatch.setattr(f, "stop_reason", {})
+    # 限流冷却是真 sleep，用例里一律归零；冷却窗口也要重置，免得串台。
+    monkeypatch.setattr(f, "THROTTLE_COOLDOWN", 0)
+    monkeypatch.setattr(f, "_throttle_until", 0.0)
+    # 本地模式只给"影片目录还在"的片补字幕；用例里常用的几个 id 先把目录造出来。
+    for tid in ("1", "2", "55", "56"):
+        os.makedirs(f.dm.movie_dir(tid, 2000), exist_ok=True)
     return tmp_path
 
 
@@ -80,6 +86,18 @@ def test_subs_dir_uses_same_year_fallback_as_downloader(sandbox):
     """year 缺失时两侧必须落到同一个 unknown_year，否则字幕与视频分家。"""
     assert f.subs_dir("55", None).startswith(f.dm.movie_dir("55", None))
     assert "unknown_year" in f.subs_dir("55", None)
+
+
+def test_local_mode_skips_deleted_movie_dir(sandbox, monkeypatch):
+    """影片目录已被用户删掉：不该凭空造出一个只有 subs/ 的孤立目录。"""
+    shutil.rmtree(f.dm.movie_dir("55", 2000))
+    called = []
+    monkeypatch.setattr(f, "search_subtitles",
+                        lambda *a, **k: (called.append(1), [])[1])
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["status"] == "local_missing"
+    assert called == []
+    assert not os.path.exists(f.dm.movie_dir("55", 2000))
 
 
 # ---------------------------------------------- 「可有可无」：不因字幕而失败
@@ -100,7 +118,7 @@ def test_missing_success_log_returns_empty(sandbox, monkeypatch, capsys):
 
 def test_search_failure_does_not_raise(sandbox, monkeypatch):
     """SubDL 查询失败只标记该片，不抛异常。"""
-    def boom(_):
+    def boom(*_a, **_k):
         raise RuntimeError("SubDL 503")
 
     monkeypatch.setattr(f, "search_subtitles", boom)
@@ -115,7 +133,7 @@ def test_one_language_failure_keeps_the_other(sandbox, monkeypatch):
     🔑 网络失败归 fetch_failed 而**不是** missing：missing 会进缺口台账、
     从此不再尝试，一次网络抖动就把该语种永久判死了。
     """
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
         {"language": "ZH", "url": "/zh.zip"},
     ])
@@ -135,7 +153,7 @@ def test_one_language_failure_keeps_the_other(sandbox, monkeypatch):
 
 def test_no_subtitle_found_is_not_an_error(sandbox, monkeypatch):
     """源站没有该片字幕是常态，状态仍是 ok、只记 missing。"""
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [])
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [])
     _, result = f.download_one({"tmdbId": "55", "year": 2000})
     assert result["status"] == "ok"
     assert sorted(result["missing"]) == ["en", "zh"]
@@ -177,7 +195,7 @@ def test_languages_already_present_are_skipped(sandbox, monkeypatch):
     for name in ("en.vtt", "en.srt", "zh.vtt", "zh.srt"):
         open(os.path.join(target, name), "w").close()
 
-    def boom(_):
+    def boom(*_a, **_k):
         raise AssertionError("已有字幕不该再查 SubDL")
 
     monkeypatch.setattr(f, "search_subtitles", boom)
@@ -191,7 +209,7 @@ def test_only_missing_language_is_fetched(sandbox, monkeypatch):
     os.makedirs(target)
     open(os.path.join(target, "en.vtt"), "w").close()
 
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "ZH", "url": "/zh.zip"},
     ])
 
@@ -217,30 +235,77 @@ def test_srt_source_is_written_as_both_formats(sandbox):
     assert "00:00:01.000 --> 00:00:03.500" in vtt
 
 
-def test_ass_is_kept_as_is(sandbox):
-    """ass/ssa 的结构与 srt/vtt 完全不同，不做转换、原样保存。
+def test_ass_is_not_written(sandbox):
+    """🔑 ass/ssa 不落盘、返回 []。
 
-    ⚠️ 参数必须与生产调用一致：download_one 传的是 `extension.lstrip(".")`，
-    即**不带点**的扩展名。早先本用例传 ".ass"（带点），与 srt 用例传 "srt"
-    （不带点）自相矛盾，掩盖了拼出 "enass"（无扩展名）的真实 bug。
+    前端 <track> 只认 vtt。历史版本曾原样存成 en.ass，结果该语种被一个用不了
+    的文件"锁死"——_language_of 认为已有，永不再补。
     """
     target = f.subs_dir("55", 2000)
     os.makedirs(target)
     saved = f._write_variants(target, "en", "[Script Info]\n", "ass")
-    assert saved == ["en.ass"]
-    assert os.path.isfile(os.path.join(target, "en.ass"))
+    assert saved == []
+    assert os.listdir(target) == []
 
 
-def test_ass_filename_matches_skip_pattern(sandbox):
-    """原样保存的文件名必须能被"已存在语种"正则认出。
-
-    否则每次运行都会重新抓一遍并再写一个同样的坏文件名。
-    """
+def test_stale_ass_file_does_not_count_as_existing(sandbox):
+    """R2/本地上残留的旧 en.ass 不能算"en 已有"，否则该语种永远补不上。"""
+    assert f._language_of("en.ass") is None
+    assert f._language_of("movies/2000/55/subs/zh.ssa") is None
     target = f.subs_dir("55", 2000)
     os.makedirs(target)
-    f._write_variants(target, "en", "[Script Info]\n", "ass")
-    names = os.listdir(target)
-    assert any(re.fullmatch(r"en\.\w+", n) for n in names), names
+    open(os.path.join(target, "en.ass"), "w").close()
+    assert f._existing_languages_local(target) == set()
+
+
+def test_ass_candidate_is_skipped_for_the_next_one(sandbox, monkeypatch):
+    """第一条候选解出来是 ASS 时换下一条，拿到 srt 才算数。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
+        {"language": "EN", "url": "/ass.zip"},
+        {"language": "EN", "url": "/srt.zip"},
+    ])
+
+    def fake_request(method, url, **kwargs):
+        if "/ass.zip" in url:
+            return _FakeZipResp(_zip_bytes({"m.ass": _ASS}))
+        return _FakeZipResp(_zip_bytes({"m.srt": _SRT}))
+
+    monkeypatch.setattr(f, "request_with_retry", fake_request)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert sorted(result["saved"]) == ["en.srt", "en.vtt"]
+    assert result["missing"] == ["zh"]
+    assert result["fetch_failed"] == []
+
+
+def test_only_ass_candidates_become_missing_not_fetch_failed(sandbox, monkeypatch):
+    """候选全是 ASS：结论是确定性的（下次还是这批 zip），归 missing 进台账。"""
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
+        {"language": "EN", "url": "/a.zip"},
+        {"language": "EN", "url": "/b.zip"},
+        {"language": "EN", "url": "/c.zip"},
+    ])
+    fetched = []
+
+    def fake_request(method, url, **kwargs):
+        fetched.append(url)
+        return _FakeZipResp(_zip_bytes({"m.ass": _ASS}))
+
+    monkeypatch.setattr(f, "request_with_retry", fake_request)
+    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    assert result["saved"] == []
+    assert "en" in result["missing"]
+    assert result["fetch_failed"] == []
+    assert len(fetched) == f.MAX_CANDIDATES_PER_LANGUAGE, "每试一条都烧额度，必须封顶"
+
+
+def test_extract_prefers_srt_over_bigger_ass_in_same_zip():
+    """同一 zip 里 srt 与 ass 并存时选 srt，哪怕 ass 体积更大。"""
+    content, ext = f.extract_srt(_zip_bytes({
+        "m.ass": _ASS * 20,
+        "m.srt": _SRT,
+    }))
+    assert ext == ".srt"
+    assert content.decode() == _SRT
 
 
 def test_oversized_zip_is_rejected(sandbox, monkeypatch):
@@ -254,7 +319,7 @@ def test_oversized_zip_is_rejected(sandbox, monkeypatch):
                 yield b"x" * 8
 
     monkeypatch.setattr(f, "MAX_ZIP_BYTES", 10)
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
     ])
     monkeypatch.setattr(f, "request_with_retry", lambda *a, **k: CountingResp())
@@ -280,6 +345,116 @@ def test_pick_best_skips_full_season_packs():
     assert f.pick_best(subs, "en")["url"] == "/movie.zip"
 
 
+def test_pick_candidates_is_capped_and_ordered():
+    """候选按 SubDL 顺序返回，且封顶——每试一条都烧一次下载额度。"""
+    subs = [{"language": "EN", "url": f"/{i}.zip"} for i in range(5)]
+    picked = f.pick_candidates(subs, "en")
+    assert [p["url"] for p in picked] == ["/0.zip", "/1.zip"]
+    assert len(picked) == f.MAX_CANDIDATES_PER_LANGUAGE
+
+
+def test_pick_candidates_uses_mapped_language_code():
+    """config 写 pt-br，SubDL 返回的是 BR_PT——必须经映射比较，否则永远比不上。"""
+    subs = [{"language": "BR_PT", "url": "/a.zip"}]
+    assert f.pick_candidates(subs, "pt-br") == subs
+    assert f.pick_candidates([{"language": "ZH", "url": "/z.zip"}], "zh-cn")
+
+
+# ------------------------------------------------------------- 语种码映射/校验
+# 2026-09-12 实测：SubDL 对未知语种码**不报错**而是返回全语种结果，光看
+# "查到了东西"发现不了配置写错；且 PT_BR 的结果 language 字段是 BR_PT。
+
+@pytest.mark.parametrize("lang,expected", [
+    ("en", "EN"),
+    ("zh", "ZH"),
+    ("zh-cn", "ZH"),
+    ("zh-TW", "ZH"),
+    ("pt-br", "BR_PT"),
+    ("en-US", "EN"),
+    ("fre", "FRE"),
+    ("", None),
+    (None, None),
+    ("chinese", None),
+    ("zh cn", None),
+    ("x", None),
+])
+def test_subdl_language_code_mapping(lang, expected):
+    assert f.subdl_language_code(lang) == expected
+
+
+def test_unsupported_language_is_warned_and_never_queried(
+    sandbox, monkeypatch, capsys
+):
+    """映射不出的语种：启动告警、不进 pending、不进台账，其余语种照常补。"""
+    monkeypatch.setattr(f, "SUBTITLE_LANGUAGES", ["en", "chinese"])
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "55", "title": "A", "year": 2000},
+    ])
+    asked = []
+
+    def fake_search(tmdb_id, languages=None, **_k):
+        asked.append(list(languages))
+        return []
+
+    monkeypatch.setattr(f, "search_subtitles", fake_search)
+    f.main()
+
+    out = capsys.readouterr().out
+    assert "['chinese'] 无法映射为 SubDL 语种码" in out
+    assert asked == [["en"]], "不合法语种不该被查"
+    assert f.load_ledger().get("55") == {"en"}, "不合法语种不该进台账"
+
+
+def test_search_sends_mapped_codes_and_media_type(sandbox, monkeypatch):
+    """搜索请求带的是映射后的 SubDL 码与 type 参数，重复码只查一次。"""
+    sent = []
+
+    class _Resp:
+        def json(self):
+            return {"status": True, "subtitles": []}
+
+    def fake_keys(method, url, params=None, **_k):
+        sent.append(dict(params))
+        return _Resp()
+
+    monkeypatch.setattr(f, "request_with_keys", fake_keys)
+    f.search_subtitles("55", ["zh", "zh-cn", "pt-br"], media_type="tv")
+    assert [p["languages"] for p in sent] == ["ZH", "BR_PT"]
+    assert {p["type"] for p in sent} == {"tv"}
+
+
+# --------------------------------------------------------- movie / tv 类型
+# SubDL 用 type 决定拿 tmdb_id 查哪张表，电影与剧集是两个独立编号空间。
+
+@pytest.mark.parametrize("title_type,expected", [
+    ("movie", "movie"),
+    ("tvSeries", "tv"),
+    ("tvMiniSeries", "tv"),
+    ("TVSPECIAL", "tv"),
+    # tvMovie 在 TMDB 落电影编号空间（见 test_fetch_movie_metadata 的 KEEP_TYPES 契约），
+    # 必须按 movie 查，否则会 not_in_subdl 进台账永久放弃。
+    ("tvMovie", "movie"),
+    (None, "movie"),
+    ("", "movie"),
+])
+def test_media_type_follows_title_type(title_type, expected):
+    assert f._media_type_of(title_type) == expected
+
+
+def test_download_one_passes_media_type_to_search(sandbox, monkeypatch):
+    seen = {}
+
+    def fake_search(tmdb_id, languages=None, media_type="movie"):
+        seen["type"] = media_type
+        return []
+
+    monkeypatch.setattr(f, "search_subtitles", fake_search)
+    f.download_one({"tmdbId": "55", "year": 2000, "title_type": "tvSeries"})
+    assert seen["type"] == "tv"
+    f.download_one({"tmdbId": "56", "year": 2000})
+    assert seen["type"] == "movie", "老记录缺 title_type 时按电影处理"
+
+
 def test_load_entries_dedupes_and_keeps_year(sandbox, monkeypatch):
     """success.jsonl 同片多条时取最后一条；year 必须带出来（拼目录要用）。"""
     path = sandbox / "success.jsonl"
@@ -292,7 +467,22 @@ def test_load_entries_dedupes_and_keeps_year(sandbox, monkeypatch):
     )
     monkeypatch.setattr(f, "SUCCESS_LOG", str(path))
     entries = f.load_entries()
-    assert entries == [{"tmdbId": "55", "title": "A2", "year": 2000}]
+    assert entries == [
+        {"tmdbId": "55", "title": "A2", "year": 2000, "title_type": None}
+    ]
+
+
+def test_load_entries_keeps_title_type(sandbox, monkeypatch):
+    """带 title_type 的记录要把类型带出来，剧集才能按 type=tv 去查。"""
+    path = sandbox / "success.jsonl"
+    path.write_text(
+        json.dumps({"tmdbId": "1", "year": 2000, "title_type": "tvSeries"}) + "\n"
+        + json.dumps({"tmdbId": "2", "year": 2000, "titleType": "movie"}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(f, "SUCCESS_LOG", str(path))
+    types = {e["tmdbId"]: e["title_type"] for e in f.load_entries()}
+    assert types == {"1": "tvSeries", "2": "movie"}
 
 
 # ==================================================== R2 模式（生产默认路径）
@@ -373,6 +563,9 @@ def remote_sandbox(sandbox, monkeypatch):
     monkeypatch.setattr(f, "REMOTE_MODE", True)
     monkeypatch.setattr(f.dm, "S3_BUCKET", "test-bucket")
     monkeypatch.setattr(f.dm, "S3_PREFIX", "")
+    # R2 模式下本地影片目录在上传成功那一刻就删了：把 sandbox 预建的目录清掉，
+    # 才能验"本地不留任何残留"。
+    shutil.rmtree(f.dm.BASE_DIR, ignore_errors=True)
     fake = _FakeS3()
     monkeypatch.setattr(f.dm, "get_s3_client", lambda: fake)
     monkeypatch.setattr(
@@ -389,7 +582,7 @@ def test_remote_existing_languages_come_from_r2(remote_sandbox, monkeypatch):
     ]
     asked = []
     monkeypatch.setattr(
-        f, "search_subtitles", lambda i: (asked.append(i), [])[1]
+        f, "search_subtitles", lambda i, *_a, **_k: (asked.append(i), [])[1]
     )
     _, result = f.download_one({"tmdbId": "55", "year": 2000})
     assert result["status"] == "ok"
@@ -425,7 +618,7 @@ def test_remote_uploads_subtitles_and_leaves_no_local_files(
     remote_sandbox, monkeypatch
 ):
     """字幕必须进 R2，且本地不留任何残留（临时目录要删干净）。"""
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
     ])
     monkeypatch.setattr(
@@ -449,7 +642,7 @@ def test_remote_upload_failure_is_not_reported_as_saved(
     remote_sandbox, monkeypatch
 ):
     """上传失败的字幕不能算已保存——它并没有进 R2。"""
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
     ])
     monkeypatch.setattr(
@@ -469,7 +662,7 @@ def test_remote_meta_json_gets_the_new_subtitles(remote_sandbox, monkeypatch):
         "subtitles": [{"language": "fr", "format": "vtt",
                        "path": "subs/fr.vtt"}],
     }
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
     ])
     monkeypatch.setattr(
@@ -492,7 +685,7 @@ def test_remote_meta_update_does_not_duplicate_entries(remote_sandbox):
         "subtitles": [{"language": "en", "format": "srt",
                        "path": "subs/en.srt"}],
     }
-    assert f._update_remote_meta("55", 2000, ["en.srt"]) is False
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) == (True, 0)
     assert remote_sandbox.put_objects == {}
 
 
@@ -501,7 +694,7 @@ def test_remote_missing_meta_does_not_break_subtitles(
 ):
     """meta.json 不存在时，字幕上传本身仍然算成功。"""
     remote_sandbox.meta = None     # get_object 会抛 NoSuchKey
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
     ])
     monkeypatch.setattr(
@@ -614,9 +807,18 @@ def test_ass_body_declared_as_srt_is_not_written_as_srt(sandbox):
     os.makedirs(target)
     saved = f._write_variants(target, "en", _ASS, "srt")   # 谎称 srt
 
-    assert saved == ["en.ass"], "必须识破并按 ass 原样保存"
+    assert saved == [], "必须识破，且 ASS 不落盘"
     assert not os.path.exists(os.path.join(target, "en.srt"))
     assert not os.path.exists(os.path.join(target, "en.vtt"))
+    assert not os.path.exists(os.path.join(target, "en.ass"))
+
+
+def test_remote_meta_ignores_non_track_formats(remote_sandbox):
+    """meta.json 的 subtitles[] 只索引 srt/vtt：前端 <track> 不认 ass。"""
+    remote_sandbox.meta = {"tmdbId": "55", "subtitles": []}
+    assert f._update_remote_meta("55", 2000, ["en.ass", "en.srt"]) == (True, 1)
+    written = json.loads(remote_sandbox.put_objects["movies/2000/55/meta.json"])
+    assert [e["path"] for e in written["subtitles"]] == ["subs/en.srt"]
 
 
 # ------------------------------------------------------- API Key 的读取来源
@@ -735,7 +937,7 @@ def test_quota_exhaustion_does_not_pollute_missing(sandbox, monkeypatch):
     missing 的语义是"源站没有这个语种"。把配额问题混进去，下次运行会以为
     已经查过了（实际一次都没查成），这些片就永远补不上字幕了。
     """
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
         {"language": "ZH", "url": "/zh.zip"},
     ])
@@ -754,7 +956,7 @@ def test_quota_exhaustion_does_not_pollute_missing(sandbox, monkeypatch):
 
 def test_quota_exhaustion_stops_remaining_movies(sandbox, monkeypatch):
     """撞上额度耗尽后，剩下的片直接跳过，不再发注定失败的请求。"""
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
     ])
     attempts = []
@@ -777,7 +979,7 @@ def test_quota_exhaustion_stops_remaining_movies(sandbox, monkeypatch):
 
 def test_quota_exhaustion_keeps_already_saved_subtitles(sandbox, monkeypatch):
     """额度在中途用尽时，前面已经拿到的语种必须照常保留、照常落盘。"""
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
         {"language": "ZH", "url": "/zh.zip"},
     ])
@@ -842,7 +1044,7 @@ def test_strip_api_key_leaves_only_the_path(url, expected):
 def test_download_uses_the_pool_key_not_the_one_in_the_url(sandbox, monkeypatch):
     """🔑 端到端护栏：请求用的必须是池子当前的 key，且只出现一次。"""
     monkeypatch.setattr(f, "key_pool", f.KeyPool(["POOLKEY"]))
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/subtitle/1-2.zip?api_key=STALEKEY"},
     ])
     seen = {}
@@ -898,7 +1100,10 @@ def test_persistent_429_becomes_search_throttled(sandbox, monkeypatch):
 
 
 def test_non_429_failure_still_raises_original_error(sandbox, monkeypatch):
-    """🔑 只有 429 才算限流。别的错误必须原样上抛，否则排查时看不到真因。"""
+    """🔑 只有 429 才算限流。别的错误必须原样上抛，否则排查时看不到真因。
+    失败的响应还得 close 掉：stream=True 的连接不关会一直占着。"""
+    closed = []
+
     class _Resp:
         status_code = 500
 
@@ -909,13 +1114,14 @@ def test_non_429_failure_still_raises_original_error(sandbox, monkeypatch):
             raise requests.HTTPError("500 Server Error")
 
         def close(self):
-            pass
+            closed.append(1)
 
     monkeypatch.setattr(f.requests, "request", lambda *a, **k: _Resp())
     monkeypatch.setattr(f.time, "sleep", lambda _: None)
 
     with pytest.raises(requests.HTTPError, match="500"):
         f.request_with_retry("GET", "https://api.subdl.com/api/v1/subtitles")
+    assert len(closed) == f.RETRY_MAX
 
 
 def test_throttled_search_is_not_counted_as_search_failed(sandbox, monkeypatch):
@@ -924,7 +1130,7 @@ def test_throttled_search_is_not_counted_as_search_failed(sandbox, monkeypatch):
     混进 search_failed 的后果：那个数字里混着两类完全不同的片，既没法据此
     剔除真的查不到的，也看不出有多少片其实只是没查成、下次该重试。
     """
-    def throttled(_tmdb_id):
+    def throttled(*_a, **_k):
         raise f.SearchThrottled("429 Too Many Requests")
 
     monkeypatch.setattr(f, "search_subtitles", throttled)
@@ -939,7 +1145,7 @@ def test_throttled_search_stops_remaining_movies(sandbox, monkeypatch):
     """限流是全局状态，剩下的片不该一部部撞死在同一面墙上。"""
     calls = []
 
-    def throttled(tmdb_id):
+    def throttled(tmdb_id, *_a, **_k):
         calls.append(tmdb_id)
         raise f.SearchThrottled("429 Too Many Requests")
 
@@ -954,21 +1160,41 @@ def test_throttled_search_stops_remaining_movies(sandbox, monkeypatch):
     assert len(calls) == 1, "闸门落下后不该再查"
 
 
-def test_real_not_found_is_still_search_failed(sandbox, monkeypatch):
-    """回归护栏：真正查不到的片仍归 search_failed，没被这次改动带走。"""
-    def not_found(_tmdb_id):
+def test_real_not_found_is_recorded_in_the_ledger(sandbox, monkeypatch):
+    """🔑 SubDL 库里没有这个 tmdb_id：确定性结论，全部语种进台账。
+
+    早先它走 search_failed 不进台账，每次运行都把库里没有的片重搜一遍，
+    库大了以后纯属噪音。与 search_throttled（要重试）必须分开。
+    """
+    def not_found(*_a, **_k):
         raise RuntimeError("can't find movie or tv")
 
     monkeypatch.setattr(f, "search_subtitles", not_found)
-    _, result = f.download_one({"tmdbId": "55", "year": 2000})
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "55", "title": "A", "year": 2000},
+    ])
+    f.main()
 
-    assert result["status"] == "search_failed"
-    assert "can't find movie or tv" in result["error"]
+    assert f.load_ledger()["55"] == {"en", "zh"}
+    assert not f.stop_fetching.is_set(), "查不到一部片不该拦下后面的片"
+
+
+def test_other_search_errors_still_stay_out_of_the_ledger(sandbox, monkeypatch):
+    """回归护栏：只有那条固定错误消息才进台账，其它查询失败仍是 search_failed。"""
+    def boom(*_a, **_k):
+        raise RuntimeError("SubDL 503")
+
+    monkeypatch.setattr(f, "search_subtitles", boom)
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "55", "title": "A", "year": 2000},
+    ])
+    f.main()
+    assert f.load_ledger() == {}
 
 
 def test_skipped_movies_report_the_actual_stop_reason(sandbox, monkeypatch):
     """被闸门拦下的片要报真实原因，不能把限流笼统说成额度耗尽。"""
-    monkeypatch.setattr(f, "search_subtitles", lambda _: (_ for _ in ()).throw(
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: (_ for _ in ()).throw(
         f.SearchThrottled("429 Too Many Requests")
     ))
     f.download_one({"tmdbId": "1", "year": 2000})
@@ -1028,7 +1254,7 @@ def test_search_failure_log_does_not_leak_the_key(sandbox, monkeypatch, capsys):
         {"tmdbId": "1", "title": "A", "year": 2000},
     ])
 
-    def leaky(_tmdb_id):
+    def leaky(*_a, **_k):
         raise requests.HTTPError(
             "429 for url: https://api.subdl.com/x?api_key=subdl_SECRET"
         )
@@ -1168,18 +1394,73 @@ def test_stop_only_after_every_key_is_exhausted(sandbox, monkeypatch):
     assert f.stop_reason["status"] == "quota_exhausted"
 
 
-def test_throttled_key_is_also_rotated(sandbox, monkeypatch):
-    """被限流的 key 同样换人：对这个 key 而言已经没法继续了。"""
+def test_throttled_key_is_not_retired(sandbox, monkeypatch):
+    """🔑 短时限流不换 key：冷却后用**同一个** key 重试成功。
+
+    早先 throttled 也退役 key。4 个线程并发打搜索接口，一次短时限流就能把
+    所有 key 串烧光、报"全部 key 被限流"停跑——其实每个 key 额度都还在。
+    """
     monkeypatch.setattr(f, "key_pool", f.KeyPool(["k1", "k2"]))
-    monkeypatch.setattr(f, "stop_fetching", threading.Event())
+    monkeypatch.setattr(f, "THROTTLE_COOLDOWN", 0)
+    used = []
 
     def fake_retry(method, url, params=None, **kwargs):
-        if params["api_key"] == "k1":
+        used.append(params["api_key"])
+        if len(used) == 1:
             raise f.SearchThrottled("429")
         return "OK"
 
     monkeypatch.setattr(f, "request_with_retry", fake_retry)
     assert f.request_with_keys("GET", "https://x") == "OK"
+    assert used == ["k1", "k1"], "限流后必须还是 k1"
+    assert f.key_pool.exhausted_count() == 0, "限流不能烧掉 key"
+    assert not f.stop_fetching.is_set()
+
+
+def test_throttle_cooldown_is_global_and_bounded(sandbox, monkeypatch):
+    """冷却走全局窗口；连续 THROTTLE_MAX_ROUNDS 轮仍 429 才落闸上抛。"""
+    monkeypatch.setattr(f, "key_pool", f.KeyPool(["k1"]))
+    slept = []
+    monkeypatch.setattr(f.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(f, "_throttle_until", 0.0)
+    monkeypatch.setattr(f, "THROTTLE_COOLDOWN", 7)
+    calls = []
+
+    def always_throttled(method, url, params=None, **kwargs):
+        calls.append(params["api_key"])
+        raise f.SearchThrottled("429")
+
+    monkeypatch.setattr(f, "request_with_retry", always_throttled)
+    with pytest.raises(f.SearchThrottled):
+        f.request_with_keys("GET", "https://x")
+
+    assert len(calls) == f.THROTTLE_MAX_ROUNDS + 1
+    assert len(slept) == f.THROTTLE_MAX_ROUNDS
+    assert all(0 < s <= 7 for s in slept)
+    assert f.key_pool.current() == "k1", "key 仍然在，没被退役"
+    assert f.stop_reason["status"] == "search_throttled"
+
+
+def test_concurrent_throttle_waits_share_one_window(sandbox, monkeypatch):
+    """两个线程几乎同时撞 429 时只推一次窗口，第二个不再叠加一轮。"""
+    monkeypatch.setattr(f, "_throttle_until", 0.0)
+    monkeypatch.setattr(f, "THROTTLE_COOLDOWN", 5)
+    slept = []
+    monkeypatch.setattr(f.time, "sleep", lambda s: slept.append(s))
+
+    first = f._wait_for_throttle()
+    second = f._wait_for_throttle()
+    assert first == 5
+    assert second <= first, "第二个只等到同一时刻，不再叠加"
+
+
+def test_threads_bail_out_once_throttle_stop_is_signalled(sandbox, monkeypatch):
+    """别的线程已判定限流不可恢复时，本线程不再各自冷却一轮，直接上抛。"""
+    monkeypatch.setattr(f, "key_pool", f.KeyPool(["k1"]))
+    f._signal_stop("search_throttled", "429")
+    monkeypatch.setattr(f, "request_with_retry", _never_called)
+    with pytest.raises(f.SearchThrottled):
+        f.request_with_keys("GET", "https://x")
 
 
 def test_finish_message_differs_from_quota_exhausted_message(
@@ -1246,7 +1527,7 @@ def test_meta_update_sends_if_match(remote_sandbox):
         return original(Bucket=Bucket, Key=Key, Body=Body, **kwargs)
 
     remote_sandbox.put_object = spy
-    assert f._update_remote_meta("55", 2000, ["en.srt"]) is True
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) == (True, 1)
     assert captured.get("IfMatch") == '"v1"'
 
 
@@ -1264,7 +1545,7 @@ def test_meta_update_retries_and_preserves_concurrent_change(remote_sandbox):
         stub.etag = '"v2"'
 
     remote_sandbox.on_get = downloader_writes
-    assert f._update_remote_meta("55", 2000, ["en.srt"]) is True
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) == (True, 1)
 
     assert remote_sandbox.conflicts == 1, "第一次写应当被 412 挡下"
     assert remote_sandbox.get_calls == 2, "冲突后必须重读"
@@ -1281,7 +1562,7 @@ def test_meta_update_gives_up_after_repeated_conflicts(remote_sandbox, capsys):
         stub.etag = f'"v{stub.get_calls + 100}"'   # 每次读完就变，必然冲突
 
     remote_sandbox.on_get = always_change
-    assert f._update_remote_meta("55", 2000, ["en.srt"]) is False
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) == (False, 0)
     assert remote_sandbox.conflicts == f.META_UPDATE_RETRIES
     assert "字幕已上传" in capsys.readouterr().out
 
@@ -1294,7 +1575,7 @@ def test_meta_update_does_not_retry_on_non_412(remote_sandbox, capsys):
         raise RuntimeError("AccessDenied")
 
     remote_sandbox.put_object = boom
-    assert f._update_remote_meta("55", 2000, ["en.srt"]) is False
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) == (False, 0)
     assert remote_sandbox.get_calls == 1, "不该重读"
 
 
@@ -1340,7 +1621,7 @@ def test_confirmed_gap_language_is_not_asked_again(sandbox, monkeypatch):
     """🔴 台账里已确认没有的语种，不能再发起搜索——这正是省配额的地方。"""
     f.record_gap("55", ["zh"])
     asked = []
-    monkeypatch.setattr(f, "search_subtitles", lambda i: (
+    monkeypatch.setattr(f, "search_subtitles", lambda i, *_a, **_k: (
         asked.append(i), [{"language": "EN", "url": "/en.zip"}]
     )[1])
     monkeypatch.setattr(
@@ -1359,7 +1640,7 @@ def test_movie_with_all_gaps_confirmed_costs_no_quota(sandbox, monkeypatch):
     """所有缺口都已确认没有时整片跳过，一次请求都不发。"""
     f.record_gap("55", ["en", "zh"])
     called = []
-    monkeypatch.setattr(f, "search_subtitles", lambda i: called.append(i))
+    monkeypatch.setattr(f, "search_subtitles", lambda i, *_a, **_k: called.append(i))
 
     _, result = f.download_one(
         {"tmdbId": "55", "year": 2000}, ledger=f.load_ledger()
@@ -1377,7 +1658,7 @@ def test_fetch_failure_never_enters_the_ledger(sandbox, monkeypatch):
     monkeypatch.setattr(f, "load_entries", lambda: [
         {"tmdbId": "55", "title": "A", "year": 2000},
     ])
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
         {"language": "ZH", "url": "/zh.zip"},
     ])
@@ -1400,7 +1681,7 @@ def test_source_confirmed_absence_is_recorded(sandbox, monkeypatch):
         {"tmdbId": "55", "title": "A", "year": 2000},
     ])
     # 只有 EN，zh 是真·源站没有
-    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+    monkeypatch.setattr(f, "search_subtitles", lambda *_a, **_k: [
         {"language": "EN", "url": "/en.zip"},
     ])
     monkeypatch.setattr(
@@ -1432,7 +1713,7 @@ def test_ledger_skipped_movies_are_counted_and_explained(
         {"tmdbId": "55", "title": "A", "year": 2000},
     ])
     called = []
-    monkeypatch.setattr(f, "search_subtitles", lambda i: called.append(i))
+    monkeypatch.setattr(f, "search_subtitles", lambda i, *_a, **_k: called.append(i))
 
     f.main()
 

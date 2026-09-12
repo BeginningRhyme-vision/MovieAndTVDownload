@@ -4201,6 +4201,9 @@ def finalize_one_entry(conversion_job, processed_ids):
             "tmdbId": tmdb_id,
             "title": conversion_job["title"],
             "year": conversion_job.get("year"),
+            # IMDB titleType（movie / tvMovie / tvSeries…）。fetch_subtitles 靠它
+            # 决定 SubDL 的 type 参数——电影与剧集是两个独立编号空间。
+            "title_type": (conversion_job.get("entry") or {}).get("title_type"),
             "url": conversion_job["url"],
             "final_path": final_path,
             # 成品字节数。必须在这里取——上传成功后本地文件就删了，事后再想
