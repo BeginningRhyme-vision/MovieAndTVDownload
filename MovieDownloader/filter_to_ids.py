@@ -18,7 +18,11 @@
 """
 
 import json
+import os
 import re
+import tempfile
+from contextlib import ExitStack
+from numbers import Real
 from pathlib import Path
 from typing import Optional
 
@@ -31,8 +35,9 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def _resolve(value, default_name: str) -> Path:
+    """相对路径锚定脚本目录；绝对路径与 `~` 开头的路径按原义解析。"""
     raw = value.strip() if isinstance(value, str) else value
-    return _SCRIPT_DIR / (raw or default_name)
+    return _SCRIPT_DIR / Path(raw or default_name).expanduser()
 
 
 def _load_own_config() -> dict:
@@ -89,6 +94,10 @@ def _in_range(value, low, high) -> bool:
 
 def check_title_type(movie: dict, rule: dict) -> bool:
     allow = rule.get("allow") or []
+    if not allow:
+        # 与 _check_person 的 "include 为空即放行" 语义一致；
+        # 否则误删 allow 列表会静默清空 ids.txt。
+        return True
     return movie.get("title_type") in allow
 
 
@@ -100,7 +109,9 @@ def check_is_adult(movie: dict, rule: dict) -> bool:
 
 def _check_numeric(movie: dict, rule: dict, field: str) -> bool:
     value = movie.get(field)
-    if value is None:
+    # bool 是 int 子类，但 True/False 出现在数值字段里只能是脏数据，同样按缺失处理；
+    # 字符串等非数值类型若直接与 min/max 比较会 TypeError 拖垮整批。
+    if value is None or isinstance(value, bool) or not isinstance(value, Real):
         return bool(rule.get("keep_if_missing", True))
     return _in_range(value, rule.get("min"), rule.get("max"))
 
@@ -172,30 +183,57 @@ def check_writers(movie: dict, rule: dict) -> bool:
     return _check_person(movie, rule, "writers")
 
 
+def _compile_keywords(rule: dict) -> None:
+    """use_regex 时在启动阶段预编译 include/exclude，写错的正则立即报错退出，
+    而不是跑到第一条电影才抛 re.error（那时输出文件已被打开）。
+    编译结果缓存在 rule["_include_re"] / rule["_exclude_re"]。"""
+    if not rule.get("use_regex", False):
+        return
+    flags = re.IGNORECASE if rule.get("case_insensitive", True) else 0
+    for key in ("include", "exclude"):
+        compiled = []
+        for kw in rule.get(key) or []:
+            if not isinstance(kw, str):
+                continue
+            try:
+                compiled.append(re.compile(kw, flags))
+            except re.error as e:
+                raise SystemExit(
+                    f"错误: title_keywords.{key} 中的正则 {kw!r} 无效: {e}"
+                )
+        rule[f"_{key}_re"] = compiled
+
+
 def check_title_keywords(movie: dict, rule: dict) -> bool:
     ci = rule.get("case_insensitive", True)
     use_regex = rule.get("use_regex", False)
-    include = rule.get("include") or []
-    exclude = rule.get("exclude") or []
 
     titles = [
         movie.get("primary_title") or "",
         movie.get("original_title") or "",
     ]
 
-    def hit(keyword: str) -> bool:
+    def hit(keyword) -> bool:
         for title in titles:
             if not title:
                 continue
             if use_regex:
-                flags = re.IGNORECASE if ci else 0
-                if re.search(keyword, title, flags):
+                if keyword.search(title):
                     return True
             else:
                 a, b = (title.lower(), keyword.lower()) if ci else (title, keyword)
                 if b in a:
                     return True
         return False
+
+    if use_regex:
+        if "_include_re" not in rule:
+            _compile_keywords(rule)
+        include = rule["_include_re"]
+        exclude = rule["_exclude_re"]
+    else:
+        include = [k for k in (rule.get("include") or []) if isinstance(k, str)]
+        exclude = [k for k in (rule.get("exclude") or []) if isinstance(k, str)]
 
     if include and not any(hit(k) for k in include):
         return False
@@ -242,42 +280,73 @@ def main():
     else:
         print("未启用任何筛选项：将选中全部带 tmdb_id 的电影")
 
-    total = kept = no_id = duplicate = 0
+    # 正则在启动阶段就编译，配置写错立即退出，不会留下半截输出文件
+    kw_rule = rule_enabled(config, "title_keywords")
+    if kw_rule is not None:
+        _compile_keywords(kw_rule)
+
+    total = kept = no_id = duplicate = bad_json = 0
     seen = set()
 
-    with open(MOVIES, encoding="utf-8") as fin, \
-            open(OUTPUT_IDS, "w", encoding="utf-8") as fids, \
-            open(OUTPUT_DETAIL, "w", encoding="utf-8") as fdetail:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                movie = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    # 先写同目录临时文件，全部完成后再原子替换：中途任何异常都不会
+    # 把旧的 ids.txt 清空或留下半截文件给下游 tmdb_ids_to_links 误读。
+    tmp_ids = tmp_detail = None
+    try:
+        # ExitStack：每个句柄一打开就登记关闭，后续任何一步（第二个 mkstemp、
+        # chmod）抛异常时前面已打开的文件不会漏关。
+        with ExitStack() as stack:
+            fin = stack.enter_context(open(MOVIES, encoding="utf-8"))
+            fd_ids, tmp_ids = tempfile.mkstemp(
+                dir=OUTPUT_IDS.parent, prefix=OUTPUT_IDS.name + ".", suffix=".tmp")
+            fids = stack.enter_context(os.fdopen(fd_ids, "w", encoding="utf-8"))
+            fd_detail, tmp_detail = tempfile.mkstemp(
+                dir=OUTPUT_DETAIL.parent, prefix=OUTPUT_DETAIL.name + ".", suffix=".tmp")
+            fdetail = stack.enter_context(os.fdopen(fd_detail, "w", encoding="utf-8"))
+            # mkstemp 默认 0600，替换后保持普通文件权限
+            os.chmod(tmp_ids, 0o644)
+            os.chmod(tmp_detail, 0o644)
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    movie = json.loads(line)
+                except json.JSONDecodeError:
+                    bad_json += 1
+                    continue
 
-            total += 1
+                total += 1
 
-            # 没有 tmdb_id 的无法下载，直接跳过
-            tmdb_id = movie.get("tmdb_id")
-            if not tmdb_id:
-                no_id += 1
-                continue
+                # 没有 tmdb_id 的无法下载，直接跳过
+                tmdb_id = movie.get("tmdb_id")
+                if not tmdb_id:
+                    no_id += 1
+                    continue
 
-            if not passes_all(movie, config):
-                continue
+                if not passes_all(movie, config):
+                    continue
 
-            tid = str(tmdb_id)
-            if tid in seen:  # 去重
-                duplicate += 1
-                continue
-            seen.add(tid)
+                tid = str(tmdb_id)
+                if tid in seen:  # 去重
+                    duplicate += 1
+                    continue
+                seen.add(tid)
 
-            fids.write(tid + "\n")
-            fdetail.write(json.dumps(movie, ensure_ascii=False) + "\n")
-            kept += 1
+                fids.write(tid + "\n")
+                fdetail.write(json.dumps(movie, ensure_ascii=False) + "\n")
+                kept += 1
 
+        os.replace(tmp_ids, OUTPUT_IDS)
+        tmp_ids = None
+        os.replace(tmp_detail, OUTPUT_DETAIL)
+        tmp_detail = None
+    finally:
+        for tmp in (tmp_ids, tmp_detail):
+            if tmp and os.path.exists(tmp):
+                os.unlink(tmp)
+
+    if bad_json:
+        print(f"警告: {bad_json} 行 JSON 解析失败已跳过（请检查 {MOVIES} 是否有损坏/非法行）")
     print(
         f"读取 {total} 条 | 无 tmdb_id 跳过 {no_id} | 重复跳过 {duplicate} | "
         f"最终选中 {kept}"

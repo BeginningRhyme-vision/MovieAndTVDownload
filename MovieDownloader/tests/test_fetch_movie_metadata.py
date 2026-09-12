@@ -244,3 +244,191 @@ def test_filter_allow_list_covers_upstream_keep_types():
     allow = set(rule.get("allow") or [])
     missing = set(f.KEEP_TYPES) - allow
     assert not missing, f"filter_config.yaml 的 title_type.allow 缺少: {missing}"
+
+
+# ------------------------------------------------------- 进度一致性
+
+@pytest.fixture
+def io_paths(tmp_path, monkeypatch):
+    out = tmp_path / "movies.jsonl"
+    prog = tmp_path / "progress.txt"
+    monkeypatch.setattr(f, "OUTPUT", out)
+    monkeypatch.setattr(f, "PROGRESS", prog)
+    return out, prog
+
+
+def test_write_jsonl_marks_progress_in_same_step(io_paths):
+    out, prog = io_paths
+    f.write_jsonl({"imdb_id": "tt0000001", "primary_title": "A"})
+    assert json.loads(out.read_text().splitlines()[0])["imdb_id"] == "tt0000001"
+    assert prog.read_text().splitlines() == ["tt0000001"]
+
+
+def test_write_jsonl_rejects_nan(io_paths):
+    out, prog = io_paths
+    with pytest.raises(ValueError):
+        f.write_jsonl({"imdb_id": "tt1", "rating": float("nan")})
+    assert not out.exists() and not prog.exists()
+
+
+def test_load_done_backfills_from_jsonl(io_paths):
+    """jsonl 里有、progress 里没有的 id 必须被补记，否则重跑会重复查 TMDB 并重复追加。"""
+    out, prog = io_paths
+    prog.write_text("tt1\n")
+    out.write_text(
+        json.dumps({"imdb_id": "tt1"}) + "\n"
+        + json.dumps({"imdb_id": "tt2"}) + "\n"
+        + json.dumps({"imdb_id": "tt3", "primary_title": "有 \"imdb_id\": 字样"}) + "\n"
+    )
+    done = f.load_done()
+    assert done == {"tt1", "tt2", "tt3"}
+    assert prog.read_text().splitlines() == ["tt1", "tt2", "tt3"]
+    # 再次加载不应重复补记
+    assert f.load_done() == {"tt1", "tt2", "tt3"}
+    assert prog.read_text().splitlines() == ["tt1", "tt2", "tt3"]
+
+
+def test_load_done_without_progress_rebuilds_from_jsonl(io_paths):
+    """progress.txt 丢失时可从 movies.jsonl 完整重建，补跑不会重复已抓过的条目。"""
+    out, prog = io_paths
+    out.write_text("".join(json.dumps({"imdb_id": f"tt{i}"}) + "\n" for i in range(5)))
+    assert f.load_done() == {f"tt{i}" for i in range(5)}
+    assert prog.exists() and len(prog.read_text().splitlines()) == 5
+
+
+def test_load_done_empty(io_paths):
+    assert f.load_done() == set()
+
+
+# ------------------------------------------------------- 滑动窗口提交
+
+def test_main_uses_bounded_submission(monkeypatch, io_paths, tmp_path):
+    """一次只提交 MAX_WORKERS*4 个 future：几十万条时不把全部 future 常驻内存。"""
+    import pandas as pd
+
+    n = 50
+    monkeypatch.setattr(f, "MAX_WORKERS", 2)  # window = 8
+    monkeypatch.setattr(f, "ensure_dataset", lambda key: None)
+    monkeypatch.setattr(f, "build_index", lambda: None)
+    monkeypatch.setattr(f, "load_basics",
+                        lambda: pd.DataFrame(index=[f"tt{i}" for i in range(n)]))
+    monkeypatch.setattr(f, "load_ratings", lambda: None)
+    monkeypatch.setattr(f, "load_crew", lambda: None)
+    monkeypatch.setattr(f, "load_names_dict", lambda: {})
+
+    processed = []
+    monkeypatch.setattr(f, "process", lambda iid, *a: (processed.append(iid) or True))
+
+    peak = {"n": 0}
+    real_submit = f.ThreadPoolExecutor.submit
+    live = {"n": 0}
+    lock = __import__("threading").Lock()
+
+    def counting_submit(self, fn, *args, **kw):
+        with lock:
+            live["n"] += 1
+            peak["n"] = max(peak["n"], live["n"])
+
+        def wrapped(*a, **k):
+            try:
+                return fn(*a, **k)
+            finally:
+                with lock:
+                    live["n"] -= 1
+        return real_submit(self, wrapped, *args, **kw)
+
+    monkeypatch.setattr(f.ThreadPoolExecutor, "submit", counting_submit)
+    f.main()
+    assert sorted(processed) == sorted(f"tt{i}" for i in range(n))
+    assert peak["n"] <= f.MAX_WORKERS * 4 + 1
+
+
+# ------------------------------------------------------- 标题 NaN 守卫
+
+def _basics_tsv(tmp_path, rows):
+    header = "tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear\tendYear\truntimeMinutes\tgenres\n"
+    path = tmp_path / "title.basics.tsv"
+    path.write_text(header + "".join("\t".join(r) + "\n" for r in rows), encoding="utf-8")
+    return path
+
+
+def test_load_basics_keeps_na_like_titles(monkeypatch, tmp_path):
+    """pandas 默认把 "NA"/"None"/"null"/"nan" 当缺失；它们都是真实存在的片名，
+    只有 IMDB 自己的 `\\N` 才是缺失。"""
+    path = _basics_tsv(tmp_path, [
+        ("tt1", "movie", "NA", "N/A", "0", "2000", "\\N", "90", "Drama"),
+        ("tt2", "movie", "None", "null", "0", "2001", "\\N", "\\N", "\\N"),
+        ("tt3", "movie", "nan", "NaN", "1", "\\N", "\\N", "\\N", "\\N"),
+        ("tt4", "movie", "\\N", "\\N", "\\N", "\\N", "\\N", "\\N", "\\N"),
+    ])
+    monkeypatch.setattr(f, "ensure_dataset", lambda key: path)
+    df = f.load_basics()
+    assert df.loc["tt1", "primaryTitle"] == "NA"
+    assert df.loc["tt1", "originalTitle"] == "N/A"
+    assert df.loc["tt2", "primaryTitle"] == "None"
+    assert df.loc["tt2", "originalTitle"] == "null"
+    assert df.loc["tt3", "primaryTitle"] == "nan"
+    assert df.loc["tt3", "originalTitle"] == "NaN"
+    # 真缺失仍是 NaN；数值列 / isAdult 语义不变
+    assert f._num(df.loc["tt4", "primaryTitle"], str) is None
+    assert f._num(df.loc["tt2", "runtimeMinutes"], int) is None
+    assert f._num(df.loc["tt1", "runtimeMinutes"], int) == 90
+    assert f._num(df.loc["tt3", "isAdult"], bool) is True
+    assert f._num(df.loc["tt4", "isAdult"], bool) is None
+    assert df.loc["tt2", "genres"] == []
+
+
+def test_process_writes_record_when_title_missing(monkeypatch, io_paths, tmp_path):
+    """标题为 `\\N` 的条目必须能落盘为 null，而不是被 allow_nan=False 拒绝后
+    每次运行都重查 TMDB 并反复失败。"""
+    import pandas as pd
+
+    out, prog = io_paths
+    path = _basics_tsv(tmp_path, [
+        ("tt9", "movie", "\\N", "\\N", "0", "1999", "\\N", "\\N", "\\N"),
+    ])
+    monkeypatch.setattr(f, "ensure_dataset", lambda key: path)
+    basics = f.load_basics()
+    empty = pd.DataFrame(index=pd.Index([], name="tconst"))
+    monkeypatch.setattr(f, "get_tmdb_id", lambda iid: 123)
+    monkeypatch.setattr(f.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(f, "query_principals", lambda *a: [])
+    monkeypatch.setattr(f, "query_akas", lambda *a: [])
+
+    assert f.process("tt9", basics, empty, empty, {}) == "tt9"
+    rec = json.loads(out.read_text(encoding="utf-8").strip())
+    assert rec["primary_title"] is None
+    assert rec["original_title"] is None
+    assert rec["start_year"] == 1999
+    assert prog.read_text(encoding="utf-8").strip() == "tt9"
+
+
+# ------------------------------------------------------- ensure_dataset 清理
+
+def test_ensure_dataset_cleans_gz_when_decompress_fails(monkeypatch, tmp_path):
+    """解压中途失败：.part 与完整 gz 都不能残留，下次运行才不会误判。"""
+    monkeypatch.setattr(f, "DATA_DIR", tmp_path)
+
+    class _Resp:
+        raw = __import__("io").BytesIO(b"not-really-gzip")
+        def raise_for_status(self): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(f.requests, "get", lambda *a, **k: _Resp())
+    with pytest.raises(Exception):
+        f.ensure_dataset("ratings")
+    assert list(tmp_path.iterdir()) == []
+
+
+# ------------------------------------------------------- _resolve
+
+def test_resolve_expands_user_and_keeps_absolute(monkeypatch):
+    from pathlib import Path
+
+    home = Path.home()
+    assert f._resolve("~/x", "d") == home / "x"
+    assert f._resolve("/abs/x", "d") == Path("/abs/x")
+    assert f._resolve(" rel ", "d") == f._SCRIPT_DIR / "rel"
+    assert f._resolve("", "d") == f._SCRIPT_DIR / "d"
+    assert f._resolve(None, "d") == f._SCRIPT_DIR / "d"

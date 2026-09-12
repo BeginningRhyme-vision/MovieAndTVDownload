@@ -141,8 +141,14 @@ directors:
   # 是否忽略大小写匹配姓名：true=忽略（推荐），false=严格区分
   case_insensitive: true
   # 需要命中的导演姓名列表（命中任一即保留）；留空 [] 时本项不生效
-  include:
-    - Christopher Nolan
+  # 示例：
+  #   include:
+  #     - Christopher Nolan
+  #     - Denis Villeneuve
+  # ⚠️ 启用本项前务必先填好 include：若 include 为空但 keep_if_missing 为 false，
+  #    所有没有导演信息的条目会被排除，而 include 为空又对其它条目不设限——
+  #    结果与预期往往不符。
+  include: []
   # 导演为空/缺失时：true=保留，false=排除
   keep_if_missing: false
 

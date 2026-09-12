@@ -19,10 +19,19 @@ import pandas as pd
 import tmdbsimple as tmdb
 import yaml
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 # ========== 配置（从 config.yaml 的 fetch_movie_metadata 段读取）==========
-CONFIG_PATH = Path(__file__).with_name("config.yaml")
+# 与 filter_to_ids.py / tmdb_ids_to_links.py / download_movies.py 一致：
+# 所有路径锚定脚本目录，不随进程 CWD 漂移（从 cron/pipeline 启动时不会写错位置）。
+_SCRIPT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = _SCRIPT_DIR / "config.yaml"
+
+
+def _resolve(value, default_name: str) -> Path:
+    """相对路径锚定脚本目录；绝对路径与 `~` 开头的路径按原义解析。"""
+    raw = value.strip() if isinstance(value, str) else value
+    return _SCRIPT_DIR / Path(raw or default_name).expanduser()
 
 
 def _load_dotenv(path):
@@ -43,7 +52,7 @@ def _load_dotenv(path):
         pass
 
 
-_load_dotenv(str(Path(__file__).with_name(".env")))
+_load_dotenv(str(_SCRIPT_DIR / ".env"))
 
 
 def load_config() -> dict:
@@ -68,11 +77,11 @@ if not TMDB_API_KEY:
     raise SystemExit("请在 .env 配置 TMDB_API_KEY（或 config.yaml 的 fetch_movie_metadata.tmdb_api_key）")
 tmdb.API_KEY = TMDB_API_KEY
 
-DATA_DIR = Path(_CFG.get("data_dir", "imdb_data"))
+DATA_DIR = _resolve(_CFG.get("data_dir"), "imdb_data")
 INDEX_DB = DATA_DIR / "index.db"  # 辅助索引库（akas/principals/names）
-OUTPUT = Path(_CFG.get("output", "movies.jsonl"))
-PROGRESS = Path(_CFG.get("progress", "progress.txt"))
-LOG_PATH = Path(_CFG.get("log_path", "fetch.log"))
+OUTPUT = _resolve(_CFG.get("output"), "movies.jsonl")
+PROGRESS = _resolve(_CFG.get("progress"), "progress.txt")
+LOG_PATH = _resolve(_CFG.get("log_path"), "fetch.log")
 
 KEEP_TYPES = set(_CFG.get("keep_types", ["movie"]))
 MAX_WORKERS = int(_CFG.get("max_workers", 8))
@@ -100,7 +109,7 @@ DATASETS = {
 }
 
 # ========== 日志 ==========
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -114,10 +123,29 @@ _lock = threading.Lock()
 
 
 # ========== 进度 ==========
+_IMDB_ID_RE = re.compile(r'"imdb_id":\s*"(tt\d+)"')
+
+
 def load_done() -> set:
-    if not PROGRESS.exists():
-        return set()
-    return set(PROGRESS.read_text(encoding="utf-8").splitlines())
+    done = set()
+    if PROGRESS.exists():
+        done.update(PROGRESS.read_text(encoding="utf-8").splitlines())
+    # 用 movies.jsonl 对账：write_jsonl 与 mark_done 是两次独立落盘，进程若恰好死在
+    # 两者之间，这条记录已写进 jsonl 但 progress 没有，重跑会再查一次 TMDB 并重复
+    # 追加一行。以 jsonl 为准把这类"已写未标记"的 id 补进 done，杜绝重复。
+    if OUTPUT.exists():
+        backfill = []
+        with open(OUTPUT, encoding="utf-8") as f:
+            for line in f:
+                m = _IMDB_ID_RE.search(line)
+                if m and m.group(1) not in done:
+                    done.add(m.group(1))
+                    backfill.append(m.group(1))
+        if backfill:
+            log.warning(f"progress 对账: {len(backfill):,} 条已写入 movies.jsonl 但未标记，已补记")
+            with open(PROGRESS, "a", encoding="utf-8") as f:
+                f.write("".join(i + "\n" for i in backfill))
+    return done
 
 
 def mark_done(imdb_id: str):
@@ -136,9 +164,16 @@ class _Encoder(json.JSONEncoder):
 
 
 def write_jsonl(record: dict):
+    """写一条记录并标记进度。两次落盘放在同一把锁内、紧挨着执行，
+    把"写了 jsonl 没写 progress"的窗口压到最小；残余窗口由 load_done 对账兜底。"""
+    # allow_nan=False：任何漏网的 NaN/Infinity 在这里直接抛 ValueError（由 job 层
+    # 记为 error、下次重试），而不是写出裸 `NaN` 让下游整行解析失败后静默丢弃。
+    line = json.dumps(record, ensure_ascii=False, cls=_Encoder, allow_nan=False)
     with _lock:
         with open(OUTPUT, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False, cls=_Encoder) + "\n")
+            f.write(line + "\n")
+        with open(PROGRESS, "a", encoding="utf-8") as f:
+            f.write(record["imdb_id"] + "\n")
 
 
 # ========== 下载（已存在则跳过）==========
@@ -149,15 +184,26 @@ def ensure_dataset(key: str) -> Path:
         log.info(f"已存在跳过: {tsv_path.name}")
         return tsv_path
     gz_path = DATA_DIR / filename
-    log.info(f"下载 {filename} ...")
-    with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
-        r.raise_for_status()
-        with open(gz_path, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
-    log.info(f"解压 {filename} ...")
-    with gzip.open(gz_path, "rb") as gz, open(tsv_path, "wb") as out:
-        shutil.copyfileobj(gz, out)
-    gz_path.unlink()
+    # 下载和解压都先写 .part 临时文件、完成后再 rename：中途失败不会留下半截
+    # .tsv 被下次 `tsv_path.exists()` 误判为完整文件（pandas 读到截断数据静默少条）。
+    gz_tmp = gz_path.with_name(gz_path.name + ".part")
+    tsv_tmp = tsv_path.with_name(tsv_path.name + ".part")
+    try:
+        log.info(f"下载 {filename} ...")
+        with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(gz_tmp, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+        gz_tmp.replace(gz_path)
+        log.info(f"解压 {filename} ...")
+        with gzip.open(gz_path, "rb") as gz, open(tsv_tmp, "wb") as out:
+            shutil.copyfileobj(gz, out)
+        tsv_tmp.replace(tsv_path)
+    finally:
+        # gz 也在这里清：解压中途失败若把完整 gz 留下，下次运行因 tsv 不存在会
+        # 重新下载覆盖它，白占几百 MB 磁盘。
+        for tmp in (gz_tmp, tsv_tmp, gz_path):
+            tmp.unlink(missing_ok=True)
     return tsv_path
 
 
@@ -179,7 +225,7 @@ def build_index():
         return cur.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
 
     def build_table(name, create_sql, index_sql, insert_sql, dataset_key,
-                    row_to_tuple, reader_kwargs=None):
+                    row_to_tuple):
         # 全有或全无：清掉可能的半成品表 -> 建表建索引 -> 批量插入 -> 提交；
         # 中途任何异常（含 KeyboardInterrupt/SystemExit）回滚并删表，保证不留半成品
         if _index_ready(name):
@@ -194,7 +240,8 @@ def build_index():
                 cur.execute(index_sql)
             path = ensure_dataset(dataset_key)
             with open(path, encoding="utf-8", errors="replace") as f:
-                reader = csv.DictReader(f, delimiter="\t", **(reader_kwargs or {}))
+                # IMDB TSV 不做引号转义，统一 QUOTE_NONE（原先只有 principals 设了）
+                reader = csv.DictReader(f, delimiter="\t", quoting=csv.QUOTE_NONE)
                 batch = []
                 for row in reader:
                     rec = row_to_tuple(row)
@@ -251,7 +298,6 @@ def build_index():
         "INSERT INTO principals VALUES (?,?,?,?,?,?)",
         "principals",
         lambda row: tuple(row.get(c, "") for c in _principals_cols),
-        reader_kwargs={"quoting": csv.QUOTE_NONE},
     )
 
     conn.close()
@@ -304,13 +350,23 @@ def query_name(nconst: str, names_dict: dict) -> str:
 
 
 # ========== 加载小文件（全量，内存够用）==========
+# IMDB TSV 不做引号转义：标题/人名里的 `"` 是普通字符。pandas 默认 QUOTE_MINIMAL
+# 会把它当引号起始，吞掉后续若干行或错列。所有 TSV 读取统一 QUOTE_NONE。
+# keep_default_na=False：IMDB 只用 `\N` 表示缺失。pandas 默认还会把 "NA"、"N/A"、
+# "None"、"nan"、"null" 等字符串当缺失——而这些都是真实存在的电影标题，读成 NaN
+# 后 write_jsonl(allow_nan=False) 会拒绝写出，这些片子会永远失败、永远重试。
+# 数值列不受影响：仍由 pd.to_numeric(errors="coerce") 把非数字转 NaN。
+_TSV_KW = dict(sep="\t", na_values="\\N", keep_default_na=False, quoting=csv.QUOTE_NONE)
+
+
 def load_basics() -> pd.DataFrame:
     path = ensure_dataset("basics")
-    df = pd.read_csv(path, sep="\t", na_values="\\N", low_memory=False)
+    df = pd.read_csv(path, low_memory=False, **_TSV_KW)
     df = df[df["titleType"].isin(KEEP_TYPES)].copy()
     df["startYear"] = pd.to_numeric(df["startYear"], errors="coerce")
     df["endYear"] = pd.to_numeric(df["endYear"], errors="coerce")
     df["runtimeMinutes"] = pd.to_numeric(df["runtimeMinutes"], errors="coerce")
+    # map 未命中（\N→NaN 或脏值）保持 NaN，由 process 里的 _num(..., bool) 统一转 None
     df["isAdult"] = df["isAdult"].map({"0": False, "1": True, 0: False, 1: True})
     df["genres"] = df["genres"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df = df.set_index("tconst")
@@ -327,7 +383,7 @@ def load_basics() -> pd.DataFrame:
 
 def load_ratings() -> pd.DataFrame:
     path = ensure_dataset("ratings")
-    df = pd.read_csv(path, sep="\t", na_values="\\N")
+    df = pd.read_csv(path, **_TSV_KW)
     df["averageRating"] = pd.to_numeric(df["averageRating"], errors="coerce")
     df["numVotes"] = pd.to_numeric(df["numVotes"], errors="coerce")
     df = df.set_index("tconst")
@@ -341,7 +397,7 @@ def load_ratings() -> pd.DataFrame:
 
 def load_crew() -> pd.DataFrame:
     path = ensure_dataset("crew")
-    df = pd.read_csv(path, sep="\t", na_values="\\N")
+    df = pd.read_csv(path, **_TSV_KW)
     df["directors"] = df["directors"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df["writers"] = df["writers"].apply(lambda x: x.split(",") if isinstance(x, str) else [])
     df = df.set_index("tconst")
@@ -460,8 +516,11 @@ def _num(value, cast):
 
 
 def process(imdb_id: str, basics, ratings, crew, names_dict):
-    tmdb_id = get_tmdb_id(imdb_id)
-    time.sleep(SLEEP)
+    try:
+        tmdb_id = get_tmdb_id(imdb_id)
+    finally:
+        # 成功与失败路径都节流：失败时不 sleep 会让重试更密集地打 TMDB
+        time.sleep(SLEEP)
     if tmdb_id is None:
         # 只有"TMDB 确实没有这部片"才走到这里（查询失败会抛 TMDBLookupError）。
         # 这是永久性结论，可以 mark_done 跳过。
@@ -479,9 +538,11 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
         "imdb_id": imdb_id,
         "tmdb_id": tmdb_id,
         "title_type": row.get("titleType"),
-        "primary_title": row.get("primaryTitle"),
-        "original_title": row.get("originalTitle"),
-        "is_adult": row.get("isAdult"),
+        # 标题也走 _num：`\N` 读成 NaN 后若原样进 json.dumps(allow_nan=False) 会抛错，
+        # 这条会被记为 error 并在每次运行反复重查 TMDB，永远写不出去。
+        "primary_title": _num(row.get("primaryTitle"), str),
+        "original_title": _num(row.get("originalTitle"), str),
+        "is_adult": _num(row.get("isAdult"), bool),
         "start_year": _num(row.get("startYear"), int),
         "end_year": _num(row.get("endYear"), int),
         "runtime_minutes": _num(row.get("runtimeMinutes"), int),
@@ -494,8 +555,7 @@ def process(imdb_id: str, basics, ratings, crew, names_dict):
         "akas": query_akas(imdb_id),
     }
 
-    write_jsonl(record)
-    mark_done(imdb_id)
+    write_jsonl(record)  # 内部同时标记进度
     return imdb_id
 
 
@@ -543,17 +603,33 @@ def main():
 
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
     try:
-        futures = {executor.submit(job, iid): iid for iid in pending}
-        for i, fut in enumerate(as_completed(futures), 1):
-            s = fut.result()
-            if s == "ok":
-                success += 1
-            elif s == "skip":
-                skipped += 1
-            else:
-                error += 1
-            if i % 200 == 0:
-                log.info(f"进度 {i:,}/{total:,} | 写入:{success} 无TMDB:{skipped} 失败:{error}")
+        # 滑动窗口提交：一次只让 MAX_WORKERS*4 个 future 在飞，完成一个补一个。
+        # 一次性 submit 几十万个 future 会把它们全部常驻内存，且 Ctrl+C 时
+        # cancel_futures 要逐个取消几十万个对象。
+        window = MAX_WORKERS * 4
+        it = iter(pending)
+        in_flight = set()
+        for iid in it:
+            in_flight.add(executor.submit(job, iid))
+            if len(in_flight) >= window:
+                break
+        i = 0
+        while in_flight:
+            done_set, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for fut in done_set:
+                i += 1
+                s = fut.result()
+                if s == "ok":
+                    success += 1
+                elif s == "skip":
+                    skipped += 1
+                else:
+                    error += 1
+                if i % 200 == 0:
+                    log.info(f"进度 {i:,}/{total:,} | 写入:{success} 无TMDB:{skipped} 失败:{error}")
+                nxt = next(it, None)
+                if nxt is not None:
+                    in_flight.add(executor.submit(job, nxt))
     except BaseException:
         # Ctrl+C 或 TMDBAuthError：取消尚未开始的任务立即退出。
         # 用 with ThreadPoolExecutor 的话，退出时会等全部排队任务跑完
