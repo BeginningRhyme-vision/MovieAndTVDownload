@@ -53,12 +53,16 @@ is_adult:
 # ----------------------------------------------------------------------------
 start_year:
   # 是否启用本项筛选：true=启用，false=不筛选（默认）
-  enabled: false
+  enabled: true
   # 最早年份（含）；null 表示不限制下界。例：2000 表示 2000 年及以后
   min: 2000
   # 最晚年份（含）；null 表示不限制上界。例：2024
   max: null
   # 年份为 null（未知）时：true=保留，false=排除
+  # ⚠️ 用户 2026-09-13 明确选择 true（宁可多收不可错过）。
+  # 知悉其代价：年份未知的条目无法确认是否在 2000 年后，保留它们等于在
+  # 「2000 年之前一概不要」这条门槛上开了个口子，会混进一批老片。
+  # 想严格卡死年份就把这里改成 false。
   keep_if_missing: true
 
 
@@ -118,16 +122,25 @@ votes:
 # ----------------------------------------------------------------------------
 genres:
   # 是否启用本项筛选：true=启用，false=不筛选（默认）
-  enabled: false
+  enabled: true
   # 是否忽略大小写匹配类型名：true=忽略（推荐），false=严格区分
   case_insensitive: true
   # 白名单：电影的 genres 至少包含其中之一才保留；留空 [] 表示不做包含限制
   include: []
   # 黑名单：电影的 genres 命中其中任意一个就排除；留空 [] 表示不做排除
+  # 用户 2026-09-13 拍板：只排除动画片。此前默认带的 Documentary / Short
+  # 已按指示移除（要恢复就把它们加回来）。
+  #
+  # ⚠️ 这一项只能过滤掉 IMDB **明确打了 Animation 标签**的片，天然漏两类：
+  #   ① 真人+动画混合片，IMDB 常只标 Family/Fantasy 而不标 Animation；
+  #   ② genres 缺失的条目（由下面 keep_if_missing: true 放行）。
+  # 属数据源标注粒度的限制，非脚本缺陷。
   exclude:
-    - Documentary
-    - Short
+    - Animation
   # genres 为空/缺失时：true=保留，false=排除
+  # 保持 true：类型缺失只说明 IMDB 没标，不等于"是动画片"，
+  # 按"只排除动画"的语义应放行。（与 start_year 的缺失处理逻辑不同：
+  # 年份缺失无法确认是否 2000 年后，类型缺失却可合理推定不是动画。）
   keep_if_missing: true
 
 
