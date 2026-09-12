@@ -29,9 +29,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "FAILED_LOG", str(tmp_path / "failed.jsonl"))
     monkeypatch.setattr(d, "UPLOAD_PENDING_LOG", str(tmp_path / "pending.jsonl"))
     monkeypatch.setattr(d, "MAIN_LOCK_FILE", str(tmp_path / "main.lock"))
-    monkeypatch.setattr(d, "FOLDER_PREFIX", "tv_")
-    monkeypatch.setattr(d, "START_FOLDER_INDEX", 1)
-    monkeypatch.setattr(d, "_current_folder_index", 1)
+    monkeypatch.setattr(d, "FOLDER_PREFIX", "tv")
     monkeypatch.setattr(d, "S3_PREFIX", "")
     monkeypatch.setattr(d, "processing_ids", set())
     return tmp_path
@@ -65,26 +63,6 @@ def test_episode_key(tid, s, e, expected):
     assert d.episode_key(tid, s, e) == expected
 
 
-@pytest.mark.parametrize("stem,expected", [
-    ("12345_S01E03", ("12345", 1, 3)),
-    ("12345_S00E00", ("12345", 0, 0)),
-    ("12345_S12E105", ("12345", 12, 105)),
-    ("  12345_S01E03 ", ("12345", 1, 3)),
-    ("12345", None),
-    ("12345_S1E3x", None),
-    ("12345_E03", None),
-    ("_S01E03", None),
-    ("temp_12345_S01E03", None),
-])
-def test_parse_episode_key(stem, expected):
-    assert d.parse_episode_key(stem) == expected
-
-
-def test_episode_key_roundtrip():
-    key = d.episode_key("98765", 3, 14)
-    assert d.episode_key(*d.parse_episode_key(key)) == key
-
-
 def test_record_episode_key_and_identity():
     rec = {"tmdbId": 5, "season": "2", "episode": 9, "title": "T", "junk": 1}
     assert d.record_episode_key(rec) == "5_S02E09"
@@ -99,20 +77,42 @@ def test_record_episode_key_and_identity():
 
 
 # ---------------------------------------------------------------- R2 key mapping
-def test_build_s3_key_layout(sandbox, monkeypatch):
+def test_build_s3_key_layout(sandbox):
+    assert d.build_s3_key(12345, 1, 3, 2008) == "tv/2008/12345/S01/E03/E03.mp4"
+    assert d.build_s3_key("12345", "0", "12", "2008") == (
+        "tv/2008/12345/S00/E12/E12.mp4"
+    )
+
+
+def test_build_s3_key_asset_shares_prefix_with_video(sandbox):
+    """字幕/meta 与视频必须同前缀：前端与字幕脚本都按同前缀一次列举。"""
+    video = d.build_s3_key(12345, 1, 3, 2008)
+    meta = d.build_s3_key(12345, 1, 3, 2008, "meta.json")
+    sub = d.build_s3_key(12345, 1, 3, 2008, "subs/en.srt")
+    prefix = "tv/2008/12345/S01/E03"
+    assert video == f"{prefix}/E03.mp4"
+    assert meta == f"{prefix}/meta.json"
+    assert sub == f"{prefix}/subs/en.srt"
+
+
+def test_build_s3_key_is_stable_across_days(sandbox, monkeypatch):
+    """对象键不含上传日期：同一集重传即幂等覆盖，而不是留下两份。
+
+    这是"字幕脚本能由 (tid, s, e, year) 纯计算出前缀"的前提。
+    """
     monkeypatch.setattr(d.time, "strftime", lambda fmt: "20260905")
-    assert d.build_s3_key(12345, 1, 3, 2008) == "2008/12345/S01/20260905/E03.mp4"
-    assert d.build_s3_key("12345", "0", "12", "2008") == "2008/12345/S00/20260905/E12.mp4"
+    first = d.build_s3_key(1, 1, 1, 2008)
+    monkeypatch.setattr(d.time, "strftime", lambda fmt: "20260906")
+    assert d.build_s3_key(1, 1, 1, 2008) == first
 
 
 def test_build_s3_key_year_sanitised_and_prefix(sandbox, monkeypatch):
-    monkeypatch.setattr(d.time, "strftime", lambda fmt: "20260905")
-    assert d.build_s3_key(1, 1, 1, " 20/08 ").startswith("2008/1/")
-    assert d.build_s3_key(1, 1, 1, None).startswith("unknown_year/1/")
-    assert d.build_s3_key(1, 1, 1, "").startswith("unknown_year/1/")
-    assert d.build_s3_key(1, 1, 1, "n/a").startswith("unknown_year/1/")
-    monkeypatch.setattr(d, "S3_PREFIX", "tv")
-    assert d.build_s3_key(1, 1, 1, 2008) == "tv/2008/1/S01/20260905/E01.mp4"
+    assert d.build_s3_key(1, 1, 1, " 20/08 ").startswith("tv/2008/1/")
+    assert d.build_s3_key(1, 1, 1, None).startswith("tv/unknown_year/1/")
+    assert d.build_s3_key(1, 1, 1, "").startswith("tv/unknown_year/1/")
+    assert d.build_s3_key(1, 1, 1, "n/a").startswith("tv/unknown_year/1/")
+    monkeypatch.setattr(d, "S3_PREFIX", "bucketroot")
+    assert d.build_s3_key(1, 1, 1, 2008) == "bucketroot/tv/2008/1/S01/E01/E01.mp4"
 
 
 @pytest.mark.parametrize("tid,s,e", [
@@ -123,44 +123,55 @@ def test_build_s3_key_missing_fields(sandbox, tid, s, e):
         d.build_s3_key(tid, s, e, 2008)
 
 
-def test_build_s3_key_multiday_same_season_does_not_collide(sandbox, monkeypatch):
-    monkeypatch.setattr(d.time, "strftime", lambda fmt: "20260905")
-    a = d.build_s3_key(1, 1, 1, 2008)
-    monkeypatch.setattr(d.time, "strftime", lambda fmt: "20260906")
-    b = d.build_s3_key(1, 1, 1, 2008)
-    assert a != b
-    assert a.rsplit("/", 2)[0] == b.rsplit("/", 2)[0]  # same S01 prefix
+def test_local_and_remote_layouts_are_isomorphic(sandbox):
+    """本地目录与 R2 对象键必须严格同构，否则两侧无法互相换算。"""
+    local = d.episode_dir(12345, 1, 3, 2008)
+    rel = d.asset_rel_path(12345, 1, 3, 2008)
+    assert rel == "tv/2008/12345/S01/E03"
+    assert local == os.path.join(str(sandbox / "downloads"), *rel.split("/"))
+    assert d.build_s3_key(12345, 1, 3, 2008, "meta.json") == f"{rel}/meta.json"
 
 
 # ---------------------------------------------------------------- local layout
+def _put_episode(base, year, tid, season, episode, data=b"x"):
+    """在新布局下造一个成品：{base}/tv/{year}/{tid}/S{ss}/E{ee}/E{ee}.mp4。"""
+    folder = base / "tv" / year / tid / f"S{season:02d}" / f"E{episode:02d}"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"E{episode:02d}.mp4"
+    path.write_bytes(data)
+    return path
+
+
 def test_scan_downloaded_mp4_ids(sandbox):
     base = sandbox / "downloads"
-    f1 = base / "tv_000001"
-    f2 = base / "tv_000002"
-    other = base / "movie_000001"
-    for folder in (f1, f2, other):
-        folder.mkdir(parents=True)
-    (f1 / "100_S01E01.mp4").write_bytes(b"x")
-    (f1 / "100_S01E02.mp4").write_bytes(b"")          # empty -> ignored
-    (f1 / "100_S01E03.MP4").write_bytes(b"x")         # case-insensitive ext
-    (f1 / "100.mp4").write_bytes(b"x")                # movie-style name ignored
-    (f1 / "temp_100_S01E04.ts").write_bytes(b"x")     # wrong ext
-    (f2 / "100_S01E01.mp4").write_bytes(b"x")         # duplicate across folders
-    (f2 / "200_S00E05.mp4").write_bytes(b"x")
-    (other / "300_S01E01.mp4").write_bytes(b"x")      # wrong prefix ignored
+    _put_episode(base, "2008", "100", 1, 1)
+    _put_episode(base, "2008", "100", 1, 2, data=b"")     # empty -> cleaned
+    _put_episode(base, "2008", "200", 0, 5)
+    # 同一集出现在两个 year 目录下（脏数据）：只报告，不删。
+    _put_episode(base, "2009", "100", 1, 1)
+    # 旁车资产与非集目录不参与去重判定。
+    ep_dir = base / "tv" / "2008" / "100" / "S01" / "E01"
+    (ep_dir / "meta.json").write_text("{}", encoding="utf-8")
+    (ep_dir / "subs").mkdir()
+    (ep_dir / "subs" / "en.srt").write_text("x", encoding="utf-8")
+    (base / "tv" / "2008" / "100" / "Extras").mkdir()
+    (base / "tv" / "2008" / "notanid").mkdir()
 
     ids, dups = d.scan_downloaded_mp4_ids()
-    assert ids == {"100_S01E01", "100_S01E03", "200_S00E05"}
+    assert ids == {"100_S01E01", "200_S00E05"}
     assert set(dups) == {"100_S01E01"}
     assert len(dups["100_S01E01"]) == 2
+    # 0 字节孤儿已被清理。
+    assert not (
+        base / "tv" / "2008" / "100" / "S01" / "E02" / "E02.mp4"
+    ).exists()
 
 
 def test_scan_downloaded_mp4_ids_missing_base(sandbox):
     assert d.scan_downloaded_mp4_ids() == (set(), {})
 
 
-def test_move_to_target_folder_rolls_over_and_overwrites(sandbox, monkeypatch):
-    monkeypatch.setattr(d, "MAX_VIDEOS_PER_FOLDER", 2)
+def test_move_to_target_folder_uses_episode_dir(sandbox):
     base = sandbox / "downloads"
     temp = sandbox / "temp"
     temp.mkdir()
@@ -170,19 +181,17 @@ def test_move_to_target_folder_rolls_over_and_overwrites(sandbox, monkeypatch):
         p.write_bytes(b"v")
         return str(p)
 
-    p1 = d.move_to_target_folder(mk("a.mp4"), "1_S01E01")
-    p2 = d.move_to_target_folder(mk("b.mp4"), "1_S01E02")
-    p3 = d.move_to_target_folder(mk("c.mp4"), "1_S01E03")
-    assert p1 == str(base / "tv_000001" / "1_S01E01.mp4")
-    assert p2 == str(base / "tv_000001" / "1_S01E02.mp4")
-    assert p3 == str(base / "tv_000002" / "1_S01E03.mp4")
-    assert d._current_folder_index == 2
+    p1 = d.move_to_target_folder(mk("a.mp4"), 1, 1, 1, 2008)
+    p2 = d.move_to_target_folder(mk("b.mp4"), 1, 1, 2, 2008)
+    p3 = d.move_to_target_folder(mk("c.mp4"), 1, 2, 1, 2008)
+    assert p1 == str(base / "tv" / "2008" / "1" / "S01" / "E01" / "E01.mp4")
+    assert p2 == str(base / "tv" / "2008" / "1" / "S01" / "E02" / "E02.mp4")
+    assert p3 == str(base / "tv" / "2008" / "1" / "S02" / "E01" / "E01.mp4")
 
-    # Same key already present in a full folder is overwritten in place.
-    monkeypatch.setattr(d, "_current_folder_index", 1)
-    p1b = d.move_to_target_folder(mk("d.mp4"), "1_S01E01")
+    # 同一集重复落盘就地覆盖，不额外造目录。
+    p1b = d.move_to_target_folder(mk("d.mp4"), 1, 1, 1, 2008)
     assert p1b == p1
-    assert sorted(os.listdir(base / "tv_000001")) == ["1_S01E01.mp4", "1_S01E02.mp4"]
+    assert os.listdir(base / "tv" / "2008" / "1" / "S01" / "E01") == ["E01.mp4"]
     assert not (temp / "d.mp4").exists()
 
 
@@ -200,38 +209,10 @@ def test_move_to_target_folder_cleans_partial_on_failure(sandbox, monkeypatch):
 
     monkeypatch.setattr(d.shutil, "move", boom)
     with pytest.raises(OSError):
-        d.move_to_target_folder(str(src), "1_S01E01")
-    assert not (base / "tv_000001" / "1_S01E01.mp4").exists()
-
-
-def test_move_to_target_folder_places_holder_before_moving(sandbox, monkeypatch):
-    """移动在锁外执行，锁内先落 0 字节占位把目录名额定死。
-
-    这样并发的其它 worker 在锁内计数时就能看到它、不会把同一目录算成未满，
-    从而在跨盘（shutil.move 退化为 copy+del）时既不串行化也不超容量。
-    """
-    base = sandbox / "downloads"
-    temp = sandbox / "temp"
-    temp.mkdir()
-    src = temp / "a.mp4"
-    src.write_bytes(b"v")
-    seen = {}
-
-    real_move = d.shutil.move
-
-    def spy(src_path, dst_path):
-        # 移动发生时占位文件已存在，且此刻不再持有 folder_lock。
-        seen["holder_exists"] = os.path.exists(dst_path)
-        seen["lock_free"] = d.folder_lock.acquire(blocking=False)
-        if seen["lock_free"]:
-            d.folder_lock.release()
-        return real_move(src_path, dst_path)
-
-    monkeypatch.setattr(d.shutil, "move", spy)
-    final = d.move_to_target_folder(str(src), "1_S01E01")
-    assert seen == {"holder_exists": True, "lock_free": True}
-    assert final == str(base / "tv_000001" / "1_S01E01.mp4")
-    assert (base / "tv_000001" / "1_S01E01.mp4").read_bytes() == b"v"
+        d.move_to_target_folder(str(src), 1, 1, 1, 2008)
+    assert not (
+        base / "tv" / "2008" / "1" / "S01" / "E01" / "E01.mp4"
+    ).exists()
 
 
 def test_clean_temp_directory(sandbox):
@@ -1043,13 +1024,10 @@ def test_upload_to_r2_retries_transient_with_exponential_backoff(sandbox, monkey
 
 # ---------------------------------------------------------------- orphan cleanup
 def test_scan_downloaded_removes_zero_byte_orphans(sandbox):
-    """0 字节 mp4 是移动中断留下的占位残骸：既不算已下载，也要清掉不占名额。"""
-    folder = sandbox / "downloads" / "tv_000001"
-    folder.mkdir(parents=True)
-    real = folder / "1_S01E01.mp4"
-    real.write_bytes(b"video")
-    orphan = folder / "2_S01E02.mp4"
-    orphan.write_bytes(b"")
+    """0 字节 mp4 是移动中断留下的残骸：既不算已下载，也要清掉。"""
+    base = sandbox / "downloads"
+    real = _put_episode(base, "2001", "1", 1, 1, data=b"video")
+    orphan = _put_episode(base, "2001", "2", 1, 2, data=b"")
 
     ids, duplicates = d.scan_downloaded_mp4_ids()
     assert ids == {"1_S01E01"} and duplicates == {}
@@ -1416,12 +1394,23 @@ def test_finalize_one_entry_success_and_failure(sandbox, monkeypatch):
     processed = set()
     key, ok, info = d.finalize_one_entry(job, processed)
     assert (key, ok) == ("1_S01E01", True)
-    assert info["final_path"] == str(sandbox / "downloads" / "tv_000001" / "1_S01E01.mp4")
+    assert info["final_path"] == str(
+        sandbox / "downloads" / "tv" / "2001" / "1" / "S01" / "E01" / "E01.mp4"
+    )
     assert os.path.exists(info["final_path"])
     assert (info["season"], info["episode"], info["year"]) == (1, 1, 2001)
     assert processed == {"1_S01E01"}
     assert d.processing_ids == set()
     assert not ts.exists() and not sample.exists()
+    # 旁车 meta.json 与视频同目录落盘，并在 success_info 里留标记供上传阶段收集。
+    assert info["has_meta"] is True
+    meta_path = os.path.join(os.path.dirname(info["final_path"]), "meta.json")
+    with open(meta_path, encoding="utf-8") as fh:
+        meta = json.load(fh)
+    assert meta["tmdbId"] == "1"
+    assert (meta["season"], meta["episode"]) == (1, 1)
+    assert meta["video"]["file"] == "E01.mp4"
+    assert meta["subtitles"] == []
 
     # Failure path: ffmpeg fails -> lock released, nothing registered.
     ts.write_bytes(b"x")
@@ -1434,11 +1423,15 @@ def test_finalize_one_entry_success_and_failure(sandbox, monkeypatch):
 
 
 def _success_info(sandbox, key="1_S01E01"):
-    folder = sandbox / "downloads" / "tv_000001"
+    tid, _, rest = key.partition("_S")
+    season, _, episode = rest.partition("E")
+    s, e = int(season), int(episode)
+    folder = (
+        sandbox / "downloads" / "tv" / "2001" / tid / f"S{s:02d}" / f"E{e:02d}"
+    )
     folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{key}.mp4"
+    path = folder / f"E{e:02d}.mp4"
     path.write_bytes(b"mp4")
-    tid, s, e = d.parse_episode_key(key)
     return {
         "tmdbId": tid, "season": s, "episode": e, "title": "T", "year": 2001,
         "url": "u", "final_path": str(path), "bitrate_kbps": 1, "resolution": "r",
@@ -1459,16 +1452,27 @@ def test_upload_one_entry_s3_disabled(sandbox, monkeypatch):
 def test_upload_one_entry_success_deletes_local(sandbox, monkeypatch):
     monkeypatch.setattr(d, "S3_ENABLED", True)
     monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
-    monkeypatch.setattr(d.time, "strftime", lambda fmt: "20260905")
     uploaded = []
     monkeypatch.setattr(d, "upload_to_r2", lambda p, k: (uploaded.append((p, k)) or (True, None)))
     info = _success_info(sandbox)
+    # 旁车资产与视频同目录，应随视频一并上传并删除本地。
+    meta_path = os.path.join(os.path.dirname(info["final_path"]), "meta.json")
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        fh.write("{}")
+    info["has_meta"] = True
+
     key, ok, out = d.upload_one_entry(info)
     assert ok is True
-    assert uploaded == [(info["final_path"], "2001/1/S01/20260905/E01.mp4")]
+    video_key = "tv/2001/1/S01/E01/E01.mp4"
+    meta_key = "tv/2001/1/S01/E01/meta.json"
+    assert uploaded == [(info["final_path"], video_key), (meta_path, meta_key)]
+    assert out["asset_keys"] == [meta_key]
     assert not os.path.exists(info["final_path"])
+    assert not os.path.exists(meta_path)
+    # 视频与资产都已进 R2，空的集目录被清掉，不留空壳吃 inode。
+    assert not os.path.isdir(os.path.dirname(info["final_path"]))
     rec = _read_jsonl(d.SUCCESS_LOG)[0]
-    assert rec["uploaded"] is True and rec["s3_key"] == "2001/1/S01/20260905/E01.mp4"
+    assert rec["uploaded"] is True and rec["s3_key"] == video_key
     assert not os.path.exists(d.UPLOAD_PENDING_LOG)
 
 
@@ -1953,7 +1957,7 @@ def test_reupload_pending_flow(sandbox, monkeypatch, capsys):
 
     # Episode 1: rebuilt key from year, uploaded, local removed, logs reconciled.
     assert calls == [
-        (str(ok_file), "2001/1/S01/20260905/E01.mp4"),
+        (str(ok_file), "tv/2001/1/S01/E01/E01.mp4"),
         (str(bad_file), "2002/2/S01/20260901/E01.mp4"),   # existing s3_key reused
     ]
     assert not ok_file.exists()

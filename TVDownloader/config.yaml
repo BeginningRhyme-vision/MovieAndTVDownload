@@ -10,7 +10,8 @@
 # 【与 MovieDownloader 的差异】
 #   - 元数据/取流/下载的处理单位从“一部电影”变为“一集”：tmdb_id + season + episode。
 #   - 季集结构以 TMDB 为准（取流阶段调 /tv/{id} 展开），IMDB episode 表仅作参考与筛选。
-#   - R2 对象键：{year}/{tmdbId}/S{season:02d}/{YYYYMMDD}/E{episode:02d}.mp4
+#   - R2 对象键：tv/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
+#     （本地目录同构，meta.json 与 subs/ 字幕同前缀）
 # ============================================================================
 
 
@@ -206,9 +207,29 @@ download_tv:
   #   3) 两者建议放在同一磁盘，成品从 temp_dir 移到 base_dir 才是瞬时操作。
   base_dir: "downloads"
   temp_dir: "temp"
-  folder_prefix: "tv_"
-  max_videos_per_folder: 1000
-  start_folder_index: 1
+  # 本地目录与 R2 对象键共用的根段，两侧严格同构：
+  #   本地  {base_dir}/tv/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
+  #   R2    {s3.prefix}/tv/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/E{集:02d}.mp4
+  # 每集独占一个目录，meta.json 与 subs/ 字幕作为旁车资产落在同一目录下，
+  # 前端按同前缀一次列举即可拿全；fetch_subtitles.py 也能由 (tid,季,集,年)
+  # 纯计算出前缀，不依赖任何日志记录即可判重与补传。
+  folder_prefix: "tv"
+  # ---- 旁车资产（meta.json + 字幕）----
+  # 尽力而为：写入/上传失败只打印告警，绝不影响整集的下载与上传结果。
+  assets:
+    # 是否为每集生成 meta.json（含剧集元数据 + 本次实测的分辨率/码率）。
+    # 其中 subtitles[] 由 fetch_subtitles.py 补抓字幕后就地更新。
+    meta_enabled: true
+    # 字幕语种白名单（小写语言代码）与输出格式。
+    # ⚠️ 本段是字幕的**单一事实来源**：fetch_subtitles.py 直接复用这几项，
+    # 要改语种/格式请改这里，不要改 fetch_subtitles 段。
+    subtitle_languages: ["en", "zh"]
+    # 同时保留 VTT 与 SRT：浏览器原生 <track> 只吃 WebVTT，而多数本地播放器
+    # 以 SRT 为主。字幕体积极小（几十 KB），两份都存的代价可忽略。
+    subtitle_formats: ["vtt", "srt"]
+    # 单个字幕文件的大小上限（字节）。防御性配置：字幕正常只有几十 KB，
+    # 若源站把一个视频/错误页塞过来，不设限会把它整个读进内存。
+    subtitle_max_bytes: 5242880
   # 并发控制
   max_workers: 32          # 同时下载的集数
   # 主循环同时持有的“下载 future”上限（分批投递深度），必须 > max_workers。
@@ -279,15 +300,19 @@ download_tv:
   # 上传失败待补传清单，供 `python download_tv.py reupload` 手动补传时精确定位。
   upload_pending_log: "upload_pending.jsonl"
   # ---- S3 兼容对象存储（Cloudflare R2）上传配置 ----
-  # 对象键格式：{prefix}/{year}/{tmdbId}/S{season:02d}/{YYYYMMDD}/E{episode:02d}.mp4
-  # 与电影版的差别：上传日期放在“季”之下、“集”之前，同一季不同日期上传的集自然分组。
+  # 对象键格式：{prefix}/tv/{首播年}/{剧tmdbId}/S{季:02d}/E{集:02d}/{资产名}
+  #   视频   .../S01/E03/E03.mp4
+  #   元信息 .../S01/E03/meta.json
+  #   字幕   .../S01/E03/subs/en.srt（由 fetch_subtitles.py 补传）
+  # 键里不含上传日期：同 key 重传即幂等覆盖，且前缀可由 (tid,季,集,年) 纯计算，
+  # 前端与字幕脚本都能按同前缀一次拿全该集的全部资产。
   s3:
     enabled: true
     # 敏感字段（endpoint_url/bucket/access_key/secret_key）优先从环境变量 / 同目录 .env 读取
     endpoint_url: ""         # 环境变量 R2_ENDPOINT_URL
     region: "auto"           # R2 固定用 auto
     bucket: ""               # 环境变量 R2_BUCKET
-    prefix: ""               # 桶内根前缀（留空）：对象键直接从「发布年份/tmdbId/...」开始
+    prefix: ""               # 桶内根前缀（留空）：对象键直接从上面的 folder_prefix（tv/）开始
     access_key: ""           # 环境变量 R2_ACCESS_KEY
     secret_key: ""           # 环境变量 R2_SECRET_KEY
     upload_workers: 16       # 上传并发数
@@ -310,23 +335,37 @@ download_tv:
 
 
 # ----------------------------------------------------------------------------
-# fetch_subtitles.py —— 按 tmdb_id + season + episode 抓取外挂字幕
+# fetch_subtitles.py —— 用 SubDL 按 tmdb_id + season + episode 为各集补外挂字幕
+#
+# ⚠️ 本段**只有 subdl_api_key 一个可调项，且它应该留空**（见下）。
+#    其余参数刻意不放在这里 —— 字幕的语种、格式、落盘路径必须与下载侧
+#    **完全一致**，否则补来的字幕会落到视频找不到的地方、或格式对不上。
+#    故 fetch_subtitles.py 直接复用 download_tv 段，单一事实来源：
+#
+#      语种白名单  <- download_tv.assets.subtitle_languages
+#      输出格式    <- download_tv.assets.subtitle_formats
+#      大小上限    <- download_tv.assets.subtitle_max_bytes
+#      成功日志    <- download_tv.success_log
+#      目录/对象键 <- download_tv.base_dir + folder_prefix
+#      是否传 R2   <- download_tv.s3.enabled
+#
+#    **要改字幕语种/格式，请改 download_tv.assets 段，不是这里。**
+#
+# 字幕落点与视频同前缀：{folder_prefix}/{年}/{剧id}/S{季}/E{集}/subs/{语种}.{格式}
+#
+# 断点续跑的状态日志固定为脚本同目录的 subtitles.jsonl（纯观测用，
+# 真正的"哪些语种已有"以 R2 上的实际对象为准，删掉它也不影响正确性）。
+#
+# 另有 subtitles_gaps.jsonl 是**缺口台账**：记录"SubDL 确认没有某集某语种"，
+# 下次运行直接跳过该语种以省配额（免费档每账号每天仅 50 次下载，剧集按集
+# 计数，额度比电影侧更紧张）。只记"源站确认没有"，取回失败的不记。
+# 删掉它同样不影响正确性，代价只是下次会把这些语种再问一遍。
 # ----------------------------------------------------------------------------
 fetch_subtitles:
-  # SubDL API Key：敏感项，请配置到同目录 .env 的 SUBDL_API_KEY（见 .env.example）。
+  # SubDL API Key：敏感项，**请留空**，改配到同目录 .env 的 SUBDL_API_KEY。
+  # config.yaml 会进版本库，填在这里等于把 key 公开推到远端仓库；
+  # .env 已被 .gitignore 排除，是唯一安全的落点（见 .env.example）。
+  #
+  # 支持多账号轮换以叠加额度：.env 里写 SUBDL_API_KEYS=key1,key2,key3
+  # 免费申请：https://subdl.com/panel/api
   subdl_api_key: ""
-  # 输入：download_tv.py 的成功日志（一行一集）
-  success_log: "success.jsonl"
-  # 字幕输出根目录
-  subtitle_dir: "/mnt/MovieAndTVDownload/tv_subtitles"
-  # 已处理状态记录（断点续跑）
-  state_log: "subtitles.jsonl"
-  # 要抓取的语言：SubDL 语言代码 -> 输出文件后缀
-  languages:
-    EN: en
-    ZH: zh
-  # 并发与重试
-  max_workers: 4
-  request_timeout: 30
-  retry_max: 3
-  retry_delay: 3
