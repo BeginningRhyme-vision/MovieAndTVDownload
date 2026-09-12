@@ -57,6 +57,7 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(f, "SUBDL_API_KEYS", ["TESTKEY"])
     monkeypatch.setattr(f, "key_pool", f.KeyPool(["TESTKEY"]))
     monkeypatch.setattr(f, "STATE_LOG", str(tmp_path / "subtitles.jsonl"))
+    monkeypatch.setattr(f, "LEDGER_LOG", str(tmp_path / "subtitles_gaps.jsonl"))
     monkeypatch.setattr(f, "REMOTE_MODE", False)
     # 停止闸门与其原因都是模块级共享状态。不换新的话，一旦某个用例把它置位，
     # 后面所有用例的 download_one 都会直接返回跳过 —— 用例间互相污染，
@@ -109,7 +110,11 @@ def test_search_failure_does_not_raise(sandbox, monkeypatch):
 
 
 def test_one_language_failure_keeps_the_other(sandbox, monkeypatch):
-    """单语种下载失败不影响另一语种。"""
+    """单语种下载失败不影响另一语种。
+
+    🔑 网络失败归 fetch_failed 而**不是** missing：missing 会进缺口台账、
+    从此不再尝试，一次网络抖动就把该语种永久判死了。
+    """
     monkeypatch.setattr(f, "search_subtitles", lambda _: [
         {"language": "EN", "url": "/en.zip"},
         {"language": "ZH", "url": "/zh.zip"},
@@ -123,7 +128,8 @@ def test_one_language_failure_keeps_the_other(sandbox, monkeypatch):
     monkeypatch.setattr(f, "request_with_retry", fake_request)
     _, result = f.download_one({"tmdbId": "55", "year": 2000})
     assert result["status"] == "ok"
-    assert result["missing"] == ["en"]
+    assert result["fetch_failed"] == ["en"]
+    assert result["missing"] == [], "取回失败不是'源站没有'，不能进台账"
     assert sorted(result["saved"]) == ["zh.srt", "zh.vtt"]
 
 
@@ -143,7 +149,7 @@ def test_worker_exception_does_not_kill_the_batch(sandbox, monkeypatch, capsys):
         {"tmdbId": "2", "title": "B", "year": 2000},
     ])
 
-    def flaky(entry):
+    def flaky(entry, ledger=None):
         if entry["tmdbId"] == "1":
             raise RuntimeError("boom")
         return "2", {"status": "ok", "saved": ["en.vtt"], "missing": []}
@@ -253,7 +259,8 @@ def test_oversized_zip_is_rejected(sandbox, monkeypatch):
     ])
     monkeypatch.setattr(f, "request_with_retry", lambda *a, **k: CountingResp())
     _, result = f.download_one({"tmdbId": "55", "year": 2000})
-    assert "en" in result["missing"]
+    assert "en" in result["fetch_failed"], "拒收不等于源站没有，不该进台账"
+    assert "en" not in result["missing"]
     assert result["saved"] == []
     assert len(delivered) <= 2, "超限后必须立刻停止拉取"
 
@@ -796,7 +803,7 @@ def test_quota_message_is_loud_and_counted(sandbox, monkeypatch, capsys):
         {"tmdbId": "2", "title": "B", "year": 2000},
     ])
 
-    def fake_download(entry):
+    def fake_download(entry, ledger=None):
         return entry["tmdbId"], {
             "status": "quota_exhausted", "saved": [], "missing": [],
             "error": "Free daily download limit reached (50/day).",
@@ -977,7 +984,7 @@ def test_throttle_message_distinguishes_itself_from_quota(
     monkeypatch.setattr(f, "load_entries", lambda: [
         {"tmdbId": "1", "title": "A", "year": 2000},
     ])
-    monkeypatch.setattr(f, "download_one", lambda e: (e["tmdbId"], {
+    monkeypatch.setattr(f, "download_one", lambda e, ledger=None: (e["tmdbId"], {
         "status": "search_throttled", "error": "429 Too Many Requests",
         "unattempted": ["en", "zh"],
     }))
@@ -1297,3 +1304,140 @@ def test_meta_update_does_not_retry_on_non_412(remote_sandbox, capsys):
 ])
 def test_precondition_detector(exc, expected):
     assert f._is_precondition_failed(exc) is expected
+
+
+# ---------------------------------------------------------------------------
+# 缺口台账：源站确认没有的语种不再重复问（省配额）
+# ---------------------------------------------------------------------------
+# 背景：实测 101 部里 zh 缺口 57 部、en 缺口仅 5 部，SubDL 中文库很薄。
+# 没有台账时每次重跑都把这 57 部的 zh 重查一遍，每次都空手而归。
+
+def test_ledger_merges_multiple_lines_by_union(sandbox):
+    """纯追加文件，同一片多行按并集合并（读取端聚合范式）。"""
+    with open(f.LEDGER_LOG, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"tmdbId": "55", "missing": ["zh"]}) + "\n")
+        fh.write(json.dumps({"tmdbId": "55", "missing": ["en"]}) + "\n")
+        fh.write(json.dumps({"tmdbId": "66", "missing": ["ZH"]}) + "\n")
+
+    ledger = f.load_ledger()
+    assert ledger["55"] == {"en", "zh"}
+    assert ledger["66"] == {"zh"}, "语种要归一成小写，否则匹配不上"
+
+
+def test_ledger_tolerates_missing_file_and_bad_lines(sandbox):
+    """🔑 台账是省配额的优化，不是正确性的一环——读不了就当空的，绝不能抛。"""
+    assert f.load_ledger() == {}, "文件不存在应返回空台账"
+
+    with open(f.LEDGER_LOG, "w", encoding="utf-8") as fh:
+        fh.write("{ 这不是 json\n")
+        fh.write(json.dumps({"missing": ["zh"]}) + "\n")          # 缺 tmdbId
+        fh.write(json.dumps({"tmdbId": "77", "missing": "zh"}) + "\n")  # 非列表
+        fh.write(json.dumps({"tmdbId": "88", "missing": ["zh"]}) + "\n")
+    assert f.load_ledger() == {"88": {"zh"}}
+
+
+def test_confirmed_gap_language_is_not_asked_again(sandbox, monkeypatch):
+    """🔴 台账里已确认没有的语种，不能再发起搜索——这正是省配额的地方。"""
+    f.record_gap("55", ["zh"])
+    asked = []
+    monkeypatch.setattr(f, "search_subtitles", lambda i: (
+        asked.append(i), [{"language": "EN", "url": "/en.zip"}]
+    )[1])
+    monkeypatch.setattr(
+        f, "request_with_retry",
+        lambda *a, **k: _FakeZipResp(_zip_bytes({"m.srt": _SRT})),
+    )
+
+    _, result = f.download_one(
+        {"tmdbId": "55", "year": 2000}, ledger=f.load_ledger()
+    )
+    assert sorted(result["saved"]) == ["en.srt", "en.vtt"]
+    assert "zh" not in result["missing"], "zh 压根没被尝试，不该再记一次"
+
+
+def test_movie_with_all_gaps_confirmed_costs_no_quota(sandbox, monkeypatch):
+    """所有缺口都已确认没有时整片跳过，一次请求都不发。"""
+    f.record_gap("55", ["en", "zh"])
+    called = []
+    monkeypatch.setattr(f, "search_subtitles", lambda i: called.append(i))
+
+    _, result = f.download_one(
+        {"tmdbId": "55", "year": 2000}, ledger=f.load_ledger()
+    )
+    assert result["status"] == "gap_confirmed"
+    assert called == [], "不能发任何请求"
+
+
+def test_fetch_failure_never_enters_the_ledger(sandbox, monkeypatch):
+    """🔴 本组最关键的一条：取回失败**绝不能**进台账。
+
+    否则一次网络抖动就让该片该语种被永久放弃，而日志上看起来只是
+    "源站没有"，无从察觉。台账只接受"源站确认没有"。
+    """
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "55", "title": "A", "year": 2000},
+    ])
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+        {"language": "ZH", "url": "/zh.zip"},
+    ])
+
+    def fake_request(method, url, **kwargs):
+        if "/en.zip" in url:
+            raise OSError("network down")     # en 取回失败
+        return _FakeZipResp(_zip_bytes({"m.srt": _SRT}))
+
+    monkeypatch.setattr(f, "request_with_retry", fake_request)
+    f.main()
+
+    ledger = f.load_ledger()
+    assert "en" not in ledger.get("55", set()), "取回失败被错记进台账"
+
+
+def test_source_confirmed_absence_is_recorded(sandbox, monkeypatch):
+    """反过来：源站确认没有的，必须记进台账，否则省不下配额。"""
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "55", "title": "A", "year": 2000},
+    ])
+    # 只有 EN，zh 是真·源站没有
+    monkeypatch.setattr(f, "search_subtitles", lambda _: [
+        {"language": "EN", "url": "/en.zip"},
+    ])
+    monkeypatch.setattr(
+        f, "request_with_retry",
+        lambda *a, **k: _FakeZipResp(_zip_bytes({"m.srt": _SRT})),
+    )
+    f.main()
+
+    assert f.load_ledger()["55"] == {"zh"}
+
+
+def test_ledger_write_failure_does_not_break_the_run(sandbox, monkeypatch, capsys):
+    """写不进台账也只是少省点配额，不能影响主流程。"""
+    monkeypatch.setattr(f, "LEDGER_LOG", "/nonexistent-dir/gaps.jsonl")
+    f.record_gap("55", ["zh"])
+    assert "缺口台账写入失败" in capsys.readouterr().out
+
+
+def test_ledger_skipped_movies_are_counted_and_explained(
+    sandbox, monkeypatch, capsys,
+):
+    """🔑 被台账跳过的片必须在收尾里说清楚。
+
+    否则日志会宣称"当前 success.jsonl 里的片都已尝试过"，而那批片这次
+    一个请求都没发 —— 日后排查"某片为什么始终没字幕"会白跑一轮。
+    """
+    f.record_gap("55", ["en", "zh"])
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "55", "title": "A", "year": 2000},
+    ])
+    called = []
+    monkeypatch.setattr(f, "search_subtitles", lambda i: called.append(i))
+
+    f.main()
+
+    out = capsys.readouterr().out
+    assert called == [], "台账命中的片不该发任何请求"
+    assert "gap_confirmed" in out, "统计里要有这一类"
+    assert "按缺口台账直接跳过" in out
+    assert "都已尝试过" not in out, "这批片并没有被尝试，措辞不能这么写"

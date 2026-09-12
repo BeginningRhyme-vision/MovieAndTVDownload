@@ -133,6 +133,15 @@ SUBDL_API_KEYS = _parse_keys(
 
 SUCCESS_LOG = dm.SUCCESS_LOG
 STATE_LOG = str(_SCRIPT_DIR / "subtitles.jsonl")
+# 【缺口台账】记录"SubDL 确认没有某片某语种"，下次运行直接跳过这个语种。
+#
+# 为什么需要它：实测 101 部里 zh 缺口 57 部、en 缺口仅 5 部 —— SubDL 中文库
+# 很薄。没有台账时，每次重跑都会把这 57 部的 zh 重查一遍，而每次都是同样的
+# 空手而归。配额本就稀缺（免费档每账号 50 次/天），这是纯浪费。
+#
+# ⚠️ 只记 missing（源站确认没有），绝不记 fetch_failed（我们没取回来）。
+# 两者混淆会让一次网络抖动把某个语种永久打入冷宫，见 _fetch_into 的注释。
+LEDGER_LOG = str(_SCRIPT_DIR / "subtitles_gaps.jsonl")
 
 # 目录结构、语种白名单、输出格式全部复用 download_movies（单一事实来源）：
 # 补来的字幕必须与下载侧落在同一个地方、用同一套格式，否则前端按同前缀
@@ -768,14 +777,17 @@ def _write_variants(target_dir, language, text, source_format):
     return saved
 
 
-def download_one(entry):
+def download_one(entry, ledger=None):
     """为一部片补齐缺失语种的字幕。
 
     绝不抛异常：任何失败都归到返回值里，让主循环继续跑下一部。
 
-    R2 模式下的流程：问 R2 要已有语种 -> 只补缺口 -> 字幕写临时目录 ->
-    上传 R2 -> 删临时目录 -> 更新 R2 上的 meta.json。
+    R2 模式下的流程：问 R2 要已有语种 -> 查缺口台账剔除没戏的语种 ->
+    只补剩下的 -> 字幕写临时目录 -> 上传 R2 -> 删临时目录 -> 更新 meta.json。
     本地不留任何残留，与下载侧"上传成功即删本地"的口径一致。
+
+    ledger：{tmdbId: {已确认源站没有的语种}}，传 None 表示不用台账
+    （等价于旧行为，每个语种都问一遍）。
     """
     tmdb_id = entry["tmdbId"]
     year = entry.get("year")
@@ -800,6 +812,18 @@ def download_one(entry):
     ]
     if not pending:
         return tmdb_id, {"status": "skipped"}
+
+    # 查缺口台账：源站已经确认没有的语种不再问第二遍。这是省配额的关键 ——
+    # 实测 zh 的缺口占了一半以上，每次重跑都重查等于把额度扔进水里。
+    given_up = ledger.get(str(tmdb_id), set()) if ledger else set()
+    if given_up:
+        remaining = [lang for lang in pending if lang.lower() not in given_up]
+        if not remaining:
+            # 该片所有还缺的语种都已确认源站没有 —— 这不是"补完了"，
+            # 而是"没得补了"，状态上要与 skipped 区分开，否则统计会误导。
+            return tmdb_id, {"status": "gap_confirmed",
+                             "givenUp": sorted(given_up)}
+        pending = remaining
 
     # 第二步：准备落盘目录。R2 模式用临时目录（传完即删），本地模式直接用
     # 影片目录。两种模式下后续写盘逻辑完全一致。
@@ -848,7 +872,26 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
     except Exception as exc:  # noqa: BLE001 - 查询失败只跳过这一部
         return {"status": "search_failed", "error": _redact(exc)}
 
-    result = {"status": "ok", "saved": [], "missing": []}
+    # ⚠️ missing 与 fetch_failed 必须分开，这是缺口台账能否成立的**前提**：
+    #   missing      = SubDL 确认没有这个语种 → 进台账，以后不再问（省配额）；
+    #   fetch_failed = 我们没取回来（网络抖动、解压失败、写盘失败）→ **不进台账**，
+    #                  下次照常重试。
+    # 混在一起的后果很隐蔽：一次网络抖动就会让那部片的该语种被永久放弃，
+    # 而日志上看起来只是"源站没有"，无从察觉。
+    result = {"status": "ok", "saved": [], "missing": [], "fetch_failed": []}
+
+    def _unattempted():
+        """本片还没得出任何结论的语种——额度恢复后要接着试的就是这些。
+
+        排除三类已有结论的：已存下、源站确认没有、取回失败（后者虽然也要
+        重试，但它已在 fetch_failed 里记着了，重复记一遍会让统计翻倍）。
+        """
+        return [
+            lang for lang in pending
+            if lang not in result["missing"]
+            and lang not in result["fetch_failed"]
+            and not any(s.startswith(f"{lang}.") for s in result["saved"])
+        ]
 
     for language in pending:
         picked = pick_best(subtitles, language)
@@ -881,6 +924,9 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
 
             content, extension = extract_srt(b"".join(chunks))
             if content is None:
+                # zip 里没有可用字幕文件。归入 missing 而非 fetch_failed 是
+                # 刻意的：pick_best 是确定性的（永远挑第一条），下次重试会拿到
+                # **同一个** zip、得到同样的结果，只是白烧一次下载额度。
                 result["missing"].append(language)
                 continue
 
@@ -891,7 +937,9 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
             if saved:
                 result["saved"].extend(saved)
             else:
-                result["missing"].append(language)
+                # 字幕已经取回来了，是**落盘**没成功（磁盘满、权限等）。
+                # 源站明明有，记成 missing 会让台账永久放弃它。
+                result["fetch_failed"].append(language)
         except QuotaExhausted as exc:
             # 额度耗尽：置位全局闸门让后续影片直接跳过，并**立刻停止本片**剩下
             # 的语种——它们同样一个都拿不到。
@@ -904,25 +952,19 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
             if exc.reset_at:
                 result["quotaResetAt"] = exc.reset_at
             # 本片未取到的语种要如实标出来，供下次运行继续尝试。
-            result["unattempted"] = [
-                lang for lang in pending
-                if lang not in result["missing"]
-                and not any(s.startswith(f"{lang}.") for s in result["saved"])
-            ]
+            result["unattempted"] = _unattempted()
             break
         except SearchThrottled as exc:
             # 下载接口被持续限流，处置同上：停下来、如实标注未尝试的语种。
             _signal_stop("search_throttled", str(exc))
             result["status"] = "search_throttled"
             result["error"] = str(exc)
-            result["unattempted"] = [
-                lang for lang in pending
-                if lang not in result["missing"]
-                and not any(s.startswith(f"{lang}.") for s in result["saved"])
-            ]
+            result["unattempted"] = _unattempted()
             break
         except Exception as exc:  # noqa: BLE001 - 单语种失败不影响其它语种
-            result["missing"].append(language)
+            # 取回过程出错（网络、解压、编码）。**不是** missing——源站可能
+            # 明明有，只是这次没拿到。记进 missing 会让台账永久放弃它。
+            result["fetch_failed"].append(language)
             result.setdefault("errors", []).append(f"{language}: {_redact(exc)}")
 
     if REMOTE_MODE and result["saved"]:
@@ -961,6 +1003,57 @@ def _upload_subtitles(tmdb_id, year, target_dir, names):
     return uploaded
 
 
+def load_ledger():
+    """读缺口台账，返回 {tmdbId: {已确认源站没有的语种}}。
+
+    纯追加文件，同一片可能有多行（每次运行各记一次）——按 tmdbId **并集**
+    合并，与 download_dead.jsonl 的"读取端聚合"范式一致（写入端保持纯追加，
+    避免为了去重而重写整个文件、与并发写冲突）。
+
+    文件不存在 / 坏行 / 读失败一律当成空台账：台账是**省配额的优化**，
+    不是正确性的一环。读不到最多多花点额度重查一遍，绝不能让它阻断主流程。
+    """
+    ledger = {}
+    if not os.path.exists(LEDGER_LOG):
+        return ledger
+    try:
+        with open(LEDGER_LOG, "r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tmdb_id = str(record.get("tmdbId") or "").strip()
+                langs = record.get("missing")
+                if not tmdb_id or not isinstance(langs, list):
+                    continue
+                ledger.setdefault(tmdb_id, set()).update(
+                    str(lang).lower() for lang in langs if lang
+                )
+    except OSError as exc:
+        print(f"⚠️ 读取缺口台账失败（按空台账处理）: {exc}", flush=True)
+    return ledger
+
+
+def record_gap(tmdb_id, languages):
+    """把"源站确认没有"的语种追加进台账。写失败只告警，不影响主流程。"""
+    if not languages:
+        return
+    try:
+        with state_lock:
+            with open(LEDGER_LOG, "a", encoding="utf-8") as file:
+                file.write(json.dumps({
+                    "tmdbId": str(tmdb_id),
+                    "missing": sorted(set(languages)),
+                    "logged_at": int(time.time()),
+                }, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 缺口台账写入失败（已忽略）: {exc}", flush=True)
+
+
 def write_state(record):
     """追加一条状态记录。写失败不影响主流程——状态日志本身也是可有可无的。"""
     try:
@@ -982,15 +1075,20 @@ def main():
     entries = load_entries()
     if not entries:
         return
+    ledger = load_ledger()
+    ledger_note = (
+        f"；缺口台账已记 {len(ledger)} 部" if ledger else ""
+    )
     print(
         f"待处理电影: {len(entries)}（语种: {', '.join(SUBTITLE_LANGUAGES)}；"
         f"落点: {'R2 ' + dm.S3_BUCKET if REMOTE_MODE else '本地 ' + dm.BASE_DIR}；"
-        f"可用 api_key: {len(SUBDL_API_KEYS)} 个）",
+        f"可用 api_key: {len(SUBDL_API_KEYS)} 个{ledger_note}）",
         flush=True,
     )
 
     stats = {}
     saved_count = 0
+    gap_count = 0
     stop_announced = False
     # 收尾提示要用的两项，从**结果**里取而不是读 stop_reason：
     # stop_reason 只有在本进程内真正触发过 _signal_stop 时才有值，而结果字典
@@ -999,7 +1097,9 @@ def main():
     blocked_kinds = set()
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(download_one, entry): entry for entry in entries}
+        futures = {
+            pool.submit(download_one, entry, ledger): entry for entry in entries
+        }
         for index, future in enumerate(as_completed(futures), 1):
             entry = futures[future]
             try:
@@ -1012,13 +1112,25 @@ def main():
 
             stats[result["status"]] = stats.get(result["status"], 0) + 1
             saved_count += len(result.get("saved", []))
+            # 只把"源站确认没有"记进台账。fetch_failed / unattempted 都不记 ——
+            # 它们下次还要再试，记进去等于永久放弃。
+            if result.get("missing"):
+                record_gap(tmdb_id, result["missing"])
+                gap_count += len(result["missing"])
             write_state({"tmdbId": tmdb_id, "title": entry.get("title"),
                          **result})
 
             if result["status"] == "ok":
+                # 取回失败的单独列出来：它与"源站没有"的后续处置完全不同
+                # （前者下次还会再试，后者已进台账不再问）。
+                retry_note = (
+                    f" 取回失败 {result['fetch_failed']}（下次重试）"
+                    if result.get("fetch_failed") else ""
+                )
                 print(
                     f"[{index}/{len(entries)}] {tmdb_id} {entry.get('title')} "
-                    f"-> 已保存 {result['saved']} 缺失 {result['missing']}",
+                    f"-> 已保存 {result['saved']} 缺失 {result['missing']}"
+                    f"{retry_note}",
                     flush=True,
                 )
             elif result["status"] == "search_failed":
@@ -1060,6 +1172,18 @@ def main():
     used_keys = key_pool.exhausted_count()
 
     print(f"\n完成。本次新增字幕文件 {saved_count} 个，统计: {stats}", flush=True)
+    if gap_count:
+        print(
+            f"缺口台账新记 {gap_count} 条（源站确认没有的语种），"
+            f"下次运行将直接跳过它们以省配额 -> {LEDGER_LOG}",
+            flush=True,
+        )
+    if stats.get("gap_confirmed"):
+        print(
+            f"其中 {stats['gap_confirmed']} 部因所缺语种此前已确认源站没有"
+            f"而整片跳过（未消耗任何配额）",
+            flush=True,
+        )
 
     if blocked:
         # 额度耗尽与被限流的"下一步"不同：前者要等到明天，后者过一阵就能再试。
@@ -1088,10 +1212,19 @@ def main():
                      f"api_key（最后一个仍有余额）。\n")
         else:
             spent = f"   未触发任何配额限制（共 {len(SUBDL_API_KEYS)} 个 api_key）。\n"
+        # "都已尝试过"这话对被台账跳过的片不成立——它们这次一个请求都没发。
+        # 收尾结论要经得起推敲，否则下次遇到"某片始终没字幕"会白排查一轮。
+        skipped = stats.get("gap_confirmed", 0)
+        scope = (
+            f"   当前 success.jsonl 里的片都已处理过"
+            f"（其中 {skipped} 部按缺口台账直接跳过），**无需今天再跑**；\n"
+            if skipped else
+            "   当前 success.jsonl 里的片都已尝试过，**无需今天再跑**；\n"
+        )
         print(
             f"\n✅ ===== 全部待补影片已处理完毕 =====\n"
             f"{spent}"
-            f"   当前 success.jsonl 里的片都已尝试过，**无需今天再跑**；\n"
+            f"{scope}"
             f"   等下载侧产出新片后再执行即可。",
             flush=True,
         )
