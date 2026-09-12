@@ -5,10 +5,13 @@ success/failed/pending log bookkeeping, playlist parsing and reupload flow.
 No network / ffmpeg / boto3 calls are made.
 """
 
+import builtins
 import json
 import os
+import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -888,6 +891,89 @@ def test_process_one_entry_mp4_branch_builds_job(sandbox, monkeypatch):
     assert "9_S01E01" in d.processing_ids
 
 
+def test_conversion_job_carries_provider_attribution(sandbox, monkeypatch):
+    """🔑 成功的 job 必须带上是哪家 provider、第几个节点下成的。
+
+    没有这几个字段，多节点 fallback 的全部价值都无法量化——成品里看不出
+    哪家救回来的，也就无从判断某个源该留该撤（§0.12 待复验 vidfast 去留）。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(
+        d, "_download_mp4_direct",
+        lambda node, out, label, runtime_minutes=None: ("1920x1080", 4000),
+    )
+    entry = {"tmdbId": 9, "season": 1, "episode": 1, "urls": [
+        {"url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4"},
+    ]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    assert job["provider"] == "vidlink" and job["node_type"] == "mp4"
+    assert job["node_index"] == 1 and job["node_total"] == 1
+
+
+def test_attribution_records_which_node_won_the_fallback(sandbox, monkeypatch):
+    """首节点挂掉、次节点救回时，node_index 必须是 2。
+
+    node_index > 1 正是"多源到底有没有用"最直接的证据：它说明这一集
+    **只靠 fallback 才拿到**，是判断某个源价值的核心信号。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+
+    def fake_direct(node, output_path, label, runtime_minutes=None):
+        raise RuntimeError("直链块不可用（HTTP 404）")
+
+    monkeypatch.setattr(d, "_download_mp4_direct", fake_direct)
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None, headers=None: [("1920x1080", "https://m/v", 5000.0)],
+    )
+    monkeypatch.setattr(
+        d, "parse_media_playlist",
+        lambda url, headers=None: ([f"https://s/{i}.ts" for i in range(8)],
+                                   [4.0] * 8, None),
+    )
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (1920, 1080))
+    monkeypatch.setattr(d, "SAMPLE_COUNT", 2)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 100.0})
+
+    def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
+                      init_url=None, force_init=False, headers=None,
+                      retry_max=None):
+        n = (len(urls) if end_idx is None else end_idx) - start_idx
+        with open(out, "wb") as fh:
+            fh.write(b"x" * n)
+        return n * 1_000_000, [], 0
+
+    monkeypatch.setattr(d, "download_segments", fake_download)
+    entry = {"tmdbId": 9, "season": 1, "episode": 1, "urls": [
+        {"url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4"},
+        {"url": "https://m/master.m3u8", "provider": "vidfast", "type": "m3u8"},
+    ]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    # 第二个节点才成功 —— 这一集是被 vidfast 靠 fallback 救回来的
+    assert job["provider"] == "vidfast" and job["node_type"] == "m3u8"
+    assert job["node_index"] == 2 and job["node_total"] == 2
+
+
+def test_attribution_of_extracts_all_keys():
+    """归因字段集中定义，缺键补 None（reupload 等路径可能没有这些键）。"""
+    got = d._attribution_of({
+        "provider": "vidup", "node_type": "m3u8",
+        "node_index": 1, "node_total": 3, "irrelevant": "x",
+    })
+    assert got == {
+        "provider": "vidup", "node_type": "m3u8",
+        "node_index": 1, "node_total": 3,
+    }
+    assert d._attribution_of({}) == {
+        "provider": None, "node_type": None,
+        "node_index": None, "node_total": None,
+    }
+    assert d._attribution_of(None)["provider"] is None
+
+
 def test_process_one_entry_mp4_then_m3u8_fallback(sandbox, monkeypatch):
     """mp4 直链 403 过期属确定性失败；切到备用 m3u8 节点，残留 ts 被清理。
 
@@ -1708,6 +1794,427 @@ def test_run_pipeline_batches_download_submissions(sandbox, monkeypatch):
     assert state["peak"] <= d.DOWNLOAD_QUEUE_DEPTH
     failed = _read_jsonl(d.FAILED_LOG)
     assert len(failed) == 20 and all(r["stage"] == "download" for r in failed)
+
+
+# ------------------------------------------------ 陈旧直链启动预检
+def _stale_env(monkeypatch, sandbox, *, enabled=True, stale_after=86400):
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", enabled)
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", stale_after)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_EPISODE", 2)
+    monkeypatch.setattr(d, "AUTO_REFETCH_WORKERS", 2)
+    monkeypatch.setattr(d, "INPUT_JSONL", str(sandbox / "results.jsonl"))
+
+
+def _entry(tid, *, fetched_at=None, url="old"):
+    e = {"tmdbId": tid, "season": 1, "episode": 2, "urls": [url]}
+    if fetched_at is not None:
+        e["fetched_at"] = fetched_at
+    return e
+
+
+def _install_fetcher(monkeypatch, results):
+    """把假的 tv_ids_to_links 塞进 sys.modules，供 refetch_entries 延迟导入。
+
+    results: {集级 key: (status, result)}；未列出的 key 返回 ("dead", None)。
+    返回记录被调用集的 list。
+    """
+    calls = []
+    module = types.ModuleType("tv_ids_to_links")
+
+    def process_episode(tid, season, episode):
+        key = d.episode_key(tid, season, episode)
+        calls.append(key)
+        return results.get(key, ("dead", None))
+
+    module.process_episode = process_episode
+    monkeypatch.setitem(sys.modules, "tv_ids_to_links", module)
+    return calls
+
+
+def test_is_stale_entry_needs_fetched_at(monkeypatch, sandbox):
+    """没有 fetched_at 的条目一律判不陈旧——宁可漏判，不可误判。
+
+    旧版 results.jsonl 与手工输入都没有该字段，当成"无限旧"会让整批集在启动时
+    全部去重取流，取流配额与耗时双重浪费，且多半徒劳。
+    """
+    _stale_env(monkeypatch, sandbox)
+    now = 1_000_000
+    assert d.is_stale_entry(_entry("1"), now) is False
+    assert d.is_stale_entry(_entry("1", fetched_at=0), now) is False
+    assert d.is_stale_entry(_entry("1", fetched_at=now - 10), now) is False
+    assert d.is_stale_entry(_entry("1", fetched_at=now - 86401), now) is True
+
+
+def test_is_stale_entry_disabled_by_zero(monkeypatch, sandbox):
+    """stale_after_seconds=0 关闭判定，再旧也不算陈旧。"""
+    _stale_env(monkeypatch, sandbox, stale_after=0)
+    assert d.is_stale_entry(_entry("1", fetched_at=1), 10**9) is False
+
+
+def test_refresh_stale_entries_replaces_only_stale_and_keeps_order(
+    monkeypatch, sandbox
+):
+    """只换陈旧的那条，顺序不变，新鲜条目不该被送去重取。"""
+    _stale_env(monkeypatch, sandbox)
+    now = int(time.time())
+    fresh = _entry("1", fetched_at=now)
+    stale = _entry("2", fetched_at=now - 90000)
+    revived = {
+        "tmdbId": "2", "season": 1, "episode": 2,
+        "urls": ["new"], "fetched_at": now,
+    }
+    calls = _install_fetcher(monkeypatch, {"2_S01E02": ("ok", revived)})
+
+    out = d.refresh_stale_entries([fresh, stale], {})
+    # 只有陈旧的那集被重取
+    assert calls == ["2_S01E02"]
+    # 顺序保持，新鲜条目原样
+    assert out[0] is fresh
+    assert out[1]["urls"] == ["new"] and out[1]["fetched_at"] == now
+    # 新结果落盘 INPUT_JSONL，供下次运行按 fetched_at 择新
+    assert _read_jsonl(d.INPUT_JSONL) == [revived]
+
+
+def test_refresh_stale_entries_keeps_original_when_refetch_fails(
+    monkeypatch, sandbox
+):
+    """🔑 重取无果必须原样保留，绝不丢弃。
+
+    阈值只是经验值、旧链接未必真失效；且没配代理凭证的机器根本取不了流，
+    丢弃等于整批集全军覆没。本功能绝不允许反过来降低下载成功率。
+    """
+    _stale_env(monkeypatch, sandbox)
+    stale = _entry("2", fetched_at=1)
+    _install_fetcher(monkeypatch, {})          # 全部返回 dead
+
+    out = d.refresh_stale_entries([stale], {})
+    assert out == [stale] and out[0]["urls"] == ["old"]
+
+
+def test_refresh_stale_entries_lets_keyboard_interrupt_escape(
+    monkeypatch, sandbox
+):
+    """Ctrl+C 必须原样逃逸：重取只吞 Exception/SystemExit，绝不笼统吞 BaseException。"""
+    _stale_env(monkeypatch, sandbox)
+
+    def boom(entries, counts):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(d, "refetch_entries", boom)
+    with pytest.raises(KeyboardInterrupt):
+        d.refresh_stale_entries([_entry("2", fetched_at=1)], {})
+
+
+def test_refetch_entries_import_systemexit_is_swallowed(monkeypatch, sandbox):
+    """import 阶段的 SystemExit 被吞掉并返回空列表（沿用旧链接继续下载）。"""
+    _stale_env(monkeypatch, sandbox)
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **kw):
+        if name == "tv_ids_to_links":
+            raise SystemExit("缺少代理凭证")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    assert d.refetch_entries([_entry("2", fetched_at=1)], {}) == []
+
+
+def test_refetch_entries_respects_per_episode_cap(monkeypatch, sandbox):
+    """达到每集重取上限后不再重取，防'取流-过期-重取'反复空转。"""
+    _stale_env(monkeypatch, sandbox)
+    calls = _install_fetcher(monkeypatch, {})
+    counts = {"2_S01E02": 2}          # 已达上限 AUTO_REFETCH_MAX_PER_EPISODE
+    assert d.refetch_entries([_entry("2", fetched_at=1)], counts) == []
+    assert calls == []
+
+
+def test_refetch_entries_counts_are_per_episode_not_per_show(
+    monkeypatch, sandbox
+):
+    """🔑 记数粒度必须是集级：同一部剧的几十集共用一个 tmdbId。
+
+    若按剧记数，同剧只要有 max_per_episode 集被重取过，**剩下所有集都会被
+    永久挡掉**——一部 100 集的剧只救得回 2 集。这里跑两轮来暴露它：第一轮
+    把计数填起来，第二轮换别的集，按集记数时它们仍应被重取。
+    """
+    _stale_env(monkeypatch, sandbox)
+    counts = {}
+    mk = lambda ep: {  # noqa: E731
+        "tmdbId": "7", "season": 1, "episode": ep, "urls": ["o"],
+        "fetched_at": 1,
+    }
+    calls = _install_fetcher(monkeypatch, {})
+
+    # 第一轮：S01E01/E02 各被重取一次 → 按剧记数的话 counts["7"] 会累到 2
+    d.refetch_entries([mk(1), mk(2)], counts)
+    calls.clear()
+    # 第二轮：换两集全新的。按集记数它们的计数是 0，必须照样被重取。
+    d.refetch_entries([mk(3), mk(4)], counts)
+
+    assert sorted(calls) == ["7_S01E03", "7_S01E04"]
+    # 计数按集分开存放，不会挤在一个剧级键上
+    assert counts.get("7") is None
+    assert counts["7_S01E01"] == 1 and counts["7_S01E03"] == 1
+
+
+def test_refetch_entries_single_failure_does_not_kill_batch(
+    monkeypatch, sandbox
+):
+    """单集重取抛异常不影响同批其余集。"""
+    _stale_env(monkeypatch, sandbox)
+    now = int(time.time())
+    good = {"tmdbId": "9", "season": 1, "episode": 2,
+            "urls": ["new"], "fetched_at": now}
+    module = types.ModuleType("tv_ids_to_links")
+
+    def process_episode(tid, season, episode):
+        if str(tid) == "8":
+            raise RuntimeError("boom")
+        return "ok", good
+
+    module.process_episode = process_episode
+    monkeypatch.setitem(sys.modules, "tv_ids_to_links", module)
+
+    out = d.refetch_entries(
+        [_entry("8", fetched_at=1), _entry("9", fetched_at=1)], {}
+    )
+    assert [e["tmdbId"] for e in out] == ["9"]
+
+
+def test_refetch_entries_preserves_extra_metadata(monkeypatch, sandbox):
+    """逐键覆盖而非整体替换：entry 上的历史元数据必须保留。"""
+    _stale_env(monkeypatch, sandbox)
+    now = int(time.time())
+    entry = _entry("2", fetched_at=1)
+    entry["year"] = 2021
+    entry["runtime_minutes"] = 42
+    revived = {"tmdbId": "2", "season": 1, "episode": 2,
+               "urls": ["new"], "fetched_at": now}
+    _install_fetcher(monkeypatch, {"2_S01E02": ("ok", revived)})
+
+    out = d.refetch_entries([entry], {})
+    assert out[0]["year"] == 2021 and out[0]["runtime_minutes"] == 42
+    assert out[0]["urls"] == ["new"]
+
+
+def test_refresh_stale_entries_noop_when_disabled(monkeypatch, sandbox):
+    """关闭开关后原样返回，且绝不碰取流模块。"""
+    _stale_env(monkeypatch, sandbox, enabled=False)
+    calls = _install_fetcher(monkeypatch, {})
+    entries = [_entry("2", fetched_at=1)]
+    assert d.refresh_stale_entries(entries, {}) is entries
+    assert calls == []
+
+
+def test_precheck_caps_batch_and_prefers_oldest(monkeypatch, sandbox):
+    """🔑 单次限额 + 最旧优先。
+
+    TV 全量下 stale 可达几万到十几万集，一次性全 submit 会让绝大多数排队到
+    总超时被丢弃，且它们的 refetch_counts 不会 +1，下次运行又从头再来，
+    队尾永远轮不到 —— 等于预检只对前几百集有效。
+    """
+    _stale_env(monkeypatch, sandbox)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_RUN", 2)
+    # 故意让最旧的排在列表末尾，验证是按时间而非按出现顺序挑
+    entries = [
+        _entry("1", fetched_at=500),
+        _entry("2", fetched_at=100),
+        _entry("3", fetched_at=300),
+        _entry("4", fetched_at=200),
+    ]
+    calls = _install_fetcher(monkeypatch, {})
+    d.refresh_stale_entries(entries, {})
+    # 只处理 2 集，且是 fetched_at 最小（最旧）的两集
+    assert sorted(calls) == ["2_S01E02", "4_S01E02"]
+
+
+def test_precheck_cap_zero_means_unlimited(monkeypatch, sandbox):
+    """max_per_run=0 表示不限额（小批量场景）。"""
+    _stale_env(monkeypatch, sandbox)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_RUN", 0)
+    entries = [_entry(str(i), fetched_at=i + 1) for i in range(5)]
+    calls = _install_fetcher(monkeypatch, {})
+    d.refresh_stale_entries(entries, {})
+    assert len(calls) == 5
+
+
+def test_precheck_skips_quality_dead_episodes(monkeypatch, sandbox):
+    """🔑 上次因画质不达标判死的集不再重取——重取回来仍不达标，白烧配额。
+
+    TV 侧集级有源率个位数，这类集在失败总量里占比很高。
+    """
+    _stale_env(monkeypatch, sandbox)
+    d.write_log(d.FAILED_LOG, {
+        "tmdbId": "2", "season": 1, "episode": 2,
+        "error": "分辨率 640x360 低于红线 720（容差 0.95），跳过",
+        "stage": "download", "retriable": False,
+    })
+    calls = _install_fetcher(monkeypatch, {})
+    out = d.refresh_stale_entries([_entry("2", fetched_at=1)], {})
+    assert calls == []              # 一次取流都不发
+    assert out[0]["urls"] == ["old"]  # 条目原样保留，照常用旧链接下载
+
+
+def test_precheck_does_not_skip_transient_failures(monkeypatch, sandbox):
+    """🔴 红线：源站 5xx / 超时**绝不能**被当成画质判死跳过。
+
+    那是"今天源站挂了"，重取完全可能换到好流；跳过等于永久放弃可救回的集。
+    """
+    _stale_env(monkeypatch, sandbox)
+    for err, retriable in [
+        ("HTTP Error 502", True),
+        ("Read timed out", True),
+        ("直链已失效（HTTP 403），需重新取流: x", False),
+    ]:
+        d.write_log(d.FAILED_LOG, {
+            "tmdbId": "2", "season": 1, "episode": 2,
+            "error": err, "stage": "download", "retriable": retriable,
+        })
+        calls = _install_fetcher(monkeypatch, {})
+        d.refresh_stale_entries([_entry("2", fetched_at=1)], {})
+        assert calls == ["2_S01E02"], f"{err} 不该被跳过"
+        os.remove(d.FAILED_LOG)
+
+
+def test_quality_dead_takes_the_latest_verdict(monkeypatch, sandbox):
+    """同一集先画质判死、后来因别的原因失败 → 以最后一条为准，不再跳过。
+
+    画质门槛可能被调松过，旧的判死结论不该永久压住它。
+    """
+    _stale_env(monkeypatch, sandbox)
+    d.write_log(d.FAILED_LOG, {
+        "tmdbId": "2", "season": 1, "episode": 2,
+        "error": "码率未达到门槛", "stage": "download", "retriable": False,
+    })
+    d.write_log(d.FAILED_LOG, {
+        "tmdbId": "2", "season": 1, "episode": 2,
+        "error": "HTTP Error 502", "stage": "download", "retriable": True,
+    })
+    assert d.load_quality_dead_keys() == set()
+
+
+def test_is_quality_dead_requires_non_retriable():
+    """可重试的失败一律不算画质判死（多节点集里"画质淘汰+502"整集仍可重试）。"""
+    assert d.is_quality_dead(False, "分辨率 640x360 低于红线 720") is True
+    assert d.is_quality_dead(False, "码率未达到门槛") is True
+    assert d.is_quality_dead(False, "本轮候选流无一入选") is True
+    # 同样的文案，retriable=True 就不算
+    assert d.is_quality_dead(True, "分辨率 640x360 低于红线 720") is False
+    # 非画质类的确定性失败也不算
+    assert d.is_quality_dead(False, "直链块不可用（HTTP 404）") is False
+    assert d.is_quality_dead(False, "HTTP Error 502") is False
+
+
+def test_plan_retry_buckets_are_not_mutually_exclusive(monkeypatch):
+    """🔑 重投与重取两个桶不互斥。
+
+    多源下"vidup m3u8 挂 5xx + vidlink mp4 签名过期"是常态。若写成互斥分支，
+    这类集只会被重投而永远不换新直链，那个 mp4 节点在剩余轮次里都是废的。
+    """
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    # 显式标志优先：error 文案里没有 marker，但节点循环发现过期了
+    assert d.plan_retry_buckets(True, "HTTP Error 502", True) == (True, True)
+    # 缺显式标志时回退按文案判断
+    assert d.plan_retry_buckets(
+        True, f"x {d._NEEDS_REFETCH_MARKER} y", None
+    ) == (True, True)
+    assert d.plan_retry_buckets(True, "HTTP Error 502", None) == (True, False)
+    # 关掉开关后重取桶恒空
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", False)
+    assert d.plan_retry_buckets(True, "x", True) == (True, False)
+
+
+def test_needs_refetch_flag_survives_non_last_node(sandbox, monkeypatch):
+    """🔑 过期节点排在**非末位**时，标志必须仍然为真。
+
+    error 文案只保留最后一个节点的错误。若只按文案判断，
+    「节点1 vidlink 403 过期 → 节点2 502」这种常见组合永远读不到过期 marker，
+    该直链在剩余所有轮次里都是废的。
+    """
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+
+    def fake_direct(node, output_path, label, runtime_minutes=None):
+        raise RuntimeError(f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: x")
+
+    monkeypatch.setattr(d, "_download_mp4_direct", fake_direct)
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda url, retries=None, headers=None: (_ for _ in ()).throw(
+            RuntimeError("HTTP Error 502")
+        ),
+    )
+    entry = {"tmdbId": 1, "season": 1, "episode": 1, "urls": [
+        {"url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4"},
+        {"url": "https://m/x.m3u8", "provider": "vidup", "type": "m3u8"},
+    ]}
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    # 末节点是 502，文案里本来没有过期 marker
+    assert info["needs_refetch"] is True
+    assert info["retriable"] is True
+    # 补挂到文案里，落盘的 failed.jsonl 也能看出来
+    assert d._NEEDS_REFETCH_MARKER in info["error"]
+    assert d.plan_retry_buckets(
+        info["retriable"], info["error"], info["needs_refetch"]
+    ) == (True, True)
+
+
+def test_merge_next_batch_dedupes_per_episode(sandbox):
+    """🔑 合并两个桶时按**集级 key** 去重，重取后的新 entry 优先。
+
+    按 tmdbId 去重会让一部剧每轮只剩一集能重投 —— 这是 TV 侧最容易踩的坑。
+    """
+    old_e1 = {"tmdbId": "7", "season": 1, "episode": 1, "urls": ["old"]}
+    old_e2 = {"tmdbId": "7", "season": 1, "episode": 2, "urls": ["old"]}
+    new_e1 = {"tmdbId": "7", "season": 1, "episode": 1, "urls": ["new"]}
+
+    out = d.merge_next_batch([old_e1, old_e2], [new_e1])
+    # 同剧两集都在（没被按 tmdbId 误合成一条）
+    assert len(out) == 2
+    by_key = {d.record_episode_key(e): e for e in out}
+    # E01 取重取后的新 urls，E02 保持原样
+    assert by_key["7_S01E01"]["urls"] == ["new"]
+    assert by_key["7_S01E02"]["urls"] == ["old"]
+
+
+def test_startup_precheck_runs_only_in_non_streaming_mode(monkeypatch, sandbox):
+    """pipeline（流式）模式刻意不做同步预检。
+
+    它的前提是主循环一步都不阻塞，而 refetch_entries 是同步的、最长堵住
+    AUTO_REFETCH_TIMEOUT。此时取流线程已在灌队列，堵住主循环反而会让队列里的
+    新鲜直链继续变旧——与预检目的正相反。
+    """
+    entries = [_entry("2", fetched_at=1)]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        json.dumps(entries[0], ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (
+            "x", False, {"error": "没有找到媒体播放列表", "retriable": False}
+        ),
+    )
+    seen = []
+    monkeypatch.setattr(
+        d, "refresh_stale_entries",
+        lambda batch, counts: seen.append(len(batch)) or batch,
+    )
+
+    # ① 流式模式：pipeline.py 会把 ListEntrySource 换成自己的工厂
+    monkeypatch.setattr(d, "ListEntrySource", lambda es: d._ListEntrySource(es))
+    d._run_pipeline()
+    assert seen == []            # 预检没被调用
+
+    # ② 非流式（单独跑 download_tv.py）：预检必须执行
+    monkeypatch.setattr(d, "ListEntrySource", d._ListEntrySource)
+    d._run_pipeline()
+    assert seen == [1]
 
 
 # ------------------------------------------------ 流式来源（pipeline 模式）

@@ -17,6 +17,7 @@ import time
 from concurrent.futures import (
     FIRST_COMPLETED,
     ThreadPoolExecutor,
+    as_completed,
     wait,
 )
 from pathlib import Path
@@ -90,6 +91,48 @@ MAX_ROUNDS = max(1, int(_MULTI_ROUND_CFG.get("max_rounds", 1))) if MULTI_ROUND_E
 # 这类失败交由跨运行重试兜底——failed 的集下次运行本就会自动重投（本脚本只按
 # success 跳过），那时往往已过数小时，恰好落在源站真正恢复的窗口里。
 ROUND_COOLDOWN_SECONDS = max(0, int(_MULTI_ROUND_CFG.get("cooldown_seconds", 60)))
+
+# ---- 陈旧直链启动预检 ----
+# results.jsonl 里的集躺过 STALE_LINK_SECONDS 后，启动时先重新取流换新 url 再
+# 下载，而不是等下载失败了才发现链接过期。
+#
+# 🔑 为什么 TV 侧必须有它：vidlink 出的是带 sign&t 时效签名的 mp4 直链，而取流
+# 侧的 load_processed 把 results.jsonl 里**已成功**的集算作"已处理"——重跑取流
+# 不会给这些集换链接。没有本预检时闭环是死的：
+#   取流不换链接 → 下载拿旧 url → 判"需重新取流" → 什么也没发生 → 下次重复
+# 全量取流要跑很多天，第 1 天取到的直链到第 10 天大概率已经过期。
+# 此前 fetched_at **只用于同一集多行之间的相对择新**，从不与当前时间比较。
+_REFETCH_CFG = _CFG.get("auto_refetch", {}) or {}
+AUTO_REFETCH_ENABLED = bool(_REFETCH_CFG.get("enabled", True))
+# 0 = 关闭预检（退回旧行为：只在下载失败后才由上游人工重取）。
+STALE_LINK_SECONDS = max(0, int(_REFETCH_CFG.get("stale_after_seconds", 86400)))
+# 取流走代理、与下载争带宽，故远小于取流侧独立运行时的 max_workers。
+AUTO_REFETCH_WORKERS = max(1, int(_REFETCH_CFG.get("workers", 8)))
+# 单集在一次运行中最多被重取几次：新链接同样可能在下载排队期间再过期，
+# 故允许多次，但必须有上限，否则"取流-过期-重取"可能反复空转。
+AUTO_REFETCH_MAX_PER_EPISODE = max(
+    1, int(_REFETCH_CFG.get("max_per_episode", 2))
+)
+# 【TV 侧特有】单次启动预检最多处理多少集。0 = 不限额。
+#
+# 🔑 为什么电影侧没有而 TV 侧必须有：TV 取流成功约 15-20 万集，跨运行间隔超过
+# 24h 后 stale 会是几万到十几万集。单集取流要打多个 provider × 多 server ×
+# 12s 超时，8 并发下 600s 最多只够几百集 —— 一次性全 submit 会让绝大多数集
+# 排队到总超时被丢弃，而它们的 refetch_counts **不会 +1**（只在收到结果时记），
+# 下次运行又从头再来，队尾的集永远轮不到。等于预检只对前几百集有效。
+# 故按 fetched_at 升序截断：最旧的直链最可能过期，优先换它们。
+AUTO_REFETCH_MAX_PER_RUN = max(0, int(_REFETCH_CFG.get("max_per_run", 2000)))
+# 预检是否跳过"上次因画质不达标被判死"的集。TV 侧有源率个位数，这类集占比高，
+# 重取回来画质依然不达标，白烧住宅代理配额。
+AUTO_REFETCH_SKIP_QUALITY_DEAD = bool(
+    _REFETCH_CFG.get("skip_quality_dead", True)
+)
+# 单次预检的总耗时上限（秒）。预检由主线程同步调用，此刻下载还没开始（不像电影
+# 侧的轮次间重取会堵住主事件循环），但仍不能让它无限期堵住启动：全量重跑时
+# 一次几千集陈旧很正常，而单集取流要跑多个 provider × 多 server × 超时 × 重试。
+AUTO_REFETCH_TIMEOUT = max(
+    30, int(_REFETCH_CFG.get("round_timeout_seconds", 600))
+)
 # 两个独立的下载态状态文件（区别于 SUCCESS_LOG/FAILED_LOG）。
 DOWNLOAD_OK_LOG = resolve_file(_CFG.get("download_ok_log"), "download_ok.jsonl")
 DOWNLOAD_FAIL_LOG = resolve_file(_CFG.get("download_fail_log"), "download_fail.jsonl")
@@ -789,6 +832,39 @@ def _classify_failure(error_msg):
     return True
 
 
+def needs_refetch(error_msg):
+    """这次失败是不是"直链签名已过期、必须换新 url 才可能成功"。"""
+    return bool(error_msg) and _NEEDS_REFETCH_MARKER in error_msg
+
+
+def plan_retry_buckets(retriable, error_msg, refetch_flag=None):
+    """决定一次下载失败要进哪些桶，返回 (要重投, 要重新取流)。
+
+    两者**不互斥**，这是本函数存在的全部理由：
+      - retriable 是乐观口径——任一节点可重试，整集就值得下一轮重投；
+      - needs_refetch 说明至少有一个 mp4 节点的签名 url 已失效，重投拿到的
+        还是同一条、必然再挂。
+    多源下"vidup m3u8 挂 5xx + vidlink mp4 签名过期"是常态。若写成互斥分支，
+    这类集只会被重投而永远不换新直链，那个 mp4 节点在剩余所有轮次里都是废的，
+    白白损失一个可用源。
+
+    refetch_flag：调用方逐节点统计出的显式结论。传 None 表示"没有该信息"，
+    此时回退到按 error_msg 文案判断。之所以要这个参数——error_msg 只保留
+    **最后一个**节点的错误，过期节点排在非末位时文案里根本没有过期 marker。
+
+    ⚠️ `auto_refetch.enabled: false` 时重取桶恒为空：`_NEEDS_REFETCH_MARKER`
+    同时在 `_PERMANENT_FAILURE_MARKERS` 里，故带 marker 的失败 retriable=False，
+    两个桶当轮都是空的。这是该开关有意的语义（等下次运行的启动预检处理），
+    此处不做自动兜底。
+    """
+    if refetch_flag is None:
+        refetch_flag = needs_refetch(error_msg)
+    return (
+        bool(retriable),
+        AUTO_REFETCH_ENABLED and bool(refetch_flag),
+    )
+
+
 # 被拒/失败原因归类规则：(类别名, 命中关键字元组)，按顺序首个命中者胜出。
 # 仅用于收尾聚合统计（观测性），量化各类误杀/失败占比，指导码率门槛校准。
 # 不参与任何判定逻辑，改动零风险。
@@ -830,6 +906,76 @@ def classify_reject_reason(error_msg):
             if marker in error_msg:
                 return category
     return "其他"
+
+
+# 画质类淘汰的类目名。用**类目**而非裸 marker：判据演进时只改 _REJECT_REASON_RULES
+# 一处，这里自动跟随。
+#
+# ⚠️ 只收"源确实给了流、但这条流画质不达标"的类目。源站 5xx / 超时 / 直链失效
+# 绝不能进来——那是"今天源站挂了"，重取完全可能换到好流；把它们当画质判死会
+# 永久放弃可救回的集，直接违背"尽可能提高成功率"这条红线。
+_QUALITY_REJECT_CATEGORIES = frozenset({
+    "分辨率低于红线",
+    "码率未达门槛",
+    "候选流无一入选",
+})
+
+
+def is_quality_dead(retriable, error_msg):
+    """这次失败是不是"画质不达标"型的确定性淘汰。
+
+    两个条件缺一不可：
+      - retriable 为 False：可重试的失败一律不算（多节点集里"某节点画质淘汰 +
+        某节点 502"整集仍可重试，算进来等于永久误杀）；
+      - 文案归类命中 _QUALITY_REJECT_CATEGORIES。
+    """
+    if retriable:
+        return False
+    return classify_reject_reason(error_msg) in _QUALITY_REJECT_CATEGORIES
+
+
+def load_quality_dead_keys():
+    """从 FAILED_LOG 读出"上次因画质不达标被判死"的集级 key 集合。
+
+    供启动预检跳过这些集：它们取流是成功的（有 urls），只是流的画质不达标，
+    重取一次流回来**大概率还是同样的流、同样不达标**，纯属白烧住宅代理配额。
+    TV 侧集级有源率只有个位数百分比，这类集在失败总量里占比很高。
+
+    ⚠️ 读文件失败一律返回空集合：预检是"锦上添花"，绝不能因为读不了日志就
+    影响启动。返回空集合的后果只是退回旧行为（全部按时间判断）。
+    """
+    keys = set()
+    if not AUTO_REFETCH_SKIP_QUALITY_DEAD or not os.path.exists(FAILED_LOG):
+        return keys
+    try:
+        with open(FAILED_LOG, "r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # 只看下载阶段：转封装/上传失败与画质无关。
+                if record.get("stage") != "download":
+                    continue
+                key = record_episode_key(record)
+                if not key:
+                    continue
+                if is_quality_dead(
+                    record.get("retriable", False), record.get("error", "")
+                ):
+                    keys.add(key)
+                else:
+                    # 同一集可能先画质判死、后来又因别的原因失败（或反之）。
+                    # 以**最后一条**为准：画质门槛可能被调松过，旧的判死结论
+                    # 不该永久压住它。
+                    keys.discard(key)
+    except OSError as exc:
+        print(f"⚠️ 读取 {FAILED_LOG} 失败，预检不做画质跳过: {exc}", flush=True)
+        return set()
+    return keys
 
 
 def update_success_log(key, new_record):
@@ -1044,6 +1190,20 @@ def write_pending(record):
     with pending_lock:
         with open(UPLOAD_PENDING_LOG, "a", encoding="utf-8") as file:
             file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+# provider 归因字段。集中定义避免各写入点漏抄其中一个。
+_ATTRIBUTION_KEYS = ("provider", "node_type", "node_index", "node_total")
+
+
+def _attribution_of(source):
+    """从 success_info / conversion_job 抽出 provider 归因字段。
+
+    pending 记录必须带上它们：补传成功后 reupload 会用 pending 里的值重建
+    success 记录，漏了这几个键就等于把"这集是哪家下成的"抹掉——而降级留本地的
+    集恰恰是上传侧故障时的一大批，抹掉会让各源转化率统计系统性偏低。
+    """
+    return {key: (source or {}).get(key) for key in _ATTRIBUTION_KEYS}
 
 
 # 主流程运行标记文件：用于让手动 reupload 检测主流程是否在跑，
@@ -2354,6 +2514,9 @@ def process_one_entry(entry, processed_ids):
     # 抛异常的动作（磁盘闸门等待、建目录）都必须在 try 内，否则会绕过 finally
     # 的 discard，让该集 ID 在本进程内永久卡在“处理中”、后续轮次全被跳过。
     handed_off_to_conversion = False
+    # 在 try 之外初始化：下面的 except 会读它，而异常可能在进入节点循环之前
+    # 就抛出（磁盘闸门、建目录等），那时它若还没定义就是 NameError。
+    any_needs_refetch = False
     cleanup_paths = set()
     final_ts = os.path.join(TEMP_DIR, f"temp_{safe_file_token(normalized_id)}.ts")
     temp_mp4 = os.path.join(TEMP_DIR, f"temp_{safe_file_token(normalized_id)}.mp4")
@@ -2685,6 +2848,10 @@ def process_one_entry(entry, processed_ids):
         conversion_job = None
         last_exc = None
         any_retriable = False  # 只要有任一节点是“可重试失败”，整集就值得下一轮重试
+        # 逐节点记录"是否有节点的直链已过期"（any_needs_refetch 在 try 外初始化）。
+        # 必须独立于 error 文案统计——msg 取的是**最后一个**节点的错误，
+        # 若过期节点排在前面（如「节点1 vidlink 403 过期 → 节点2 502」），
+        # 按文案判断就永远看不到那条 marker，该直链在剩余所有轮次里都是废的。
         for idx, node in enumerate(urls, start=1):
             is_last_node = idx == len(urls)
             try:
@@ -2695,6 +2862,17 @@ def process_one_entry(entry, processed_ids):
                         flush=True,
                     )
                 conversion_job = _attempt_download(node, is_last_node)
+                # 🔑 provider 归因：在**唯一**知道"是哪个节点成的"的地方贴标签。
+                # 两个 _attempt_download 分支（mp4/m3u8）各自构造 conversion_job，
+                # 但都拿不到 idx，故统一在此补写，避免两处重复且漏改一处。
+                # 没有这两个字段，多节点 fallback 的全部价值都无法量化——
+                # 成品里看不出哪家救回来的，也就无从判断某个源该留该撤。
+                conversion_job["provider"] = node["provider"]
+                conversion_job["node_type"] = node["type"]
+                # 第几个节点成功（1-based）。>1 说明 fallback 真的救回了这一集，
+                # 是"多源到底有没有用"最直接的证据。
+                conversion_job["node_index"] = idx
+                conversion_job["node_total"] = len(urls)
                 break
             except Exception as exc:
                 last_exc = exc
@@ -2702,6 +2880,8 @@ def process_one_entry(entry, processed_ids):
                 # 避免末节点恰为确定性失败时“连坐”误伤前面本可恢复的瞬时节点。
                 if _classify_failure(str(exc)):
                     any_retriable = True
+                if needs_refetch(str(exc)):
+                    any_needs_refetch = True
                 # 本节点失败：清掉本轮残留的 ts，避免污染下一个节点。
                 remove_file(final_ts)
                 if idx < len(urls):
@@ -2717,7 +2897,17 @@ def process_one_entry(entry, processed_ids):
         # 整集可否重试：全节点失败时以“任一节点可重试”为准（乐观，首要目标是下全）；
         # 其它异常路径（单次抛出）回退到按该异常本身分类。
         retriable = any_retriable or _classify_failure(msg)
-        return label, False, {"error": msg, "retriable": retriable}
+        # 过期节点排在非末位时，msg 里读不到过期 marker。补挂上去，让落盘的
+        # failed.jsonl 也能看出"这集有节点需要重新取流"——否则只有进程内的
+        # 标志知道，人工排查与事后统计都看不见。
+        if any_needs_refetch and _NEEDS_REFETCH_MARKER not in msg:
+            msg = f"{msg}（另有节点{_NEEDS_REFETCH_MARKER}）"
+        return label, False, {
+            "error": msg,
+            "retriable": retriable,
+            # 与 error 文案解耦的显式结论，供 plan_retry_buckets 使用。
+            "needs_refetch": any_needs_refetch,
+        }
     finally:
         # 下载成功后临时文件和 ID 锁交给转封装阶段管理。
         if not handed_off_to_conversion:
@@ -2760,6 +2950,13 @@ def finalize_one_entry(conversion_job, processed_ids):
             "title": conversion_job["title"],
             "year": year,
             "url": conversion_job["url"],
+            # 取流来源归因：这一集最终是哪家 provider、第几个节点下成的。
+            # 用 .get 而非下标：reupload 补传等路径会重建 conversion_job，
+            # 缺这几个键也不能让整集在收尾阶段崩掉。
+            "provider": conversion_job.get("provider"),
+            "node_type": conversion_job.get("node_type"),
+            "node_index": conversion_job.get("node_index"),
+            "node_total": conversion_job.get("node_total"),
             "final_path": final_path,
             "bitrate_kbps": conversion_job["bitrate_kbps"],
             "resolution": conversion_job["resolution"],
@@ -2847,6 +3044,7 @@ def upload_one_entry(success_info):
             "episode": episode,
             "title": success_info.get("title", ""),
             "year": success_info.get("year"),
+            **_attribution_of(success_info),
             "local_path": local_path,
             "s3_key": s3_key,
             "fail_reason": reason,
@@ -2865,6 +3063,7 @@ def upload_one_entry(success_info):
                 "episode": episode,
                 "title": success_info.get("title", ""),
                 "year": success_info.get("year"),
+                **_attribution_of(success_info),
                 "local_path": local_path,
                 "s3_key": success_info.get("s3_key", ""),
                 "fail_reason": reason,
@@ -2881,6 +3080,241 @@ def upload_one_entry(success_info):
 
 
 
+
+
+def is_stale_entry(entry, now=None):
+    """该集的直链是否已躺过 STALE_LINK_SECONDS。
+
+    ⚠️ **没有 fetched_at 的条目一律判为不陈旧**。旧版 results.jsonl 与手工
+    构造的输入都没有这个字段，把它们当成"无限旧"会让整批集在启动时全部去
+    重取流——取流配额与耗时双重浪费，且多半是徒劳（那些链接可能好好的）。
+    宁可漏判，不可误判。
+    """
+    if STALE_LINK_SECONDS <= 0:
+        return False
+    fetched_at = parse_int(entry.get("fetched_at"))
+    if fetched_at is None or fetched_at <= 0:
+        return False
+    return (now or time.time()) - fetched_at > STALE_LINK_SECONDS
+
+
+def refetch_entries(entries, refetch_counts):
+    """就地重新取流：调用取流侧的 provider 拿新 url，返回可重投的 entry 列表。
+
+    与人工重跑 `tv_ids_to_links.py` 不同——取流侧的 load_processed 会把
+    results.jsonl 里已成功的集算作"已处理"直接跳过，**根本不会给它们换链接**。
+    这里绕开那层跳过，按 (剧, 季, 集) 直接调 process_episode。
+
+    - 新结果会**追加写入 INPUT_JSONL**：与取流侧落盘行为一致，这样即使本次
+      运行中途被中断，下次启动也能按 fetched_at 择新直接用上，重取不白做。
+    - refetch_counts 按**集级 key** 记数，达 AUTO_REFETCH_MAX_PER_EPISODE 即
+      不再重取（新链接同样可能在排队期间再过期，但必须有上限防空转）。
+    - 取流侧任何异常都不得逃逸：重取是"锦上添花"的捞回，失败了退回原状即可，
+      绝不能让它崩掉整条下载流水线。
+    """
+    # 延迟导入：取流侧模块 import 时会读 config、要求 TMDB key 与代理凭证并建
+    # Session，放在模块级会让"只想跑下载"的场景平白多出这些依赖与副作用。
+    #
+    # ⚠️ 必须连 SystemExit 一起捕获：tv_ids_to_links 在**模块级**用
+    # `raise SystemExit` 做配置校验（缺 TMDB_API_KEY、缺 PROXY_USER/PASSWORD、
+    # providers 非法等）。SystemExit 继承 BaseException，`except Exception`
+    # 拦不住它。只配了 R2 凭证、没配代理凭证的机器（只跑下载，完全合理）
+    # 一旦走到这里，整条流水线会被这个 SystemExit 直接杀掉。
+    # 但**不能笼统捕获 BaseException** —— KeyboardInterrupt 必须原样逃逸。
+    try:
+        import tv_ids_to_links as fetcher
+    except (Exception, SystemExit) as exc:
+        print(f"⚠️ 无法加载取流模块，跳过重新取流: {exc}", flush=True)
+        return []
+
+    pending = []
+    for entry in entries:
+        key = record_episode_key(entry)
+        if not key:
+            # 缺 tmdbId/season/episode：定位不到具体一集，无从重取。
+            continue
+        if refetch_counts.get(key, 0) >= AUTO_REFETCH_MAX_PER_EPISODE:
+            continue
+        pending.append((key, entry))
+
+    if not pending:
+        return []
+
+    print(
+        f"\n[自动重取流] {len(pending)} 集就地重新取流"
+        f"（并发 {AUTO_REFETCH_WORKERS}）...",
+        flush=True,
+    )
+
+    revived = []
+    executor = ThreadPoolExecutor(max_workers=AUTO_REFETCH_WORKERS)
+    try:
+        future_to_item = {}
+        for key, entry in pending:
+            future = executor.submit(
+                fetcher.process_episode,
+                entry["tmdbId"], entry["season"], entry["episode"],
+            )
+            future_to_item[future] = (key, entry)
+        # 带总超时地收集结果：as_completed 的 timeout 是**整体**预算，超时会抛
+        # TimeoutError 中断迭代。此时已完成的部分照常收下，仍在跑的直接放弃。
+        try:
+            for future in as_completed(
+                future_to_item, timeout=AUTO_REFETCH_TIMEOUT
+            ):
+                key, entry = future_to_item[future]
+                refetch_counts[key] = refetch_counts.get(key, 0) + 1
+                try:
+                    status, result = future.result()
+                except (Exception, SystemExit) as exc:
+                    # 同 import 处：process_episode 内部也可能触发模块级的
+                    # SystemExit 式校验。单集重取失败绝不能带塌整批。
+                    print(f"  [重取失败] {key}: {exc}", flush=True)
+                    continue
+                if status != "ok" or not result or not result.get("urls"):
+                    # dead（源站确认无此集）与 retry（瞬时错误耗尽）都不重投：
+                    # 前者救不回来，后者留给下次运行——此刻已无新链接可用。
+                    print(f"  [重取无果] {key}: {status}", flush=True)
+                    continue
+                # 落盘新结果，与取流侧行为一致（追加写，下游按 fetched_at 择新）。
+                write_log(INPUT_JSONL, result)
+                # 用新 urls 覆盖 entry 的取流字段，其余元数据（title/year/
+                # runtime_minutes 等）保留：entry 可能带有 result 没有的历史
+                # 字段，故逐键覆盖而非整体替换。
+                new_entry = dict(entry)
+                new_entry["urls"] = result["urls"]
+                new_entry["fetched_at"] = result.get("fetched_at")
+                revived.append(new_entry)
+                print(
+                    f"  [重取成功] {key}: {len(result['urls'])} 个新节点",
+                    flush=True,
+                )
+        except TimeoutError:
+            # 超时只是"本次不再等"，不是"作废"：仍在跑的 future 已经把请求发
+            # 出去了，跑完若成功也不会落盘（我们不再收结果）——但那批集本来
+            # 就会沿用旧链接照常下载，不构成损失。
+            done = len(revived)
+            print(
+                f"⚠️ 重取超过 {AUTO_REFETCH_TIMEOUT}s，已收下 {done} 集，"
+                f"其余放弃等待（沿用原直链，不影响本次下载）。",
+                flush=True,
+            )
+    finally:
+        # 不等仍在跑的 future：它们最多再跑一个取流超时就自行结束，
+        # 而主流程不该为此干等。cancel_futures 砍掉尚未开跑的。
+        executor.shutdown(wait=False, cancel_futures=True)
+    return revived
+
+
+def merge_next_batch(round_failed_retriable, revived):
+    """合并两条重投路径，按**集级 key** 去重，重取后的新 entry 优先。
+
+    两个桶可能含同一集（既 retriable 又有过期直链，多源下是常态）：
+      - 用旧 entry 会让那个 mp4 节点在整轮里继续是废的；
+      - 投两份会让同一集被并发下载两次，第二份在 process_one_entry 的
+        processing_ids 检查里被判"重复条目"直接丢弃，白占一个下载槽位。
+    revived 排在后面，dict 的值取最新者胜出，正好覆盖成新 urls 的版本。
+
+    ⚠️ 去重必须按 (剧, 季, 集) 而非 tmdbId：同一部剧的几十集共用一个 tmdbId，
+    按剧去重会让一部剧每轮只剩一集能重投。
+    """
+    merged = {}
+    for entry in list(round_failed_retriable) + list(revived):
+        key = record_episode_key(entry)
+        if not key:
+            continue
+        merged[key] = entry
+    return list(merged.values())
+
+
+def refresh_stale_entries(entries, refetch_counts):
+    """启动时把陈旧条目换成新直链，返回替换后的完整列表（顺序不变）。
+
+    🔑 **重取无果的条目原样保留**，绝不丢弃。三条理由：
+      1. STALE_LINK_SECONDS 只是经验阈值，旧链接未必真失效，试一次不损失什么；
+      2. 只配了 R2 凭证、没配代理凭证的机器根本取不了流（refetch_entries 会
+         整体返回空），丢弃等于这批集全军覆没；
+      3. 真过期的话下载侧会挂 _NEEDS_REFETCH_MARKER 判为确定性失败，
+         下次运行的本预检还会再救它一次 —— 退路本来就有。
+    所以本函数**只可能让结果变好**，不会比不做更差。
+    """
+    if not entries or STALE_LINK_SECONDS <= 0 or not AUTO_REFETCH_ENABLED:
+        return entries
+
+    now = time.time()
+    stale = [entry for entry in entries if is_stale_entry(entry, now)]
+    if not stale:
+        return entries
+
+    # ① 跳过"上次因画质不达标判死"的集：重取回来还是同样不达标，白烧配额。
+    #    TV 侧有源率个位数，这类集在失败总量里占比很高（电影侧为此专门建了
+    #    download_dead.jsonl 账本，这里用 failed.jsonl 做等效的轻量实现）。
+    quality_dead = load_quality_dead_keys()
+    if quality_dead:
+        before = len(stale)
+        stale = [
+            entry for entry in stale
+            if (record_episode_key(entry) or "") not in quality_dead
+        ]
+        skipped = before - len(stale)
+        if skipped:
+            print(
+                f"[启动预检] 跳过 {skipped} 集上次因画质不达标判死的"
+                f"（重取回来仍不达标，省下取流配额）",
+                flush=True,
+            )
+        if not stale:
+            return entries
+
+    # ② 限额 + 最旧优先。TV 全量下 stale 可达几万到十几万集，一次性全投会让
+    #    绝大多数集排队到总超时被丢弃（且它们的 refetch_counts 不会 +1，
+    #    下次运行又从头再来，队尾永远轮不到）。按 fetched_at 升序截断：
+    #    最旧的直链最可能已经过期，优先换它们。
+    deferred = 0
+    if AUTO_REFETCH_MAX_PER_RUN and len(stale) > AUTO_REFETCH_MAX_PER_RUN:
+        # 无 fetched_at 的不会出现在这里（is_stale_entry 已把它们判为不陈旧）。
+        stale.sort(key=lambda e: parse_int(e.get("fetched_at")) or 0)
+        deferred = len(stale) - AUTO_REFETCH_MAX_PER_RUN
+        stale = stale[:AUTO_REFETCH_MAX_PER_RUN]
+
+    hours = STALE_LINK_SECONDS / 3600
+    print(
+        f"\n[启动预检] {len(stale)}/{len(entries)} 集的直链已超过 "
+        f"{hours:.0f} 小时，先换新链接再下载"
+        f"（省掉'下完才发现过期'的一整轮无效下载）...",
+        flush=True,
+    )
+    if deferred:
+        print(
+            f"[启动预检] 另有 {deferred} 集也已陈旧，本次不处理"
+            f"（单次上限 {AUTO_REFETCH_MAX_PER_RUN} 集，按最旧优先）；"
+            f"它们照常用原直链下载，下次运行会优先轮到。",
+            flush=True,
+        )
+    revived = refetch_entries(stale, refetch_counts)
+    by_key = {}
+    for entry in revived:
+        key = record_episode_key(entry)
+        if key:
+            by_key[key] = entry
+    if not by_key:
+        print(
+            "[启动预检] 一集都没换到新链接，全部沿用原直链继续下载"
+            "（它们未必真失效；真过期会在下载失败后记为确定性失败，"
+            "下次运行的预检会再试一次）。",
+            flush=True,
+        )
+        return entries
+
+    refreshed = [
+        by_key.get(record_episode_key(entry) or "", entry) for entry in entries
+    ]
+    print(
+        f"[启动预检] {len(by_key)}/{len(stale)} 集换到新链接，"
+        f"其余 {len(stale) - len(by_key)} 集沿用原直链照常下载。",
+        flush=True,
+    )
+    return refreshed
 
 
 class ListEntrySource:
@@ -3202,11 +3636,15 @@ def _run_pipeline():
     reject_permanent = {}
     reject_retriable = {}
 
-    def handle_done_future(future, round_failed_retriable):
+    def handle_done_future(future, round_failed_retriable,
+                           round_failed_expired=None):
         """处理一个已完成的 future，按其阶段推进流水线。
 
         round_failed_retriable 为本轮“可重试下载失败”的收集器（list）；
-        末轮排空阶段传 None（此时 pending 里只会剩转封装/上传，不会命中下载分支）。
+        round_failed_expired 为本轮“有节点直链过期、需重新取流”的收集器。
+        两个桶**不互斥**：同一集可能既值得重投、又需要换新直链（见
+        plan_retry_buckets）。末轮排空阶段两者都传 None（此时 pending 里只会
+        剩转封装/上传，不会命中下载分支）。
         """
         stage = stage_of.pop(future, None)
 
@@ -3222,9 +3660,15 @@ def _run_pipeline():
 
             if download_success:
                 # 下载成功：写独立的下载态状态文件（只记下载，不含转封装/上传）。
+                # 带上 provider 归因：这是**下载这一级**唯一的落盘点，
+                # pipeline_report 靠它算各源的"给出的节点 → 真下成"转化率。
+                # info 此刻就是 conversion_job（process_one_entry 的返回值）。
                 write_log(DOWNLOAD_OK_LOG, {
                     **ident,
                     "year": entry.get("year"),
+                    "provider": info.get("provider"),
+                    "node_type": info.get("node_type"),
+                    "node_index": info.get("node_index"),
                 })
                 # submit 若抛异常（如线程池已 shutdown），finalize 永不执行 →
                 # processing_ids 锁与临时文件会永久泄漏。故兜底：失败即释放 ID 锁、
@@ -3268,6 +3712,12 @@ def _run_pipeline():
                 "urls": entry.get("urls", []),
                 "error": error_msg,
                 "stage": "download",
+                # 跨运行可见的失败性质。DOWNLOAD_FAIL_LOG 虽也记 retriable，
+                # 但它每轮开头清空、只反映本轮，跨运行读不到。
+                # 启动预检靠这个字段跳过"画质判死"的集（见 load_quality_dead_keys）：
+                # 没有它就无法区分"这条流画质不达标"与"今天源站挂了"，
+                # 而后者重取完全可能换到好流，绝不能一并跳过。
+                "retriable": retriable,
             })
             # 下载态状态文件：本轮下载失败逐条记录（含可否重试）。
             write_log(DOWNLOAD_FAIL_LOG, {
@@ -3279,9 +3729,20 @@ def _run_pipeline():
                 f"下载失败: {label}: {error_msg}"
                 f"（{'可重试' if retriable else '确定性失败,不重试'}）"
             )
+            # 两条重投路径**不互斥**，判定集中在 plan_retry_buckets（见其文档）。
+            # needs_refetch 优先取 info 里的显式标志（节点循环逐节点记录，不受
+            # "error 只留末节点文案"的影响）；缺失时回退按文案判断，兼容
+            # process_one_entry 之外的异常路径。
+            should_retry, should_refetch = plan_retry_buckets(
+                retriable, error_msg, info.get("needs_refetch")
+            )
             # 仅“可重试”的失败进入下一轮；确定性失败绝不重下。
-            if retriable and round_failed_retriable is not None:
+            if should_retry and round_failed_retriable is not None:
                 round_failed_retriable.append(entry)
+            # 有节点的签名直链已过期：重投拿到的还是同一条、必然再挂，
+            # 必须换新 url 才有意义。攒到轮末统一重取。
+            if should_refetch and round_failed_expired is not None:
+                round_failed_expired.append(entry)
 
         elif stage == "conversion":
             entry = conversion_future_to_entry.pop(future)
@@ -3331,6 +3792,7 @@ def _run_pipeline():
                             "episode": info.get("episode"),
                             "title": info.get("title", ""),
                             "year": info.get("year"),
+                            **_attribution_of(info),
                             "local_path": info.get("final_path"),
                             "s3_key": "",
                             "fail_reason": degrade_reason,
@@ -3408,6 +3870,21 @@ def _run_pipeline():
             ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as upload_executor:
 
         current_batch = entries
+        # 每集被就地重取过几次（集级 key → 次数），跨预检与后续轮次共用同一本账，
+        # 防"取流-过期-重取"反复空转。
+        refetch_counts = {}
+        # 陈旧直链启动预检：只对**非流式**（单独跑 download_tv.py）生效。
+        #
+        # ⚠️ pipeline 模式刻意不做：它的整个前提是"主循环一步都不阻塞"，而
+        # refetch_entries 是同步的，最长能堵住 AUTO_REFETCH_TIMEOUT。此时取流
+        # 线程已经在灌队列，堵住主循环反而会让队列里的新鲜直链继续变旧——与本
+        # 预检的目的正相反。
+        # 而且 pipeline 模式下这个缺口本就小得多：取流与下载只隔几分钟，
+        # 真正会陈旧的只有 backlog（断点续跑存量）那一部分。
+        # 电影侧为此专门建了 AsyncRefetcher 走非阻塞投递，TV 侧待 §0.0 ③
+        # 全量重跑拿到数据后再评估是否需要，现在不预先设计。
+        if ListEntrySource is _ListEntrySource:
+            current_batch = refresh_stale_entries(current_batch, refetch_counts)
         round_no = 1
         while True:
             # 每轮开头清空 download_fail 状态文件，只记录本轮下载失败。
@@ -3473,6 +3950,8 @@ def _run_pipeline():
                 return True
 
             round_failed_retriable = []
+            # 本轮"有节点直链过期"的集。与上面的桶不互斥（见 plan_retry_buckets）。
+            round_failed_expired = []
             submit_downloads()
 
             # 关键：只等“本轮下载 future”全部离开 download 阶段即算本轮下载完成，
@@ -3521,36 +4000,58 @@ def _run_pipeline():
                     # 信号量与 processing_ids 锁无从释放（铁律：宁可单片失败，
                     # 绝不崩主流程）。
                     try:
-                        handle_done_future(future, round_failed_retriable)
+                        handle_done_future(future, round_failed_retriable,
+                                           round_failed_expired)
                     except Exception as exc:
                         print(f"⚠️ future 处理异常，已跳过该条: {exc}", flush=True)
                 # 腾出槽位后立即补投，保持下载池始终满载。
                 submit_downloads()
 
             # 本轮下载全部有结论，决定是否再来一轮。
-            if not round_failed_retriable:
+            # 先处理"直链过期"桶：这批集重投同一条 url 必然再挂，必须换新 url。
+            # 放在 break 判断**之前**：即使本轮没有可重试失败（round_failed_retriable
+            # 为空）、按旧逻辑就要收尾了，只要有过期直链就仍值得重取一轮 ——
+            # 否则这些集要等下次运行的启动预检才轮得到，白白慢一整轮。
+            revived = []
+            has_more_rounds = round_no < MAX_ROUNDS
+            if AUTO_REFETCH_ENABLED and round_failed_expired and has_more_rounds:
+                revived = refetch_entries(round_failed_expired, refetch_counts)
+            elif round_failed_expired and not has_more_rounds:
+                # 末轮不重取：拿到新链接也没有轮次去消费，白耗取流配额。
+                # 它们已落 failed.jsonl，下次运行的启动预检会接手。
+                print(
+                    f"\n本轮有 {len(round_failed_expired)} 集的直链已过期，"
+                    f"但已是末轮、不再重取（下次运行的启动预检会换新链接）。",
+                    flush=True,
+                )
+
+            next_batch = merge_next_batch(round_failed_retriable, revived)
+            if not next_batch:
                 if MULTI_ROUND_ENABLED and MAX_ROUNDS > 1:
                     print("\n本轮无可重试的下载失败，多轮下载提前结束。", flush=True)
                 break
             if round_no >= MAX_ROUNDS:
                 print(
                     f"\n已达最大轮次 {MAX_ROUNDS}，仍有 "
-                    f"{len(round_failed_retriable)} 集下载失败未成功，停止重试。",
+                    f"{len(next_batch)} 集下载失败未成功，停止重试。",
                     flush=True,
                 )
                 break
 
+            revived_note = (
+                f"（其中 {len(revived)} 集已换到新直链）" if revived else ""
+            )
             print(
-                f"\n本轮有 {len(round_failed_retriable)} 集可重试下载失败，"
+                f"\n本轮有 {len(next_batch)} 集待重投{revived_note}，"
                 f"冷却 {ROUND_COOLDOWN_SECONDS}s 后进入第 {round_no + 1} 轮...",
                 flush=True,
             )
             if ROUND_COOLDOWN_SECONDS > 0:
-                # 可打断的冷却：默认 300s，Ctrl+C 后干等这么久会让收尾看起来像卡死。
+                # 可打断的冷却：Ctrl+C 后干等这么久会让收尾看起来像卡死。
                 if interrupted.wait(ROUND_COOLDOWN_SECONDS):
                     print("\n收到中断信号，不再进入下一轮。", flush=True)
                     break
-            current_batch = round_failed_retriable
+            current_batch = next_batch
             round_no += 1
 
         # 多轮下载结束，但 pending 里可能还有末轮的转封装/上传在途 -> 显式排空，
@@ -3688,6 +4189,11 @@ def reupload_pending():
                 "episode": parse_int(record.get("episode")),
                 "title": record.get("title", ""),
                 "year": record.get("year"),
+                # ⚠️ update_success_log 是**整条覆盖**写。provider 归因必须
+                # 从 pending 记录里原样带回来，否则补传一次就把"这集是哪家
+                # 下成的"抹掉了——而降级留本地的集恰恰是上传侧出故障时的一
+                # 大批，抹掉会让各源转化率统计系统性偏低。
+                **_attribution_of(record),
                 "final_path": local_path,
                 "s3_key": s3_key,
                 "asset_keys": asset_keys,

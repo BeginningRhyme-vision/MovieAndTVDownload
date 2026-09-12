@@ -189,6 +189,51 @@ def _print_counter(title, counter, total):
         print(f"    {reason}: {count} 次（{_pct(count, total)}）")
 
 
+def _print_provider_funnel(offered_by, won_by, fallback_wins,
+                           attributed, downloaded_total):
+    """各取流源的「提供 → 下成」转化率，外加独占贡献与 fallback 救回数。
+
+    这是判断「某个源该不该留」的唯一依据：一个源如果命中的集别家也都命中，
+    它就是冗余的——只有**独占**（只有它提供了节点的集）和**靠 fallback 才
+    下成的集**才是接入它的理由。光看"给出多少条 url"会严重高估同后端换皮的源。
+
+    ⚠️ 分母是「该源为多少集提供过节点」而非「多少集下成了」：同一集往往有
+    多家提供节点，各家分母会重叠，所以各行的百分比**不该相加**。
+    """
+    if not offered_by:
+        return
+
+    missing = downloaded_total - attributed
+    print("\n  各源转化率（集级；分母=该源为多少集提供过节点，各行分母有重叠）：")
+    for name in sorted(offered_by, key=lambda n: -len(offered_by[n])):
+        offered = offered_by[name]
+        # 独占 = 只有这一家给这集提供了节点，别家一条都没有。
+        others = set()
+        for other_name, keys in offered_by.items():
+            if other_name != name:
+                others |= keys
+        exclusive = offered - others
+        won = won_by.get(name, 0)
+        saved = fallback_wins.get(name, 0)
+        extra = []
+        if exclusive:
+            extra.append(f"独占 {len(exclusive)} 集")
+        if saved:
+            extra.append(f"其中 {saved} 集靠 fallback 救回")
+        suffix = f"；{'、'.join(extra)}" if extra else ""
+        print(
+            f"    {name}: 提供 {len(offered)} 集 → 下成 {won} 集"
+            f"（{_pct(won, len(offered))}）{suffix}"
+        )
+
+    if missing > 0:
+        print(
+            f"    ⚠️ {missing} 集下载成功但无 provider 归因"
+            f"（{_pct(missing, downloaded_total)}）——"
+            "这些是加归因字段之前跑出来的旧记录，不计入上表"
+        )
+
+
 def main():
     cfg = _cfg()
     links_cfg = cfg.get("tv_ids_to_links", {}) or {}
@@ -219,6 +264,10 @@ def main():
 
     # 取流侧：results.jsonl 按集去重（同集多行只算一集）
     fetched, providers, types = set(), Counter(), Counter()
+    # provider 归因用的集级视图（上面的 providers 是"url 条数"，粒度不同）：
+    #   offered_by[家] = 该家为哪些集提供过节点
+    # 这是算转化率的分母，也是判断某家该不该留的基础。
+    offered_by = {}
     result_rows = 0
     fetch_times = []
     for record in _iter_jsonl(results_file):
@@ -232,15 +281,37 @@ def main():
             fetch_times.append(ts)
         for node in record.get("urls") or []:
             if isinstance(node, dict):
-                providers[node.get("provider") or "unknown"] += 1
+                name = node.get("provider") or "unknown"
+                providers[name] += 1
                 types[node.get("type") or "m3u8"] += 1
             else:
+                # 旧格式裸字符串：按当初的唯一来源 vidup 计。
+                name = "vidup"
                 providers["vidup"] += 1
                 types["m3u8"] += 1
+            offered_by.setdefault(name, set()).add(key)
     if not fetched:
         _missing(results_file, "results.jsonl")
 
-    downloaded = {k for k in (_ep_key(r) for r in _iter_jsonl(ok_log)) if k}
+    # 下载侧：带 provider 归因（新格式）。旧行没有这些字段，计入 unknown，
+    # 这样"统计不出来"是显式可见的，而不是悄悄少算某一家。
+    downloaded = set()
+    won_by = Counter()
+    fallback_wins = Counter()
+    attributed = 0
+    for record in _iter_jsonl(ok_log):
+        key = _ep_key(record)
+        if not key:
+            continue
+        downloaded.add(key)
+        name = record.get("provider")
+        if name:
+            attributed += 1
+            won_by[name] += 1
+            # node_index > 1 = 前面的节点都挂了、靠 fallback 才救回来。
+            # 这是"多源到底有没有用"最直接的证据。
+            if isinstance(record.get("node_index"), int) and record["node_index"] > 1:
+                fallback_wins[name] += 1
 
     # success.jsonl 每集一条，uploaded 标记是否已进 R2
     finalized, uploaded = set(), set()
@@ -311,6 +382,8 @@ def main():
         print("  节点类型分布：")
         for name, count in types.most_common():
             print(f"    {name}: {count} 条")
+        _print_provider_funnel(offered_by, won_by, fallback_wins,
+                               attributed, len(downloaded))
 
     base = len(fetched)
     print(f"\n【2·下载】成功 {len(downloaded)} 集（占取流成功 {_pct(len(downloaded), base)}）")
