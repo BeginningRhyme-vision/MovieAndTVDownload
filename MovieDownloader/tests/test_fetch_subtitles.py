@@ -1052,6 +1052,21 @@ def test_parse_keys_preserves_order():
     assert f._parse_keys("z,a,m") == ["z", "a", "m"]
 
 
+def test_plural_and_singular_env_vars_are_merged(monkeypatch):
+    """🔑 复数与单数都配时要**合并**，不是二选一。
+
+    早先写的是 `复数 or 单数`，用户加了 SUBDL_API_KEYS 却忘了删旧的
+    SUBDL_API_KEY，那个账号一整天的额度就白扔了 —— 额度是这里最稀缺的资源。
+    复用 _parse_keys 的去重，两处填了同一个 key 也不会占两个位置。
+    """
+    merged = f._parse_keys(" ".join(filter(None, ["k1,k2", "k3", ""])))
+    assert merged == ["k1", "k2", "k3"]
+
+    # 单数与复数重复填同一个 key：只算一个
+    deduped = f._parse_keys(" ".join(filter(None, ["k1,k2", "k1", ""])))
+    assert deduped == ["k1", "k2"]
+
+
 def test_pool_hands_out_keys_in_order():
     pool = f.KeyPool(["k1", "k2"])
     assert pool.current() == "k1"

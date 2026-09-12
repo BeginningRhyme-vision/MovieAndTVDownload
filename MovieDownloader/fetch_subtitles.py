@@ -104,7 +104,8 @@ def _config_api_key():
 # 2026-09-12 实测确认额度按**账号**计而非按 IP 计（同一台机器、同一条 url：
 # 旧 key 429、新 key 200、旧 key 复核仍 429），故多 key 轮换确实能叠加额度。
 #   .env 里写：SUBDL_API_KEYS=key1,key2,key3
-# 单数形式 SUBDL_API_KEY 继续有效（向后兼容），两者都配时合并去重。
+# 单数形式 SUBDL_API_KEY 继续有效（向后兼容）：两者都配时**合并去重**，
+# 复数在前。不合并的话，用户加了复数却忘了删单数，那个 key 的额度就白扔了。
 def _parse_keys(raw):
     """把逗号/空白/换行分隔的多个 key 解析成有序去重列表。
 
@@ -123,9 +124,11 @@ def _parse_keys(raw):
 
 
 SUBDL_API_KEYS = _parse_keys(
-    os.environ.get("SUBDL_API_KEYS", "")
-) or _parse_keys(
-    os.environ.get("SUBDL_API_KEY", "") or _config_api_key()
+    " ".join(filter(None, [
+        os.environ.get("SUBDL_API_KEYS", ""),
+        os.environ.get("SUBDL_API_KEY", ""),
+        _config_api_key(),
+    ]))
 )
 
 SUCCESS_LOG = dm.SUCCESS_LOG
