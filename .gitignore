@@ -35,6 +35,8 @@ MovieDownloader/ids.txt
 MovieDownloader/unresolved.txt
 MovieDownloader/downloads/
 MovieDownloader/temp/
+# failed.jsonl 轮转产生的归档。上面的 *.jsonl 只匹配顶层，挡不住子目录里的。
+MovieDownloader/archive/
 TVDownloader/imdb_data/
 TVDownloader/*.log
 TVDownloader/*.jsonl

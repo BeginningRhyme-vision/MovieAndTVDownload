@@ -6,6 +6,7 @@ mp4 直链请求头、失败分类与被拒原因归类。全部为纯函数级�
 
 import json
 import os
+import pathlib
 import threading
 import time
 
@@ -612,6 +613,131 @@ def test_refetch_returns_empty_when_fetcher_unavailable(sandbox, monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", blocked)
     assert d.refetch_entries([{"tmdbId": "55", "urls": []}], {}) == []
+
+
+# ---------------------------------------------------------------------------
+# 直链绝对过期判定（fetched_at 超 24h → 启动时先换新链接）
+# ---------------------------------------------------------------------------
+# 此前 fetched_at 只做同 ID 多行之间的相对择新，从不与当前时间比较。跨运行
+# 间隔几天时，每部片都要先完整地下载失败一次才触发重取，白烧时间和带宽。
+
+def test_entry_is_stale_only_after_the_threshold(monkeypatch):
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    now = 1_000_000
+    assert d.is_stale_entry({"fetched_at": now - 86401}, now) is True
+    assert d.is_stale_entry({"fetched_at": now - 86399}, now) is False
+
+
+def test_entry_without_timestamp_is_never_stale(monkeypatch):
+    """🔑 缺 fetched_at 一律判为不陈旧 —— 宁可漏判，不可误判。
+
+    老版本 results.jsonl 与手工构造的输入都没有这个字段。把它们当成"无限旧"
+    会让整批片在启动时全去重取流：配额与耗时双重浪费，且多半徒劳。
+    """
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    now = 1_000_000
+    assert d.is_stale_entry({}, now) is False
+    assert d.is_stale_entry({"fetched_at": None}, now) is False
+    assert d.is_stale_entry({"fetched_at": "坏数据"}, now) is False
+    assert d.is_stale_entry({"fetched_at": 0}, now) is False
+
+
+def test_stale_check_can_be_disabled(monkeypatch):
+    """设 0 = 关闭判定，退回"只在下载失败后才重取"的旧行为。"""
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 0)
+    assert d.is_stale_entry({"fetched_at": 1}, 1_000_000) is False
+
+
+def test_stale_entries_get_fresh_links_before_downloading(sandbox, monkeypatch):
+    """陈旧条目在启动时就换成新链接，新鲜的原样不动、也不去取流。"""
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    fetcher = _FakeFetcher({
+        "old": ("ok", {"tmdbId": "old", "urls": [{"url": "fresh"}],
+                       "fetched_at": 999}),
+    })
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    now = int(time.time())
+    entries = [
+        {"tmdbId": "old", "urls": [{"url": "stale"}], "fetched_at": now - 90000},
+        {"tmdbId": "new", "urls": [{"url": "keep"}], "fetched_at": now - 100},
+    ]
+    result = d.refresh_stale_entries(entries, {})
+
+    assert fetcher.seen == ["old"], "新鲜的片不该去取流"
+    assert result[0]["urls"] == [{"url": "fresh"}]
+    assert result[1]["urls"] == [{"url": "keep"}]
+    assert [e["tmdbId"] for e in result] == ["old", "new"], "顺序必须保持"
+
+
+def test_stale_entry_keeps_old_link_when_refetch_fails(sandbox, monkeypatch):
+    """🔴 本组最关键：重取无果时必须**沿用旧链接**，绝不能丢弃该片。
+
+    24 小时只是经验阈值，旧链接未必真失效。而没配代理凭证的机器压根取不了流
+    （refetch_entries 整体返回空），丢弃等于这批片全军覆没 —— 那就成了
+    "为优化而降低成功率"，与本功能的初衷正相反。
+    """
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "refetch_entries", lambda entries, counts: [])
+
+    now = int(time.time())
+    entries = [{"tmdbId": "55", "urls": [{"url": "old"}], "fetched_at": now - 90000}]
+    result = d.refresh_stale_entries(entries, {})
+
+    assert len(result) == 1, "重取失败不等于放弃这部片"
+    assert result[0]["urls"] == [{"url": "old"}], "必须沿用旧链接再试一次"
+
+
+def test_partial_refetch_keeps_the_unrefreshed_ones(sandbox, monkeypatch):
+    """只换到一部分时，没换到的照常用旧链接下载，不做任何丢弃。"""
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(
+        d, "refetch_entries",
+        lambda entries, counts: [{"tmdbId": "1", "urls": [{"url": "fresh"}]}],
+    )
+
+    now = int(time.time())
+    entries = [
+        {"tmdbId": "1", "urls": [{"url": "old1"}], "fetched_at": now - 90000},
+        {"tmdbId": "2", "urls": [{"url": "old2"}], "fetched_at": now - 90000},
+    ]
+    result = d.refresh_stale_entries(entries, {})
+
+    assert result[0]["urls"] == [{"url": "fresh"}]
+    assert result[1]["urls"] == [{"url": "old2"}], "没换到的不能丢"
+
+
+def test_precheck_shares_the_per_movie_refetch_cap(sandbox, monkeypatch):
+    """预检消耗的重取次数要计入每片上限，否则轮次间还能再重取满额。"""
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    fetcher = _FakeFetcher({"55": ("dead", None)})
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    counts = {}
+    now = int(time.time())
+    d.refresh_stale_entries(
+        [{"tmdbId": "55", "urls": [], "fetched_at": now - 90000}], counts,
+    )
+    assert counts == {"55": 1}
+
+
+def test_precheck_is_skipped_when_auto_refetch_is_off(sandbox, monkeypatch):
+    """关掉 auto_refetch 就完全不预检——该开关的语义是"重取全交人工"。"""
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", False)
+    called = []
+    monkeypatch.setattr(
+        d, "refetch_entries", lambda e, c: called.append(1) or [],
+    )
+
+    now = int(time.time())
+    entries = [{"tmdbId": "55", "urls": [{"url": "old"}], "fetched_at": now - 90000}]
+    assert d.refresh_stale_entries(entries, {}) is entries
+    assert called == []
 
 
 def test_mixed_node_failure_is_both_retriable_and_refetchable(sandbox, monkeypatch):
@@ -3902,3 +4028,247 @@ class _FakeSession:
 
 def _status_session(status):
     return _FakeSession(status)
+
+
+# ---------------------------------------------------------------------------
+# failed.jsonl 归档轮转
+# ---------------------------------------------------------------------------
+# 它是纯追加、永不清理的，全量几十万部时 --refetch-failed 每次要全量读一遍。
+# 轮转的最大风险：把待重取的片一起移走，重试链当场断裂、直接掉下载成功率。
+
+def _setup_failed_log(tmp_path, monkeypatch, lines, max_bytes=1):
+    monkeypatch.setattr(d, "FAILED_LOG", str(tmp_path / "failed.jsonl"))
+    monkeypatch.setattr(d, "FAILED_LOG_MAX_BYTES", max_bytes)
+    monkeypatch.setattr(d, "_SCRIPT_DIR", tmp_path)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "load_dead_ids", lambda *a, **kw: set())
+    # 默认"没有别的进程在跑"。跨进程守卫的行为由专门的用例验证。
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    with open(d.FAILED_LOG, "w", encoding="utf-8") as fh:
+        for line in lines:
+            fh.write(json.dumps(line, ensure_ascii=False) + "\n")
+
+
+_REFETCH_ERR = f"直链已失效（HTTP 403），{d._NEEDS_REFETCH_MARKER}: https://x/f.mp4"
+
+
+def test_rotation_keeps_entries_that_still_need_refetching(tmp_path, monkeypatch):
+    """🔴 本组最关键：带『需重新取流』的片必须回填，否则重试链断裂。"""
+    _setup_failed_log(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "error": _REFETCH_ERR, "stage": "download"},
+        {"tmdbId": "2", "error": "分辨率太低", "stage": "download"},
+    ])
+
+    rotated, archive_path, kept = d.compact_failed_log()
+    assert rotated and kept == 1
+
+    with open(d.FAILED_LOG, encoding="utf-8") as fh:
+        remaining = [json.loads(line) for line in fh if line.strip()]
+    assert [r["tmdbId"] for r in remaining] == ["1"]
+    assert remaining[0]["error"] == _REFETCH_ERR, "error 原文必须逐字保留"
+
+
+def test_rotation_archives_every_line_losslessly(tmp_path, monkeypatch):
+    """历史零丢失：原文件整体移进 archive/，不做任何裁剪。"""
+    records = [
+        {"tmdbId": "1", "error": _REFETCH_ERR, "stage": "download"},
+        {"tmdbId": "2", "error": "分辨率太低", "stage": "download"},
+        {"stage": "preflight", "error": "ffmpeg 不在 PATH", "ts": 1},
+    ]
+    _setup_failed_log(tmp_path, monkeypatch, records)
+
+    _, archive_path, _ = d.compact_failed_log()
+    with open(archive_path, encoding="utf-8") as fh:
+        archived = [json.loads(line) for line in fh if line.strip()]
+    assert archived == records, "归档必须是原文件的完整副本"
+
+
+def test_rotation_matches_the_fetchers_selection_exactly(tmp_path, monkeypatch):
+    """🔑 跨文件契约：回填结果必须与取流侧 load_refetch_ids 的口径完全一致。
+
+    两边判据只要有一点分歧，就会出现"轮转后挑不出来"的静默缺口。这里直接
+    拿真正的取流侧函数来比对，而不是复述一遍判据。
+    """
+    import tmdb_ids_to_links as fetcher
+
+    records = [
+        {"tmdbId": "1", "error": _REFETCH_ERR, "stage": "download"},
+        {"tmdbId": "2", "error": "画质不达标", "stage": "download"},
+        {"tmdbId": "3", "error": _REFETCH_ERR, "stage": "download"},
+        {"tmdbId": "3", "error": _REFETCH_ERR, "stage": "download"},  # 重复行
+        {"stage": "preflight", "error": "ffmpeg 缺失", "ts": 1},      # 无 tmdbId
+    ]
+    _setup_failed_log(tmp_path, monkeypatch, records)
+
+    before = fetcher.load_refetch_ids(
+        pathlib.Path(d.FAILED_LOG), tmp_path / "nofail.txt",
+    )
+    d.compact_failed_log()
+    after = fetcher.load_refetch_ids(
+        pathlib.Path(d.FAILED_LOG), tmp_path / "nofail.txt",
+    )
+    assert before == after == ["1", "3"], "轮转前后取流侧挑出的片必须一模一样"
+
+
+def test_rotation_drops_movies_already_downloaded_or_dead(tmp_path, monkeypatch):
+    """已成功/已判死的片不必回填——取流侧本来也会排除它们。"""
+    _setup_failed_log(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "error": _REFETCH_ERR, "stage": "download"},
+        {"tmdbId": "2", "error": _REFETCH_ERR, "stage": "download"},
+        {"tmdbId": "3", "error": _REFETCH_ERR, "stage": "download"},
+    ])
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: {"2"})
+    monkeypatch.setattr(d, "load_dead_ids", lambda *a, **kw: {"3"})
+
+    _, _, kept = d.compact_failed_log()
+    assert kept == 1
+    with open(d.FAILED_LOG, encoding="utf-8") as fh:
+        assert [json.loads(l)["tmdbId"] for l in fh if l.strip()] == ["1"]
+
+
+def test_rotation_leaves_no_file_when_nothing_to_keep(tmp_path, monkeypatch):
+    """没有待重取的片时不留空文件——下游把"不存在"当合法空态。"""
+    _setup_failed_log(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "error": "画质不达标", "stage": "download"},
+    ])
+    rotated, _, kept = d.compact_failed_log()
+    assert rotated and kept == 0
+    assert not os.path.exists(d.FAILED_LOG)
+
+
+def test_rotation_does_nothing_below_the_threshold(tmp_path, monkeypatch):
+    """没超阈值就一个字节都不动，零开销。"""
+    _setup_failed_log(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "error": _REFETCH_ERR},
+    ], max_bytes=10 * 1024 * 1024)
+    before = open(d.FAILED_LOG, encoding="utf-8").read()
+
+    assert d.compact_failed_log() == (False, None, 0)
+    assert open(d.FAILED_LOG, encoding="utf-8").read() == before
+
+
+def test_rotation_can_be_disabled(tmp_path, monkeypatch):
+    """max_bytes: 0 = 关闭轮转。"""
+    _setup_failed_log(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "error": _REFETCH_ERR},
+    ], max_bytes=0)
+    assert d.compact_failed_log() == (False, None, 0)
+    assert os.path.exists(d.FAILED_LOG)
+
+
+def test_rotation_handles_missing_file(tmp_path, monkeypatch):
+    """文件不存在是合法状态（还没跑过），不能抛。"""
+    monkeypatch.setattr(d, "FAILED_LOG", str(tmp_path / "nope.jsonl"))
+    monkeypatch.setattr(d, "FAILED_LOG_MAX_BYTES", 1)
+    assert d.compact_failed_log() == (False, None, 0)
+
+
+def test_rotation_failure_never_breaks_the_run(tmp_path, monkeypatch, capsys):
+    """轮转纯属维护动作，失败只是文件继续变大，绝不能影响业务结论。"""
+    _setup_failed_log(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "error": _REFETCH_ERR},
+    ])
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(d.os, "makedirs", boom)
+    assert d.compact_failed_log() == (False, None, 0)
+    assert "轮转失败" in capsys.readouterr().out
+    assert os.path.exists(d.FAILED_LOG), "失败后原文件必须还在"
+
+
+def test_rotation_stands_down_when_another_process_is_running(
+    tmp_path, monkeypatch,
+):
+    """🔴 跨进程守卫：另一个 downloader 在跑时绝不轮转。
+
+    log_lock 只在进程内有效。轮转发生在 release_main_lock() **之后**，此刻
+    第二个进程已能启动并往 failed.jsonl 追加。它的 fd 指向旧 inode，我们
+    os.replace 之后它写的每一条都只存在于 archive 里，新 failed.jsonl 中没有
+    —— 那批待重取记录就此蒸发，--refetch-failed 再也挑不到。
+    与 reupload_pending 的 is_main_running() 守卫同理。
+    """
+    _setup_failed_log(tmp_path, monkeypatch, [
+        {"tmdbId": "1", "error": _REFETCH_ERR},
+    ])
+    monkeypatch.setattr(d, "is_main_running", lambda: True)
+
+    assert d.compact_failed_log() == (False, None, 0)
+    assert os.path.exists(d.FAILED_LOG), "不该动别人正在写的文件"
+    assert not os.path.exists(tmp_path / "archive"), "不该产生归档"
+
+
+def test_startup_precheck_is_skipped_in_pipeline_mode(tmp_path, monkeypatch):
+    """🔴 pipeline 模式下不得做启动预检。
+
+    ⚠️ 这里必须走真实的 `_run_pipeline`。判据曾被写成
+    `hasattr(current_batch, "poll")` —— 而该处的 current_batch 就是
+    entries（一个 list），list 永远没有 poll，那是恒 False 的死判据，
+    pipeline 模式照样会进来。只测 refresh_stale_entries 本身抓不到这种错。
+
+    pipeline 的前提是主循环一步都不阻塞（为此专门建了 AsyncRefetcher），
+    而预检调用的 refetch_entries 是同步的，最长堵住 AUTO_REFETCH_TIMEOUT。
+    """
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+
+    # 一条陈旧到必然触发预检的记录
+    inp = tmp_path / "in.jsonl"
+    inp.write_text(json.dumps({
+        "tmdbId": "55", "title": "T", "urls": ["u"],
+        "fetched_at": int(time.time()) - 999999,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (entry["tmdbId"], False, {"error": "x"}),
+    )
+
+    called = []
+    monkeypatch.setattr(
+        d, "refresh_stale_entries",
+        lambda entries, counts: called.append(1) or entries,
+    )
+
+    # 装上 pipeline 的钩子（pipeline.py 正是这样替换的）
+    monkeypatch.setattr(d, "ListEntrySource", lambda entries: d._ListEntrySource(entries))
+    d._run_pipeline()
+    assert called == [], "pipeline 模式下不该做同步预检"
+
+
+def test_startup_precheck_runs_in_standalone_mode(tmp_path, monkeypatch):
+    """反过来：单独跑下载时预检必须执行，否则这个功能等于没做。"""
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+
+    inp = tmp_path / "in.jsonl"
+    inp.write_text(json.dumps({
+        "tmdbId": "55", "title": "T", "urls": ["u"],
+        "fetched_at": int(time.time()) - 999999,
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (entry["tmdbId"], False, {"error": "x"}),
+    )
+
+    called = []
+    monkeypatch.setattr(
+        d, "refresh_stale_entries",
+        lambda entries, counts: called.append(1) or entries,
+    )
+    d._run_pipeline()
+    assert called == [1], "单独跑下载时预检必须执行"

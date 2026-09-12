@@ -129,6 +129,19 @@ AUTO_REFETCH_WORKERS = max(1, int(_REFETCH_CFG.get("workers", 8)))
 AUTO_REFETCH_TIMEOUT = max(
     30, int(_REFETCH_CFG.get("round_timeout_seconds", 600))
 )
+# 【直链绝对过期判定】results.jsonl 里的条目躺了超过这么久（秒），启动时就
+# 当成"直链已过期"，先重取流再下载，不等下载失败了才发现。
+#
+# 为什么需要它：此前 fetched_at **只用于同一 ID 多行之间的相对择新**，从不与
+# 当前时间比较。跨运行间隔几天时，整个 results.jsonl 都是陈旧的——每部片都要
+# 先完整地下载失败一次（跑满超时与重试）才触发重取，白烧的是时间和带宽。
+#
+# 24 小时是经验阈值，不是源站的硬性规定。所以**重取无果时仍会拿旧链接试一次**
+# （见 _refresh_stale_entries）：旧链接未必真失效，试一次不损失什么，而直接
+# 放弃则会让"没配代理凭证的机器"整批片全军覆没。这条回退是硬要求 ——
+# 本功能是优化，绝不允许它反过来降低下载成功率。
+# 设为 0 可关闭该判定（退回旧行为：只在下载失败后才重取）。
+STALE_LINK_SECONDS = max(0, int(_REFETCH_CFG.get("stale_after_seconds", 86400)))
 
 # ---- 收尾自动补传 ----
 # 上传槽位等待超时后会降级为"留本地 + 写 upload_pending.jsonl"，这些成品不会被
@@ -136,6 +149,23 @@ AUTO_REFETCH_TIMEOUT = max(
 # 往往已恢复，自动补一次能省掉这次人工介入；手动 reupload 子命令始终保留。
 AUTO_REUPLOAD_ENABLED = bool(
     (_CFG.get("auto_reupload", {}) or {}).get("enabled", True)
+)
+# ---- failed.jsonl 归档轮转 ----
+# failed.jsonl 是纯追加、永不清理的（唯一的删除是 remove_upload_failure_from_log，
+# 且只删 stage=="upload"）。run3 一轮就写了 245KB；全量几十万部时
+# `--refetch-failed` 每次都要把它整个读一遍。
+#
+# 超过本阈值（字节）就在运行收尾时轮转：整个文件移进 archive/，再把**仍待重取**
+# 的行原样写回一个新的 failed.jsonl。
+#
+# 🔑 为什么必须回填而不是简单地移走：`--refetch-failed` 靠"文件里有带
+# `需重新取流` 标记的行"来挑待重取的片。整体移走会让这批片再也挑不出来，
+# 重试链当场断裂 —— 那是直接牺牲下载成功率，绝不允许。
+# 回填后新文件只剩待重取的片（极少），历史全在 archive/ 里一条不丢。
+# 设为 0 可关闭轮转。
+_COMPACT_CFG = _CFG.get("failed_log_rotation", {}) or {}
+FAILED_LOG_MAX_BYTES = max(
+    0, int(_COMPACT_CFG.get("max_bytes", 100 * 1024 * 1024))
 )
 # 两个独立的下载态状态文件（区别于 SUCCESS_LOG/FAILED_LOG）。
 DOWNLOAD_OK_LOG = resolve_file(_CFG.get("download_ok_log"), "download_ok.jsonl")
@@ -1502,6 +1532,69 @@ def refetch_entries(entries, refetch_counts):
     return revived
 
 
+def is_stale_entry(entry, now=None):
+    """该条目的直链是否已躺过 STALE_LINK_SECONDS。
+
+    ⚠️ **没有 fetched_at 的条目一律判为不陈旧**。老版本 results.jsonl 与
+    某些手工构造的输入都没有这个字段，把它们当成"无限旧"会让整批片在启动时
+    全部去重取流——取流配额与耗时双重浪费，且多半是徒劳（那些链接可能好好的）。
+    宁可漏判，不可误判。
+    """
+    if STALE_LINK_SECONDS <= 0:
+        return False
+    fetched_at = parse_int(entry.get("fetched_at"))
+    if fetched_at is None or fetched_at <= 0:
+        return False
+    return (now or time.time()) - fetched_at > STALE_LINK_SECONDS
+
+
+def refresh_stale_entries(entries, refetch_counts):
+    """启动时把陈旧条目换成新直链，返回替换后的完整列表（顺序不变）。
+
+    🔑 **重取无果的条目原样保留**，绝不丢弃。三条理由：
+      1. 24 小时只是经验阈值，旧链接未必真失效，试一次不损失什么；
+      2. 只配了 R2 凭证、没配代理凭证的机器根本取不了流（refetch_entries 会
+         整体返回空），丢弃等于这批片全军覆没；
+      3. 真过期的话下载侧会挂 _NEEDS_REFETCH_MARKER，轮次间重取与跨运行重试
+         都还会再救它一次 —— 退路本来就有。
+    所以本函数**只可能让结果变好**，不会比不做更差。
+    """
+    if not entries or STALE_LINK_SECONDS <= 0 or not AUTO_REFETCH_ENABLED:
+        return entries
+
+    now = time.time()
+    stale = [entry for entry in entries if is_stale_entry(entry, now)]
+    if not stale:
+        return entries
+
+    hours = STALE_LINK_SECONDS / 3600
+    print(
+        f"\n[启动预检] {len(stale)}/{len(entries)} 部的直链已超过 "
+        f"{hours:.0f} 小时，先换新链接再下载"
+        f"（省掉'下完才发现过期'的一整轮无效下载）...",
+        flush=True,
+    )
+    revived = refetch_entries(stale, refetch_counts)
+    by_id = {str(entry.get("tmdbId")): entry for entry in revived}
+    if not by_id:
+        print(
+            "[启动预检] 一部都没换到新链接，全部沿用原直链继续下载"
+            "（它们未必真失效；真过期会在下载失败后走既有的重取闭环）。",
+            flush=True,
+        )
+        return entries
+
+    refreshed = [
+        by_id.get(str(entry.get("tmdbId")), entry) for entry in entries
+    ]
+    print(
+        f"[启动预检] {len(by_id)}/{len(stale)} 部换到新链接，"
+        f"其余 {len(stale) - len(by_id)} 部沿用原直链照常下载。",
+        flush=True,
+    )
+    return refreshed
+
+
 def update_success_log(tmdb_id, new_record):
     """按 tmdbId 去重地写 SUCCESS_LOG：同一 ID 覆盖旧记录，否则追加。
 
@@ -1585,6 +1678,111 @@ def remove_upload_failure_from_log(tmdb_id):
                 else:
                     file.write(json.dumps(record, ensure_ascii=False) + "\n")
         os.replace(tmp_path, FAILED_LOG)
+
+
+def _still_needs_refetch(record, done_ids, dead_ids):
+    """轮转时该行是否必须留在新 failed.jsonl 里。
+
+    判据与取流侧 `load_refetch_ids` **保持一致**（tmdb_ids_to_links.py）：
+    带 `需重新取流` 标记、有 tmdbId、且既没下载成功也没被判死。
+    两边任何一边放宽/收紧，都会让重试链出现缺口，故改动时必须同步。
+    """
+    if not isinstance(record, dict):
+        return False
+    if _NEEDS_REFETCH_MARKER not in str(record.get("error", "")):
+        return False
+    tmdb_id = record.get("tmdbId")
+    if tmdb_id is None:
+        return False
+    tmdb_id = str(tmdb_id).strip()
+    return bool(tmdb_id) and tmdb_id not in done_ids and tmdb_id not in dead_ids
+
+
+def compact_failed_log():
+    """failed.jsonl 超限时轮转：整体归档，把仍待重取的行写回新文件。
+
+    返回 (是否轮转过, 归档路径, 回填行数)。
+
+    ⚠️ 三条不可动摇的约束：
+      1. **历史零丢失** —— 原文件整体 move 进 archive/，不做任何裁剪。
+         事后分析（temp/agg_run.py 之类）仍能拿到完整数据。
+      2. **待重取的片必须留下** —— 否则 `--refetch-failed` 挑不到它们，
+         重试链断裂、直接掉下载成功率。这是本函数存在的最大风险点。
+      3. **error 原文逐字保留** —— 那是跨文件的字符串契约（有契约测试守着），
+         改写任何一个字都会让闭环静默断开。故回填时原样 dump，不重构字段。
+
+    并发：进程内靠 log_lock；**跨进程**靠 is_main_running() 守卫。后者不可省 ——
+    本函数在 release_main_lock() 之后才被调用，此刻另一个 downloader 已能启动
+    并往 failed.jsonl 追加。那个进程的 fd 指向旧 inode，我们 os.replace 之后
+    它写的每一条都进了 archive、而新 failed.jsonl 里没有 —— 那批待重取记录
+    就此蒸发，重试链断裂。与 reupload_pending 的守卫同理。
+
+    至于并发**读**（`--refetch-failed` 刻意不抢锁）：os.replace 是原子的，
+    已打开的 fd 仍指向旧 inode，读到的是完整快照，不会读到半截。
+    """
+    if FAILED_LOG_MAX_BYTES <= 0 or not os.path.exists(FAILED_LOG):
+        return False, None, 0
+    # 本进程此刻已释放主锁，故锁在 = 别的进程在跑。让它去，文件大一点没关系。
+    if is_main_running():
+        return False, None, 0
+    try:
+        if os.path.getsize(FAILED_LOG) <= FAILED_LOG_MAX_BYTES:
+            return False, None, 0
+    except OSError:
+        return False, None, 0
+
+    # 先算出"已成功"与"已判死"，与取流侧的排除口径一致。
+    # 放在锁外：这两个文件不由本函数改写，且读它们可能较慢。
+    done_ids = load_success_log_ids()
+    dead_ids = load_dead_ids()
+    # 在 with 之外定义：return 语句在锁块外用它，放里面是作用域隐患。
+    keep = []
+
+    with log_lock:
+        # 锁内复查：拿锁期间别的线程可能已经轮转过了。
+        if not os.path.exists(FAILED_LOG):
+            return False, None, 0
+        try:
+            if os.path.getsize(FAILED_LOG) <= FAILED_LOG_MAX_BYTES:
+                return False, None, 0
+        except OSError:
+            return False, None, 0
+
+        archive_dir = os.path.join(str(_SCRIPT_DIR), "archive")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        archive_path = os.path.join(archive_dir, f"failed_{stamp}.jsonl")
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            # 先读出要回填的行，再移走原文件。顺序反过来的话，移动成功但读取
+            # 失败就会让待重取的片彻底丢失。
+            with open(FAILED_LOG, "r", encoding="utf-8") as file:
+                for line in file:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        # 坏行不回填。这里与 remove_upload_failure_from_log
+                        # "原样保留"的做法不同，是有意的：那边是原地改写、丢了
+                        # 就真没了；这里原文件整体进了 archive/，坏行一个字都
+                        # 没少。而坏行按定义解析不出 marker，回填它也没用。
+                        continue
+                    if _still_needs_refetch(record, done_ids, dead_ids):
+                        keep.append(stripped)   # 原样保留，绝不重构字段
+            os.replace(FAILED_LOG, archive_path)
+            if keep:
+                tmp_path = FAILED_LOG + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as file:
+                    file.write("\n".join(keep) + "\n")
+                os.replace(tmp_path, FAILED_LOG)
+        except OSError as exc:
+            # 轮转纯属维护动作，失败了只是文件继续变大，不影响任何业务结论。
+            print(f"⚠️ failed.jsonl 轮转失败（已忽略，不影响下载）: {exc}",
+                  flush=True)
+            return False, None, 0
+
+    return True, archive_path, len(keep)
 
 
 def year_segment(year):
@@ -4304,6 +4502,23 @@ def main():
                 # 随时可以手动 reupload。SystemExit 一并兜住（避免收尾动作把已经跑完
                 # 的整次运行判成失败退出），但放过 KeyboardInterrupt。
                 print(f"⚠️ 自动补传异常，成品仍留本地待手动 reupload: {exc}", flush=True)
+
+        # failed.jsonl 轮转：纯追加的它在全量跑时会涨到让 --refetch-failed
+        # 每次全量读一遍。放在正常路径的最后（补传之后）——补传成功会删掉
+        # stage=="upload" 的行，先补传再轮转，归档的内容才是最终态。
+        # 被中断时不做：此刻状态未知，维护动作让位于尽快退出。
+        try:
+            rotated, archive_path, kept = compact_failed_log()
+            if rotated:
+                print(
+                    f"\n[日志轮转] failed.jsonl 已超过 "
+                    f"{FAILED_LOG_MAX_BYTES / 1024 / 1024:.0f}MB，"
+                    f"完整历史已归档到 {archive_path}；"
+                    f"回填 {kept} 条仍待重取的记录（--refetch-failed 照常可用）。",
+                    flush=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ failed.jsonl 轮转异常（已忽略）: {exc}", flush=True)
     finally:
         # 本次运行的最终口径：主流程 + 收尾补传。前面两段是分开打的，中间还隔着
         # 一大段失败聚合日志，不给一个合并行的话，用户得自己翻日志做加法。
@@ -4721,6 +4936,21 @@ def _run_pipeline(run_volume=None):
         round_no = 1
         # 每部片已被就地重取几次（跨轮累计），防"取流-过期-重取"无限空转。
         refetch_counts = {}
+        # 启动预检：把躺了太久的直链先换新再投。放在这里而不是读输入时，
+        # 是为了共用 refetch_counts —— 预检重取过的片要计入每片重取上限，
+        # 否则它在轮次间还能再重取满 AUTO_REFETCH_MAX_PER_MOVIE 次。
+        #
+        # ⚠️ 判据必须用 streaming，不能写 hasattr(current_batch, "poll")：
+        # 此处 current_batch 就是 entries（一个 list），list 永远没有 poll，
+        # 那样写是恒 False 的死判据，pipeline 模式照样会进来。
+        # 队列语义要到下面 ListEntrySource(current_batch) 那步才出现。
+        #
+        # pipeline 模式不做预检的理由：它的整个前提是"主循环一步都不阻塞"
+        # （为此专门建了 AsyncRefetcher），而 refetch_entries 是同步的，
+        # 最长能堵住 AUTO_REFETCH_TIMEOUT。此时取流线程已在灌队列，堵住主循环
+        # 反而会让队列里的直链继续变旧——与本预检的目的正相反。
+        if not streaming:
+            current_batch = refresh_stale_entries(current_batch, refetch_counts)
         while True:
             # 每轮开头清空 download_fail 状态文件，只记录本轮下载失败。
             truncate_log(DOWNLOAD_FAIL_LOG)
