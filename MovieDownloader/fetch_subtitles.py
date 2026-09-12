@@ -99,7 +99,34 @@ def _config_api_key():
 # SubDL API Key：敏感项。环境变量 / 同目录 .env 优先，config.yaml 仅作本地
 # 调试回退 —— config.yaml 会进版本库，填在那里等于把 key 公开推到远端。
 # 免费申请：https://subdl.com/panel/api
-SUBDL_API_KEY = os.environ.get("SUBDL_API_KEY", "").strip() or _config_api_key()
+#
+# 支持**多账号轮换**：免费档每账号每天只有 50 次下载，单 key 补不了多少片。
+# 2026-09-12 实测确认额度按**账号**计而非按 IP 计（同一台机器、同一条 url：
+# 旧 key 429、新 key 200、旧 key 复核仍 429），故多 key 轮换确实能叠加额度。
+#   .env 里写：SUBDL_API_KEYS=key1,key2,key3
+# 单数形式 SUBDL_API_KEY 继续有效（向后兼容），两者都配时合并去重。
+def _parse_keys(raw):
+    """把逗号/空白/换行分隔的多个 key 解析成有序去重列表。
+
+    保序很重要：用户把额度多的 key 放前面时，应当先用它。
+    """
+    if not raw:
+        return []
+    parts = re.split(r"[,\s]+", str(raw))
+    seen, out = set(), []
+    for part in parts:
+        key = part.strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(key)
+    return out
+
+
+SUBDL_API_KEYS = _parse_keys(
+    os.environ.get("SUBDL_API_KEYS", "")
+) or _parse_keys(
+    os.environ.get("SUBDL_API_KEY", "") or _config_api_key()
+)
 
 SUCCESS_LOG = dm.SUCCESS_LOG
 STATE_LOG = str(_SCRIPT_DIR / "subtitles.jsonl")
@@ -121,6 +148,11 @@ MAX_WORKERS = 4
 REQUEST_TIMEOUT = 30
 RETRY_MAX = 3
 RETRY_DELAY = 3
+# meta.json 的乐观锁重试：并发写同一个 key 的概率本就很低（下载侧此刻传的是
+# 还没进 success.jsonl 的片，与我们处理的片天然不相交），撞上也只需重读一次。
+# 3 次足够，再多只是拖慢收尾。
+META_UPDATE_RETRIES = 3
+META_UPDATE_BACKOFF = 0.5
 # 防御性上限：字幕 zip 正常只有几十 KB，源站返回异常内容时不能整个读进内存。
 MAX_ZIP_BYTES = dm.SUBTITLE_MAX_BYTES
 
@@ -136,10 +168,76 @@ REMOTE_MODE = dm.S3_ENABLED
 # 这是**确定性**失败，必须与"源站没这个语种"严格区分开（见 QuotaExhausted）。
 QUOTA_ERROR_CODE = "api_download_limit_exceeded"
 
-# 一旦确认"继续请求也没意义"就置位，所有还没开跑的片直接跳过。
-# 两种触发原因：下载额度耗尽、搜索接口持续限流（重试完仍 429）。
-# 不置位的话：剩下几十部会各自再发若干次注定失败的 HTTP，还要被
-# request_with_retry 各重试 3 次、白等 9 秒，最后把接口问题记成"源站没字幕"。
+
+class KeyPool:
+    """多个 SubDL api_key 的轮换池。线程安全。
+
+    🔑 为什么不能简单地"撞 429 就切下一个"：
+    4 个工作线程共用当前 key，key1 耗尽时它们会**各自**撞到 429、各自要求切换。
+    无脑 `index += 1` 会一次跳过 3 个 key —— 那 3 个账号的额度**原封不动地
+    被浪费掉**，而额度正是这里最稀缺的资源。
+
+    解法：调用方报告"是哪个 key 挂了"，只有当它确实是当前 key 时才推进。
+    后到的 3 个线程报的是同一个 key1，此时 current 已是 key2，直接忽略。
+    """
+
+    def __init__(self, keys):
+        self._keys = list(keys)
+        self._index = 0
+        self._exhausted = {}        # key -> 原因（quota / throttled）
+        self._lock = threading.Lock()
+
+    def __len__(self):
+        return len(self._keys)
+
+    def current(self):
+        """取当前可用 key；全部耗尽时返回 None。"""
+        with self._lock:
+            if self._index >= len(self._keys):
+                return None
+            return self._keys[self._index]
+
+    def retire(self, key, reason):
+        """报告某个 key 已不可用，返回接替它的新 key（没有则 None）。
+
+        幂等：同一个 key 被多个线程重复报告时，只有第一次真正推进游标。
+        """
+        with self._lock:
+            if self._index >= len(self._keys):
+                return None
+            if self._keys[self._index] != key:
+                # 已经有别的线程切走了。说明当前 key 是新的，直接沿用，
+                # 绝不因为"我也撞墙了"而再跳一次。
+                return self._keys[self._index]
+            self._exhausted.setdefault(key, reason)
+            self._index += 1
+            position = self._index
+            nxt = self._keys[self._index] if self._index < len(self._keys) else None
+        if nxt:
+            print(
+                f"\n🔑 第 {position} 个 api_key 已用尽（{reason}），"
+                f"切换到第 {position + 1}/{len(self._keys)} 个继续。",
+                flush=True,
+            )
+        return nxt
+
+    def exhausted_count(self):
+        with self._lock:
+            return len(self._exhausted)
+
+    def all_exhausted(self):
+        with self._lock:
+            return self._index >= len(self._keys)
+
+
+key_pool = KeyPool(SUBDL_API_KEYS)
+
+# 全局停止闸门：**只有"所有 key 都耗尽"才置位**。
+# ⚠️ 与单 key 时代的语义不同：那时"撞额度 = 停跑"，现在"撞额度 = 换 key"，
+# 只有换无可换才停。搞混会让多配的 key 一个都用不上。
+#
+# 注意"跑完了"与"没额度了"是两种**完全不同**的收场，日志必须分开说：
+# 前者是圆满完成、无需再跑；后者是被迫中断、明天还要接着跑。
 stop_fetching = threading.Event()
 
 # 置位原因，供 download_one 如实报告跳过的理由（而不是笼统说"额度耗尽"）。
@@ -156,6 +254,21 @@ def _signal_stop(status, error, reset_at=None):
             if reset_at:
                 stop_reason["quotaResetAt"] = reset_at
     stop_fetching.set()
+
+
+def _retire_key(key, reason, error, reset_at=None):
+    """当前 key 用尽 -> 换下一个；换无可换才落全局闸门。
+
+    返回 True 表示还有 key 可用（调用方应当重试），False 表示该收摊了。
+    """
+    nxt = key_pool.retire(key, reason)
+    if nxt:
+        return True
+    _signal_stop(
+        "quota_exhausted" if reason == "quota" else "search_throttled",
+        error, reset_at,
+    )
+    return False
 
 
 def _redact(text):
@@ -229,11 +342,37 @@ def _existing_languages_local(target_dir):
     return {lang for lang in map(_language_of, names) if lang}
 
 
+def _is_precondition_failed(exc):
+    """判断异常是不是 If-Match 失败（HTTP 412 PreconditionFailed）。
+
+    只认这一种错误码：别的失败（权限、网络、桶不存在）重试多少次都一样，
+    当场放弃比空转三轮更诚实。
+    """
+    response = getattr(exc, "response", None) or {}
+    if isinstance(response, dict):
+        meta = response.get("ResponseMetadata") or {}
+        if meta.get("HTTPStatusCode") == 412:
+            return True
+        code = str((response.get("Error") or {}).get("Code") or "")
+        if code in ("PreconditionFailed", "412"):
+            return True
+    return False
+
+
 def _update_remote_meta(tmdb_id, year, new_files):
-    """把新补的字幕并进 R2 上 meta.json 的 subtitles[]。
+    """把新补的字幕并进 R2 上 meta.json 的 subtitles[]。**带乐观锁**。
 
     前端按 meta.json 索引字幕时，光传上去文件是不够的——meta 里没有记录就等于
     不存在。meta.json 只有几百字节，下载-改-回传的代价可忽略。
+
+    🔑 为什么必须用 ETag 乐观锁（这是"下载侧运行时也能补字幕"的前提）：
+    本函数是"读-改-写"，而下载侧上传成品时会整份覆盖同一个 key。裸写的时序：
+
+        本进程 get(meta v1) -> 下载侧 put(meta v2) -> 本进程 put(v1 + 字幕)
+                                                      ↑ v2 的改动被静默吃掉
+
+    带上读取时拿到的 ETag 做 If-Match，中途被人改过就会 412，此时**重读重试**
+    即可 —— 第二次读到的就是 v2，合并后回写不丢任何字段。
 
     整个过程尽力而为：meta 不存在或格式坏掉都只打印，绝不影响字幕本身已经
     成功上传的事实。
@@ -241,44 +380,77 @@ def _update_remote_meta(tmdb_id, year, new_files):
     key = dm.build_s3_key(tmdb_id, year, "meta.json")
     try:
         client = dm.get_s3_client()
-        body = client.get_object(Bucket=dm.S3_BUCKET, Key=key)["Body"].read()
-        meta = json.loads(body.decode("utf-8"))
-    except Exception as exc:  # noqa: BLE001 - 没有 meta 就不更新，不是错误
-        print(f"  [{tmdb_id}] ⚠️ 读取 meta.json 失败（字幕已上传，跳过更新）: {exc}",
-              flush=True)
-        return False
-
-    entries = meta.get("subtitles")
-    if not isinstance(entries, list):
-        entries = []
-    # 按 path 去重：重复跑本脚本、或同一语种被覆盖重传时不该堆出重复条目。
-    known = {e.get("path") for e in entries if isinstance(e, dict)}
-    added = 0
-    for name in new_files:
-        rel = f"{dm.SUBS_SUBDIR}/{name}"
-        if rel in known:
-            continue
-        language, _, fmt = name.rpartition(".")
-        entries.append({"language": language, "format": fmt, "path": rel})
-        known.add(rel)
-        added += 1
-    if not added:
-        return False
-
-    meta["subtitles"] = entries
-    # 留痕：标明这份 meta 被字幕补漏流程改过，便于日后排查字幕来源。
-    meta["subtitlesUpdatedAt"] = int(time.time())
-    try:
-        client.put_object(
-            Bucket=dm.S3_BUCKET, Key=key,
-            Body=json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
-        return True
     except Exception as exc:  # noqa: BLE001
-        print(f"  [{tmdb_id}] ⚠️ 回写 meta.json 失败（字幕已上传）: {exc}",
+        print(f"  [{tmdb_id}] ⚠️ 连接 R2 失败（字幕已上传，跳过 meta 更新）: {exc}",
               flush=True)
         return False
+
+    for attempt in range(META_UPDATE_RETRIES):
+        try:
+            obj = client.get_object(Bucket=dm.S3_BUCKET, Key=key)
+            etag = obj.get("ETag")
+            meta = json.loads(obj["Body"].read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - 没有 meta 就不更新，不是错误
+            print(
+                f"  [{tmdb_id}] ⚠️ 读取 meta.json 失败（字幕已上传，跳过更新）: "
+                f"{exc}", flush=True,
+            )
+            return False
+
+        entries = meta.get("subtitles")
+        if not isinstance(entries, list):
+            entries = []
+        # 按 path 去重：重复跑本脚本、或同一语种被覆盖重传时不该堆出重复条目。
+        known = {e.get("path") for e in entries if isinstance(e, dict)}
+        added = 0
+        for name in new_files:
+            rel = f"{dm.SUBS_SUBDIR}/{name}"
+            if rel in known:
+                continue
+            language, _, fmt = name.rpartition(".")
+            entries.append({"language": language, "format": fmt, "path": rel})
+            known.add(rel)
+            added += 1
+        if not added:
+            return False
+
+        meta["subtitles"] = entries
+        # 留痕：标明这份 meta 被字幕补漏流程改过，便于日后排查字幕来源。
+        meta["subtitlesUpdatedAt"] = int(time.time())
+
+        put_kwargs = {
+            "Bucket": dm.S3_BUCKET, "Key": key,
+            "Body": json.dumps(meta, ensure_ascii=False,
+                               indent=2).encode("utf-8"),
+            "ContentType": "application/json",
+        }
+        # ETag 拿不到就退化为裸写：总比不写强，且单独跑（下载侧没在跑）时
+        # 本就不存在竞争。
+        if etag:
+            put_kwargs["IfMatch"] = etag
+        try:
+            client.put_object(**put_kwargs)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            if _is_precondition_failed(exc) and attempt < META_UPDATE_RETRIES - 1:
+                # 有人在我们读完之后改了它 —— 重读重试，把两边的改动合起来。
+                print(
+                    f"  [{tmdb_id}] meta.json 被并发修改，重读重试"
+                    f"（第 {attempt + 1} 次）",
+                    flush=True,
+                )
+                time.sleep(META_UPDATE_BACKOFF * (attempt + 1))
+                continue
+            print(f"  [{tmdb_id}] ⚠️ 回写 meta.json 失败（字幕已上传）: {exc}",
+                  flush=True)
+            return False
+
+    print(
+        f"  [{tmdb_id}] ⚠️ meta.json 并发冲突重试 {META_UPDATE_RETRIES} 次仍失败"
+        f"（字幕已上传，下次运行会自动补记）",
+        flush=True,
+    )
+    return False
 
 
 
@@ -347,8 +519,8 @@ class QuotaExhausted(Exception):
     「已保存 [] 缺失 ['zh']」，完全同形。结果一次额度耗尽的空跑被误判成
     "补字幕功能坏了"，排查了很久才发现是配额问题。
 
-    它还是**确定性**失败：重试、换片、等几分钟都没用，当天就是没额度了。
-    故：不重试、立刻置位全局标志、让主流程尽快收尾。
+    它还是**确定性**失败：对**当前这个 key** 而言重试、换片都没用，当天就是
+    没额度了。故：不重试、换下一个 key；换无可换才停。
     """
 
     def __init__(self, message, retry_after=None, reset_at=None):
@@ -423,17 +595,44 @@ def request_with_retry(method, url, **kwargs):
     raise last_error
 
 
+def request_with_keys(method, url, params=None, **kwargs):
+    """带 api_key 发请求；当前 key 用尽就换下一个重试，直到换无可换。
+
+    这是**唯一**该被业务代码调用的请求入口 —— 把"哪个 key、什么时候换"
+    整个收拢在这里，业务侧只管拿结果。
+
+    额度/限流由本函数就地消化；只有**所有 key 都用尽**时才把异常抛给调用方。
+    """
+    params = dict(params or {})
+    # 最多把每个 key 试一遍。用 len+1 兜底：极端并发下 current() 可能刚被
+    # 别的线程推进过，多留一次机会，但绝不无限循环。
+    for _ in range(len(key_pool) + 1):
+        key = key_pool.current()
+        if key is None:
+            raise QuotaExhausted("所有 api_key 的当日额度均已用尽")
+        params["api_key"] = key
+        try:
+            return request_with_retry(method, url, params=params, **kwargs)
+        except QuotaExhausted as exc:
+            if not _retire_key(key, "quota", str(exc), exc.reset_at):
+                raise
+        except SearchThrottled as exc:
+            # 限流未必是额度问题，但对这个 key 已经没法继续了，同样换人。
+            if not _retire_key(key, "throttled", str(exc)):
+                raise
+    raise QuotaExhausted("所有 api_key 的当日额度均已用尽")
+
+
 def search_subtitles(tmdb_id):
     """按 tmdb_id 查询该电影的所有候选字幕。"""
     params = {
-        "api_key": SUBDL_API_KEY,
         "tmdb_id": tmdb_id,
         "type": "movie",
         "languages": ",".join(SUBDL_LANGUAGES),
         "subs_per_page": 30,
         "client": "custom_integration",
     }
-    response = request_with_retry("GET", SEARCH_API, params=params)
+    response = request_with_keys("GET", SEARCH_API, params=params)
     data = response.json()
     if not data.get("status"):
         raise RuntimeError(data.get("error") or "SubDL 返回 status=false")
@@ -458,16 +657,18 @@ def pick_best(subtitles, language):
     return None
 
 
-def _download_params(url):
-    """决定下载请求要不要再带 api_key。
+def _strip_api_key(url):
+    """去掉 SubDL 返回 url 里自带的 api_key，只保留纯路径。
 
-    SubDL 返回的 `url` 字段**已经自带** `?api_key=...`（2026-09-12 实测）。
-    再通过 params 追加一个，最终请求会变成
-        /subtitle/xxx.zip?api_key=K&api_key=K
-    —— 重复的鉴权参数，服务端目前容忍，但这是明确的错误拼装，且让日志里的
-    url 长得离谱、排查时极难阅读。故：自带就不再追加。
+    🔑 多 key 场景下这一步是**必须**的，不只是为了好看：
+    搜索结果里的 url 自带的是**当时那个 key**。若原样拼接，即便 KeyPool 已经
+    切到了 key2，请求里带的仍是耗尽的 key1 —— 换 key 会完全失效，而且症状
+    极隐蔽（看起来在轮换，实际一直在撞同一堵墙）。
+    故：一律剥掉自带的 key，由 request_with_keys 统一盖当前 key。
+
+    顺带解决了老问题：自带 key 再追加一个会拼出 `?api_key=K&api_key=K`。
     """
-    return None if "api_key=" in url else {"api_key": SUBDL_API_KEY}
+    return str(url).split("?", 1)[0]
 
 
 def extract_srt(zip_bytes):
@@ -620,19 +821,21 @@ def download_one(entry):
 
 
 def _fetch_into(tmdb_id, year, pending, target_dir):
-    """把 pending 里各语种的字幕抓进 target_dir；R2 模式下再上传并更新 meta。"""
+    """把 pending 里各语种的字幕抓进 target_dir；R2 模式下再上传并更新 meta。
+
+    ⚠️ 这里捕获的 QuotaExhausted / SearchThrottled 语义是**所有 key 都用尽**
+    （单个 key 用尽已由 request_with_keys 就地换人消化掉了），所以直接收摊。
+    """
     try:
         subtitles = search_subtitles(tmdb_id)
     except SearchThrottled as exc:
-        # 搜索被限流：这一部**压根没查成**，与"SubDL 库里没有这个 tmdb_id"
-        # 完全不同。混进 search_failed 会把那个统计弄脏（真查不到的片
-        # 值得从待办里剔除，被限流的片下次还要再试）。同样要让整批停下来 ——
-        # 限流是全局状态，继续跑只是把剩下的片一部部撞死在同一面墙上。
+        # 全部 key 都被限流：这一部**压根没查成**，与"SubDL 库里没有这个
+        # tmdb_id"完全不同。混进 search_failed 会把那个统计弄脏（真查不到的
+        # 片值得从待办里剔除，被限流的片下次还要再试）。
         _signal_stop("search_throttled", str(exc))
         return {"status": "search_throttled", "error": str(exc),
-                "unattempted": list(pending)}
+                "saved": [], "missing": [], "unattempted": list(pending)}
     except QuotaExhausted as exc:
-        # 搜索接口也可能直接给出额度错误，按额度耗尽处置。
         _signal_stop("quota_exhausted", str(exc), exc.reset_at)
         result = {"status": "quota_exhausted", "error": str(exc),
                   "saved": [], "missing": [], "unattempted": list(pending)}
@@ -651,12 +854,12 @@ def _fetch_into(tmdb_id, year, pending, target_dir):
             result["missing"].append(language)
             continue
 
-        download_url = DOWNLOAD_BASE + picked["url"]
+        # 剥掉 url 自带的 key，改由 request_with_keys 盖当前 key。
+        # 不剥的话换 key 会静默失效（见 _strip_api_key 注释）。
+        download_url = DOWNLOAD_BASE + _strip_api_key(picked["url"])
         try:
-            response = request_with_retry(
-                "GET", download_url,
-                params=_download_params(picked["url"]),
-                stream=True,
+            response = request_with_keys(
+                "GET", download_url, stream=True,
             )
             # 流式累加 + 超限即断：字幕 zip 正常几十 KB，若源站给回一个大文件，
             # 一次性 .content 会在检查之前就把它整个读进内存。
@@ -768,9 +971,9 @@ def write_state(record):
 def main():
     # 没配 API Key 就安静跳过：字幕是可有可无的附属步骤，不该让整条流水线
     # 因为缺一个可选凭证而以非零码退出（那会让 cron / && 串联的后续步骤中断）。
-    if not SUBDL_API_KEY:
-        print("未配置 SUBDL_API_KEY，跳过字幕补全（不影响已下载的影片）",
-              flush=True)
+    if not SUBDL_API_KEYS:
+        print("未配置 SUBDL_API_KEYS/SUBDL_API_KEY，跳过字幕补全"
+              "（不影响已下载的影片）", flush=True)
         return
 
     entries = load_entries()
@@ -778,7 +981,8 @@ def main():
         return
     print(
         f"待处理电影: {len(entries)}（语种: {', '.join(SUBTITLE_LANGUAGES)}；"
-        f"落点: {'R2 ' + dm.S3_BUCKET if REMOTE_MODE else '本地 ' + dm.BASE_DIR}）",
+        f"落点: {'R2 ' + dm.S3_BUCKET if REMOTE_MODE else '本地 ' + dm.BASE_DIR}；"
+        f"可用 api_key: {len(SUBDL_API_KEYS)} 个）",
         flush=True,
     )
 
@@ -829,11 +1033,12 @@ def main():
                 if not stop_announced and result.get("error"):
                     stop_announced = True
                     if result["status"] == "quota_exhausted":
-                        what = "SubDL 当日下载额度已用尽"
+                        what = (f"全部 {len(SUBDL_API_KEYS)} 个 api_key "
+                                f"的当日下载额度均已用尽")
                         when = (f"额度重置时间(UTC): "
                                 f"{result.get('quotaResetAt') or '未提供'}")
                     else:
-                        what = "SubDL 接口持续限流（重试已用尽）"
+                        what = "全部 api_key 均被 SubDL 持续限流（重试已用尽）"
                         when = "稍后重试即可（限流通常会自行恢复）"
                     print(
                         f"\n🛑 [{index}/{len(entries)}] {what}，剩余影片全部跳过。\n"
@@ -844,20 +1049,47 @@ def main():
                         flush=True,
                     )
 
-    print(f"\n完成。字幕文件 {saved_count} 个，统计: {stats}", flush=True)
-
-    # 把"因接口不可用而没补上"单独结账。它和 missing 完全是两件事，
-    # 混在一起看会让人误以为这些片在源站没有字幕、从此不再重试。
+    # 两种收场必须**说得明显不同**：
+    #   跑完了  -> 圆满，所有待补的片都处理过了，没必要再跑；
+    #   没额度了 -> 被迫中断，明天额度重置后还得接着跑。
+    # 混为一谈的话，用户看完日志不知道到底还要不要再来一趟。
     blocked = stats.get("quota_exhausted", 0) + stats.get("search_throttled", 0)
+    used_keys = key_pool.exhausted_count()
+
+    print(f"\n完成。本次新增字幕文件 {saved_count} 个，统计: {stats}", flush=True)
+
     if blocked:
+        # 额度耗尽与被限流的"下一步"不同：前者要等到明天，后者过一阵就能再试。
+        # 都说成"等额度重置"会让人白等一天。
         if "quota_exhausted" in blocked_kinds:
             reason = f"当日额度耗尽，额度重置(UTC): {quota_reset_at or '未提供'}"
+            nxt = "⏭️  明天额度重置后**再跑一次本脚本**即可接着补"
         else:
-            reason = "接口限流，稍后重试即可"
+            reason = "接口被持续限流"
+            nxt = "⏭️  过一段时间**再跑一次本脚本**即可接着补"
         print(
-            f"⚠️ 其中 {blocked} 部因 SubDL 接口不可用而未处理（{reason}）。\n"
-            f"   SubDL 免费账号每天 50 个下载；要一次补完更多片需升级 Pro，"
-            f"或每天跑一次本脚本逐步补齐。",
+            f"\n🛑 ===== 因配额耗尽而中断（未跑完）=====\n"
+            f"   已用尽 {used_keys}/{len(SUBDL_API_KEYS)} 个 api_key；"
+            f"{blocked} 部影片本次未处理（{reason}）。\n"
+            f"   {nxt}（已补好的会自动跳过）。\n"
+            f"   想一次补更多：加配 api_key（SUBDL_API_KEYS=key1,key2,...）"
+            f"或升级 SubDL Pro。",
+            flush=True,
+        )
+    else:
+        # 跑完了。但"跑完"不等于"一路顺风"——中途可能已经烧掉了几个 key，
+        # 只是最后一个撑到了收尾。这个区别直接影响用户要不要再加配 key，
+        # 所以必须如实说，不能笼统报"没有触发任何配额限制"。
+        if used_keys:
+            spent = (f"   期间用尽了 {used_keys}/{len(SUBDL_API_KEYS)} 个 "
+                     f"api_key（最后一个仍有余额）。\n")
+        else:
+            spent = f"   未触发任何配额限制（共 {len(SUBDL_API_KEYS)} 个 api_key）。\n"
+        print(
+            f"\n✅ ===== 全部待补影片已处理完毕 =====\n"
+            f"{spent}"
+            f"   当前 success.jsonl 里的片都已尝试过，**无需今天再跑**；\n"
+            f"   等下载侧产出新片后再执行即可。",
             flush=True,
         )
 

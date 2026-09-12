@@ -54,7 +54,8 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(f.dm, "FOLDER_PREFIX", "movies")
     monkeypatch.setattr(f, "SUBTITLE_LANGUAGES", ["en", "zh"])
     monkeypatch.setattr(f, "SUBTITLE_FORMATS", ["vtt", "srt"])
-    monkeypatch.setattr(f, "SUBDL_API_KEY", "TESTKEY")
+    monkeypatch.setattr(f, "SUBDL_API_KEYS", ["TESTKEY"])
+    monkeypatch.setattr(f, "key_pool", f.KeyPool(["TESTKEY"]))
     monkeypatch.setattr(f, "STATE_LOG", str(tmp_path / "subtitles.jsonl"))
     monkeypatch.setattr(f, "REMOTE_MODE", False)
     # 停止闸门与其原因都是模块级共享状态。不换新的话，一旦某个用例把它置位，
@@ -84,7 +85,7 @@ def test_subs_dir_uses_same_year_fallback_as_downloader(sandbox):
 
 def test_missing_api_key_exits_quietly(monkeypatch, capsys):
     """没配 API Key 只跳过，不能抛 SystemExit —— 否则 cron/&& 串联会中断。"""
-    monkeypatch.setattr(f, "SUBDL_API_KEY", "")
+    monkeypatch.setattr(f, "SUBDL_API_KEYS", [])
     f.main()   # 不抛异常即通过
     assert "跳过字幕补全" in capsys.readouterr().out
 
@@ -151,7 +152,7 @@ def test_worker_exception_does_not_kill_the_batch(sandbox, monkeypatch, capsys):
     f.main()
     out = capsys.readouterr().out
     assert "异常（已跳过）" in out
-    assert "完成。字幕文件 1 个" in out
+    assert "本次新增字幕文件 1 个" in out
 
 
 def test_state_log_failure_is_swallowed(sandbox, monkeypatch, capsys):
@@ -294,7 +295,13 @@ def test_load_entries_dedupes_and_keeps_year(sandbox, monkeypatch):
 # 本地不留残留、meta.json 同步更新。
 
 class _FakeS3:
-    """最小 S3 桩：记录 upload/put，按预置对象列表回答 list/get。"""
+    """最小 S3 桩：记录 upload/put，按预置对象列表回答 list/get。
+
+    支持 ETag + If-Match，用来验证 meta.json 的乐观锁：
+      - get_object 返回当前 etag；
+      - put_object 带 IfMatch 且与当前 etag 不符时抛 412；
+      - on_get 钩子可在"读之后、写之前"模拟别人改了对象（制造竞争窗口）。
+    """
 
     def __init__(self, keys=None, meta=None):
         self.keys = list(keys or [])
@@ -303,6 +310,11 @@ class _FakeS3:
         self.put_objects = {}   # key -> bytes
         self.list_error = None
         self.upload_error = None
+        self.etag = '"v1"'
+        self.on_get = None      # 每次 get_object 之后调用，用于插入并发修改
+        self.get_calls = 0
+        self.put_calls = 0
+        self.conflicts = 0      # 实际抛出 412 的次数
 
     def get_paginator(self, _name):
         outer = self
@@ -318,10 +330,34 @@ class _FakeS3:
     def get_object(self, Bucket=None, Key=None):
         if self.meta is None:
             raise RuntimeError("NoSuchKey")
-        return {"Body": io.BytesIO(json.dumps(self.meta).encode("utf-8"))}
+        self.get_calls += 1
+        body = json.dumps(self.meta).encode("utf-8")
+        etag = self.etag
+        if self.on_get:
+            self.on_get(self)
+        return {"Body": io.BytesIO(body), "ETag": etag}
 
     def put_object(self, Bucket=None, Key=None, Body=None, **kwargs):
+        self.put_calls += 1
+        if_match = kwargs.get("IfMatch")
+        if if_match is not None and if_match != self.etag:
+            self.conflicts += 1
+            raise _PreconditionFailed()
         self.put_objects[Key] = Body
+        if Key.endswith("meta.json"):
+            self.meta = json.loads(Body.decode("utf-8"))
+            self.etag = f'"after-{self.put_calls}"'
+
+
+class _PreconditionFailed(Exception):
+    """模拟 botocore 的 ClientError(412)，结构与真实对象一致。"""
+
+    def __init__(self):
+        super().__init__("PreconditionFailed")
+        self.response = {
+            "Error": {"Code": "PreconditionFailed"},
+            "ResponseMetadata": {"HTTPStatusCode": 412},
+        }
 
 
 @pytest.fixture
@@ -771,29 +807,36 @@ def test_quota_message_is_loud_and_counted(sandbox, monkeypatch, capsys):
     f.main()
 
     out = capsys.readouterr().out
-    assert "当日下载额度已用尽" in out
+    assert "当日下载额度均已用尽" in out
     assert "2026-09-12T00:00:00.000Z" in out
     assert "这不是「源站没有字幕」" in out
-    assert "2 部因 SubDL 接口不可用而未处理" in out
+    assert "因配额耗尽而中断" in out
+    assert "2 部影片本次未处理" in out
     assert "当日额度耗尽" in out
+    assert "已处理完毕" not in out, "被迫中断不能报成圆满完成"
 
 
 # ------------------------------------------------------ 下载 url 的参数拼装
 
-def test_api_key_is_not_appended_when_url_already_has_it(sandbox):
-    """SubDL 返回的 url 自带 api_key，再追加会拼出 ?api_key=K&api_key=K。"""
-    assert f._download_params("/subtitle/1-2.zip?api_key=K") is None
+@pytest.mark.parametrize("url,expected", [
+    ("/subtitle/1-2.zip?api_key=K", "/subtitle/1-2.zip"),
+    ("/subtitle/1-2.zip", "/subtitle/1-2.zip"),
+    ("/subtitle/1-2.zip?api_key=K&x=1", "/subtitle/1-2.zip"),
+])
+def test_strip_api_key_leaves_only_the_path(url, expected):
+    """SubDL 返回的 url 自带 api_key，必须剥掉。
+
+    🔑 多 key 场景下这是**正确性**问题而非美观问题：自带的是搜索时那个 key，
+    不剥的话即便 KeyPool 已切到 key2，请求带的仍是耗尽的 key1 —— 轮换静默失效。
+    """
+    assert f._strip_api_key(url) == expected
 
 
-def test_api_key_is_appended_when_url_lacks_it(sandbox):
-    """url 不带 api_key 时仍要补上，否则请求不被鉴权。"""
-    assert f._download_params("/subtitle/1-2.zip") == {"api_key": "TESTKEY"}
-
-
-def test_download_request_carries_exactly_one_api_key(sandbox, monkeypatch):
-    """端到端护栏：最终请求里 api_key 只能出现一次。"""
+def test_download_uses_the_pool_key_not_the_one_in_the_url(sandbox, monkeypatch):
+    """🔑 端到端护栏：请求用的必须是池子当前的 key，且只出现一次。"""
+    monkeypatch.setattr(f, "key_pool", f.KeyPool(["POOLKEY"]))
     monkeypatch.setattr(f, "search_subtitles", lambda _: [
-        {"language": "EN", "url": "/subtitle/1-2.zip?api_key=TESTKEY"},
+        {"language": "EN", "url": "/subtitle/1-2.zip?api_key=STALEKEY"},
     ])
     seen = {}
 
@@ -805,8 +848,9 @@ def test_download_request_carries_exactly_one_api_key(sandbox, monkeypatch):
     monkeypatch.setattr(f, "request_with_retry", fake_request)
     f.download_one({"tmdbId": "55", "year": 2000})
 
-    assert seen["params"] is None
-    assert seen["url"].count("api_key=") == 1
+    assert "api_key" not in seen["url"], "url 里不该再有 key"
+    assert seen["params"]["api_key"] == "POOLKEY"
+    assert "STALEKEY" not in str(seen), "绝不能用搜索结果里那个过期的 key"
 
 
 # ------------------------------------- 搜索接口被限流 ≠ 源站没有这个 tmdb_id
@@ -942,7 +986,7 @@ def test_throttle_message_distinguishes_itself_from_quota(
     out = capsys.readouterr().out
     assert "持续限流" in out
     assert "这不是「源站没有字幕」" in out
-    assert "1 部因 SubDL 接口不可用而未处理" in out
+    assert "1 部影片本次未处理" in out
     assert "额度重置" not in out, "限流与额度是两件事，不能混说"
 
 
@@ -988,3 +1032,253 @@ def test_search_failure_log_does_not_leak_the_key(sandbox, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "subdl_SECRET" not in out
     assert "api_key=REDACTED" in out
+
+
+# ========================================== 多 api_key 轮换（额度按账号叠加）
+# 2026-09-12 实测确认额度按**账号**计而非按 IP 计：同一台机器、同一条 url，
+# 旧 key 429 / 新 key 200 / 旧 key 复核仍 429。故多 key 轮换真能叠加额度。
+# 额度是这里最稀缺的资源，**一次都不能浪费**，这组用例就是守住这一点。
+
+def test_parse_keys_handles_separators_and_dedupes():
+    assert f._parse_keys("a,b,c") == ["a", "b", "c"]
+    assert f._parse_keys(" a , b \n c ") == ["a", "b", "c"]
+    assert f._parse_keys("a,a,b") == ["a", "b"], "重复的 key 不该占位置"
+    assert f._parse_keys("") == []
+    assert f._parse_keys(None) == []
+
+
+def test_parse_keys_preserves_order():
+    """保序：用户把额度多的 key 放前面时，应当先用它。"""
+    assert f._parse_keys("z,a,m") == ["z", "a", "m"]
+
+
+def test_pool_hands_out_keys_in_order():
+    pool = f.KeyPool(["k1", "k2"])
+    assert pool.current() == "k1"
+    assert pool.retire("k1", "quota") == "k2"
+    assert pool.current() == "k2"
+
+
+def test_pool_returns_none_when_all_exhausted():
+    pool = f.KeyPool(["k1"])
+    assert pool.retire("k1", "quota") is None
+    assert pool.current() is None
+    assert pool.all_exhausted() is True
+
+
+def test_pool_ignores_stale_reports_from_other_threads():
+    """🔑 核心并发保护：晚到的重复报告绝不能多跳一个 key。
+
+    4 个线程共用当前 key，k1 耗尽时它们会各自撞 429、各自要求换人。
+    若无脑 `index += 1`，一次就从 k1 跳到 k4 —— k2/k3 两个账号的额度
+    **原封不动地被扔掉**。额度正是这里最稀缺的东西。
+    """
+    pool = f.KeyPool(["k1", "k2", "k3", "k4"])
+
+    assert pool.retire("k1", "quota") == "k2"      # 第一个线程：真正推进
+    assert pool.retire("k1", "quota") == "k2"      # 晚到的报告：忽略
+    assert pool.retire("k1", "quota") == "k2"
+    assert pool.retire("k1", "quota") == "k2"
+
+    assert pool.current() == "k2", "k2 必须还在，绝不能被跳过"
+    assert pool.exhausted_count() == 1
+
+
+def test_pool_is_thread_safe_under_real_contention():
+    """真并发：8 个线程同时报告同一个 key 失效，只能前进一格。"""
+    pool = f.KeyPool([f"k{i}" for i in range(10)])
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def report():
+        try:
+            barrier.wait(timeout=5)
+            pool.retire("k0", "quota")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=report) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert not errors
+    assert pool.current() == "k1", "8 个线程报同一个 key，只能前进一格"
+    assert pool.exhausted_count() == 1
+
+
+def test_request_switches_key_on_quota_and_succeeds(sandbox, monkeypatch):
+    """🔑 第一个 key 撞额度时应换人重试，而不是让整批停摆。"""
+    monkeypatch.setattr(f, "key_pool", f.KeyPool(["k1", "k2"]))
+    monkeypatch.setattr(f, "stop_fetching", threading.Event())
+    used = []
+
+    def fake_retry(method, url, params=None, **kwargs):
+        used.append(params["api_key"])
+        if params["api_key"] == "k1":
+            raise f.QuotaExhausted("k1 用尽", reset_at="2026-09-13T00:00:00Z")
+        return "OK"
+
+    monkeypatch.setattr(f, "request_with_retry", fake_retry)
+    assert f.request_with_keys("GET", "https://x") == "OK"
+    assert used == ["k1", "k2"]
+    assert not f.stop_fetching.is_set(), "还有 key 可用时不该落闸"
+
+
+def test_stop_only_after_every_key_is_exhausted(sandbox, monkeypatch):
+    """只有**所有** key 都用尽才落全局闸门 —— 这是与单 key 时代的关键差别。"""
+    monkeypatch.setattr(f, "key_pool", f.KeyPool(["k1", "k2", "k3"]))
+    monkeypatch.setattr(f, "stop_fetching", threading.Event())
+    monkeypatch.setattr(f, "stop_reason", {})
+    used = []
+
+    def always_exhausted(method, url, params=None, **kwargs):
+        used.append(params["api_key"])
+        raise f.QuotaExhausted("用尽")
+
+    monkeypatch.setattr(f, "request_with_retry", always_exhausted)
+    with pytest.raises(f.QuotaExhausted):
+        f.request_with_keys("GET", "https://x")
+
+    assert used == ["k1", "k2", "k3"], "每个 key 都要真正试过一次"
+    assert f.stop_fetching.is_set()
+    assert f.stop_reason["status"] == "quota_exhausted"
+
+
+def test_throttled_key_is_also_rotated(sandbox, monkeypatch):
+    """被限流的 key 同样换人：对这个 key 而言已经没法继续了。"""
+    monkeypatch.setattr(f, "key_pool", f.KeyPool(["k1", "k2"]))
+    monkeypatch.setattr(f, "stop_fetching", threading.Event())
+
+    def fake_retry(method, url, params=None, **kwargs):
+        if params["api_key"] == "k1":
+            raise f.SearchThrottled("429")
+        return "OK"
+
+    monkeypatch.setattr(f, "request_with_retry", fake_retry)
+    assert f.request_with_keys("GET", "https://x") == "OK"
+
+
+def test_finish_message_differs_from_quota_exhausted_message(
+    sandbox, monkeypatch, capsys
+):
+    """🔑 "跑完了"与"没额度了"必须说得明显不同。
+
+    两者的下一步完全相反：前者无需再跑，后者明天还得来。
+    混为一谈的话，用户看完日志不知道到底还要不要再来一趟。
+    """
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "1", "title": "A", "year": 2000},
+    ])
+    monkeypatch.setattr(f, "download_one", lambda e: (e["tmdbId"], {
+        "status": "ok", "saved": ["en.srt"], "missing": [],
+    }))
+    f.main()
+
+    out = capsys.readouterr().out
+    assert "全部待补影片已处理完毕" in out
+    assert "无需今天再跑" in out
+    assert "因配额耗尽而中断" not in out
+
+
+def test_finish_message_still_reports_keys_burned_along_the_way(
+    sandbox, monkeypatch, capsys
+):
+    """跑完了 ≠ 一路顺风：中途烧掉的 key 要如实说。
+
+    真机实测出过这个假象：日志里明明有一次 key 耗尽切换，收尾却报
+    "没有触发任何配额限制"。用户据此会以为 key 够用，实际已经烧掉一个了。
+    """
+    monkeypatch.setattr(f, "SUBDL_API_KEYS", ["k1", "k2"])
+    pool = f.KeyPool(["k1", "k2"])
+    pool.retire("k1", "quota")          # 模拟中途烧掉一个
+    monkeypatch.setattr(f, "key_pool", pool)
+    monkeypatch.setattr(f, "load_entries", lambda: [
+        {"tmdbId": "1", "title": "A", "year": 2000},
+    ])
+    monkeypatch.setattr(f, "download_one", lambda e: (e["tmdbId"], {
+        "status": "ok", "saved": ["en.srt"], "missing": [],
+    }))
+    f.main()
+
+    out = capsys.readouterr().out
+    assert "全部待补影片已处理完毕" in out
+    assert "期间用尽了 1/2 个" in out
+    assert "未触发任何配额限制" not in out, "烧掉了 key 就不能说没触发限制"
+
+
+# ===================================== meta.json 乐观锁（与下载侧并行的前提）
+# 本函数是"读-改-写"，下载侧上传成品时会整份覆盖同一个 key。裸写的时序：
+#   本进程 get(v1) -> 下载侧 put(v2) -> 本进程 put(v1+字幕)   ← v2 被静默吃掉
+# 带 If-Match 就能发现冲突并重读重试。
+
+def test_meta_update_sends_if_match(remote_sandbox):
+    """必须带上读取时拿到的 ETag，否则乐观锁形同虚设。"""
+    remote_sandbox.meta = {"tmdbId": "55"}
+    captured = {}
+    original = remote_sandbox.put_object
+
+    def spy(Bucket=None, Key=None, Body=None, **kwargs):
+        captured.update(kwargs)
+        return original(Bucket=Bucket, Key=Key, Body=Body, **kwargs)
+
+    remote_sandbox.put_object = spy
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) is True
+    assert captured.get("IfMatch") == '"v1"'
+
+
+def test_meta_update_retries_and_preserves_concurrent_change(remote_sandbox):
+    """🔑 下载侧在我们读完之后改了 meta —— 它的改动一个字段都不能丢。"""
+    remote_sandbox.meta = {"tmdbId": "55", "title": "旧"}
+    state = {"done": False}
+
+    def downloader_writes(stub):
+        # 只在第一次 get 之后插一刀，模拟下载侧刚好此时覆盖了 meta.json
+        if state["done"]:
+            return
+        state["done"] = True
+        stub.meta = {"tmdbId": "55", "title": "旧", "posterPath": "/p.jpg"}
+        stub.etag = '"v2"'
+
+    remote_sandbox.on_get = downloader_writes
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) is True
+
+    assert remote_sandbox.conflicts == 1, "第一次写应当被 412 挡下"
+    assert remote_sandbox.get_calls == 2, "冲突后必须重读"
+    final = remote_sandbox.meta
+    assert final["posterPath"] == "/p.jpg", "下载侧写的字段不能被覆盖掉"
+    assert [e["path"] for e in final["subtitles"]] == ["subs/en.srt"]
+
+
+def test_meta_update_gives_up_after_repeated_conflicts(remote_sandbox, capsys):
+    """一直冲突时要有尽头，且字幕本身仍算上传成功。"""
+    remote_sandbox.meta = {"tmdbId": "55"}
+
+    def always_change(stub):
+        stub.etag = f'"v{stub.get_calls + 100}"'   # 每次读完就变，必然冲突
+
+    remote_sandbox.on_get = always_change
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) is False
+    assert remote_sandbox.conflicts == f.META_UPDATE_RETRIES
+    assert "字幕已上传" in capsys.readouterr().out
+
+
+def test_meta_update_does_not_retry_on_non_412(remote_sandbox, capsys):
+    """非 412 的失败重试多少次都一样，当场放弃比空转三轮更诚实。"""
+    remote_sandbox.meta = {"tmdbId": "55"}
+
+    def boom(**_kwargs):
+        raise RuntimeError("AccessDenied")
+
+    remote_sandbox.put_object = boom
+    assert f._update_remote_meta("55", 2000, ["en.srt"]) is False
+    assert remote_sandbox.get_calls == 1, "不该重读"
+
+
+@pytest.mark.parametrize("exc,expected", [
+    (_PreconditionFailed(), True),
+    (RuntimeError("boom"), False),
+])
+def test_precondition_detector(exc, expected):
+    assert f._is_precondition_failed(exc) is expected
