@@ -389,12 +389,15 @@ def load_seasons_cache(cache_file):
     return cache
 
 
-def expand_seasons(ids, cache_file, fail_file, dead_shows, refresh_ongoing=False):
+def expand_seasons(ids, cache_file, fail_file, dead_shows, refresh_ongoing=False,
+                   stop_event=None):
     """
     对 ids 中尚未缓存的剧并发调 TMDB 展开季集，追加写入 cache_file。
     TMDB 404 的剧写 fail_file（tid\\t-\\t-）并加入 dead_shows。
     refresh_ongoing=True 时，缓存中 ended 非 True 的剧（在播 / 旧格式缺 ended 字段）也重新展开，
     以追加新行覆盖旧行（load_seasons_cache 同 tmdbId 取最后一行），捞回新播出的集。
+    stop_event（可选，pipeline 模式用）：置位后不再展开新的剧，已在跑的自然结束。
+    全量首跑要展开近 10 万部（约 2.5 小时），没有它的话 Ctrl+C 要等到展开跑完。
     返回 {tid: cache_entry}。
     """
     cache = load_seasons_cache(cache_file)
@@ -417,6 +420,10 @@ def expand_seasons(ids, cache_file, fail_file, dead_shows, refresh_ongoing=False
     done = 0
 
     def one(tid):
+        # 停止信号已置位：不再打 TMDB。返回"未展开"，该剧下次运行再试
+        # （不写缓存也不判死，与瞬时错误同口径）。
+        if stop_event is not None and stop_event.is_set():
+            return tid, None, "stopped"
         try:
             return tid, fetch_seasons_from_tmdb(tid), None
         except TmdbNotFound:
@@ -445,6 +452,8 @@ def expand_seasons(ids, cache_file, fail_file, dead_shows, refresh_ongoing=False
                     with open(fail_file, "a", encoding="utf-8") as f:
                         f.write(f"{tid}\t-\t-\n")
                     print(f"[tmdb] {done}/{len(todo)} {tid} TMDB 404，整部剧跳过")
+                elif err == "stopped":
+                    pass   # 停止信号下的静默跳过，不刷屏
                 else:
                     # 瞬时错误：本次不缓存也不判死，下次运行再试
                     print(f"[tmdb] {done}/{len(todo)} {tid} 展开失败（下次再试）: {err}")
@@ -971,11 +980,26 @@ def _rollback_fail_tail(fail_file, items):
     return True
 
 
-def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True):
+def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
+              on_result=None, stop_event=None):
     """并发处理一批集，实时落盘 ok/dead，返回本批“瞬时耗尽”待重跑的三元组列表。
     write_dead=False（--recheck-dead 模式）：仍无源的集不再重复写 fail.txt（旧行已在），且不启用熔断。
     熔断：连续 DEAD_STREAK_BREAKER 集 dead（无任何成功间隔）→ 持锁暂停全员，复探金丝雀；
-    金丝雀存活或无法判断则清零继续，明确失败则回滚窗口内 fail 行并抛 DeadStreakBreaker。"""
+    金丝雀存活或无法判断则清零继续，明确失败则回滚窗口内 fail 行并抛 DeadStreakBreaker。
+
+    on_result（可选，pipeline 模式用）：取到一条 ok 结果时回调一次，让下游
+    （下载侧）立刻拿到这一集，而不必等整轮跑完再读文件。
+      - 落盘照旧：回调只是"额外的快车道"，results_file 一行不少，
+        故断点续跑 / fetched_at 择新 / --recheck-dead 全部不受影响；
+      - **在写盘锁之外调用**，故允许阻塞（pipeline 的队列满时正是靠它形成反压）；
+        放在锁内会让一条的等待堵死其余所有取流线程，反压就变成了冻结；
+      - 回调抛异常不得影响取流：已落盘的结果不能因为下游出问题而白费。
+
+    stop_event（可选，pipeline 模式用）：协作式停止信号。置位后：
+      - 尚未开跑的集直接跳过（不再消耗代理流量），按 retry 收集；
+      - 已在跑的那一集仍会跑完（HTTP 请求本身无法中途取消），结果照常落盘。
+    没有它的话，pipeline 被 Ctrl+C 时取流线程会把整批几百万集跑完才罢休。
+    """
     lock = threading.Lock()
     ok_count = 0
     dead_count = 0
@@ -988,6 +1012,12 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True)
     def process_one(item):
         nonlocal tripped
         tid, s, e = item
+        # 停止信号已置位：不再开新的取流请求。按 retry 收集而非 dead——
+        # 这些集从未被判过无源，绝不能写进 fail.txt 被永久排除。
+        if stop_event is not None and stop_event.is_set():
+            with lock:
+                retry_items.append(item)
+            return "skipped"
         status, result = process_episode(tid, s, e)
         label = _ep_label(tid, s, e)
         with lock:
@@ -1026,6 +1056,16 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True)
                         print("  [熔断] 金丝雀存活，上游正常，这段剧为真无源，继续。\n" if verdict else
                               "  [熔断] 金丝雀结果无法判断，放行继续。\n")
                         dead_streak.clear()
+        # ⚠️ 回调必须在**锁外**执行：它可能阻塞（pipeline 模式下队列满时要等
+        # 下载侧腾出空位，最长可达数分钟）。若放在临界区内，这一条的等待会把
+        # 其余 max_workers-1 个取流线程全堵在 lock 上，整批取流吞吐直接归零——
+        # 反压本意是"降速"，绝不该变成"冻结"。
+        # 落盘已在锁内完成，故此处失败也不丢数据。
+        if status == "ok" and result and on_result is not None:
+            try:
+                on_result(result)
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️  on_result 回调失败（结果已落盘，不影响取流）: {exc}")
         return status
 
     executor = ThreadPoolExecutor(max_workers=max_workers)
@@ -1037,7 +1077,9 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True)
                 status = future.result()
                 if status == "ok":
                     ok_count += 1
-                elif status == "retry":
+                elif status in ("retry", "skipped"):
+                    # skipped = 停止信号置位后未开跑的集，已按 retry 收集，
+                    # 既不算成功也不算无源。
                     pass
                 else:
                     dead_count += 1
@@ -1076,7 +1118,16 @@ def _parse_args(argv):
     return parser.parse_args(argv)
 
 
-def main(argv=None):
+def main(argv=None, on_result=None, stop_event=None):
+    """取流主流程。
+
+    on_result（可选）：pipeline 模式下把每条 ok 结果实时推给下游（下载侧），
+    而不必等整轮跑完再读 results.jsonl。落盘行为完全不变，回调只是快车道。
+
+    stop_event（可选）：pipeline 模式下的协作式停止信号，让取流能在下载侧
+    收工 / 用户 Ctrl+C 后及时停下，而不是把整批几百万集跑完才罢休。
+    置位后：不开新一轮、不发起新请求、季集展开与轮间退避立即醒来。
+    """
     global ACTIVE_PROVIDERS
     args = _parse_args([] if argv is None else argv)
     if args.providers:
@@ -1103,8 +1154,15 @@ def main(argv=None):
     processed, dead_shows = load_processed(results_file, fail_file)
 
     # ---- 第一步：TMDB 展开季集结构（带缓存）----
+    # ⚠️ pipeline 模式下这一步**不产出任何取流结果**：全新部署、缓存为空时，
+    # 9.7 万部剧要展开约 2.5 小时，期间下载侧会一直拿到 "wait"（它会按
+    # stream_idle_poll_seconds 让出 CPU，不空烧）。续跑时缓存已在，只需几十秒。
     cache = expand_seasons(ids, cache_file, fail_file, dead_shows,
-                           refresh_ongoing=args.refresh_ongoing)
+                           refresh_ongoing=args.refresh_ongoing,
+                           stop_event=stop_event)
+    if stop_event is not None and stop_event.is_set():
+        print("\n==> 收到停止信号，取流在季集展开阶段退出（缓存已落盘，下次续跑）。")
+        return
 
     # ---- 第二步：按 ids.txt 顺序展开成 (tid, season, episode) 任务，剔除已处理 ----
     to_process = []
@@ -1165,6 +1223,10 @@ def main(argv=None):
     pending = to_process
     round_no = 0
     while pending:
+        # 停止信号：不再开新一轮。未结算的集没写任何文件，下次运行自动续跑。
+        if stop_event is not None and stop_event.is_set():
+            print(f"\n==> 收到停止信号，取流不再开新一轮（剩余 {len(pending)} 集留待下次运行）。")
+            break
         round_no += 1
         print(f"\n{'=' * 70}")
         print(f"==> 第 {round_no}/{max_rounds} 轮 | 待处理 {len(pending)} 集")
@@ -1172,7 +1234,8 @@ def main(argv=None):
 
         try:
             retry_items = run_batch(pending, results_file, fail_file, max_workers,
-                                    write_dead=not args.recheck_dead)
+                                    write_dead=not args.recheck_dead,
+                                    on_result=on_result, stop_event=stop_event)
         except DeadStreakBreaker as e:
             print(f"\n{'!' * 70}\n==> 熔断退出：{e}\n"
                   f"    本窗口的 fail 行已回滚，其余未结算的集下次运行自动续跑；"
@@ -1181,6 +1244,11 @@ def main(argv=None):
 
         if not retry_items:
             print("\n==> 瞬时失败已清零，所有有源集已捞干净，正常结束。")
+            break
+        if stop_event is not None and stop_event.is_set():
+            # 本轮是被停止信号提前截断的：retry_items 里多半是"未开跑"的集，
+            # 它们从未被真正尝试过，绝不能当成"重试耗尽"写进 fail.txt。
+            print(f"\n==> 收到停止信号，本轮剩余 {len(retry_items)} 集留待下次运行。")
             break
         if round_no >= max_rounds:
             # 第 4 列标记：这些集只是“重试耗尽”而非真无源，load_processed 不会把它们当作已处理，
@@ -1210,7 +1278,14 @@ def main(argv=None):
                   f"疑似代理/源站故障，等待 {wait}s 后再试。")
         else:
             print(f"\n==> 本轮剩余 {len(retry_items)} 集瞬时失败，等待 {wait}s 后进入下一轮。")
-        time.sleep(wait)
+        # 用 stop_event.wait 代替 sleep：退避最长 300s，Ctrl+C 后干等这么久
+        # 会让 pipeline 的 shutdown 白白超时。置位即立刻醒来。
+        if stop_event is not None:
+            if stop_event.wait(wait):
+                print("\n==> 退避期间收到停止信号，取流提前收尾。")
+                break
+        else:
+            time.sleep(wait)
         pending = retry_items
 
     print(f"\nAll done. 共跑 {round_no} 轮，结果已合并写入 {results_file}")

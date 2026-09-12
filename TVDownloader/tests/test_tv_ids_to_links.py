@@ -1150,7 +1150,7 @@ def test_main_expands_and_backfills_year(tmp_path, monkeypatch):
     monkeypatch.setattr(m.time, "sleep", lambda s: sleeps.append(s))
     seen = []
 
-    def fake_batch(pending, rf, ff, mw, write_dead=True):
+    def fake_batch(pending, rf, ff, mw, write_dead=True, **kw):
         assert write_dead is True
         seen.append(list(pending))
         return [] if len(seen) > 1 else [pending[-1]]
@@ -1158,7 +1158,8 @@ def test_main_expands_and_backfills_year(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "run_batch", fake_batch)
     m.main()
 
-    assert expand_kw == [{"refresh_ongoing": False}]   # 不传参数默认不刷新
+    # 不传参数默认不刷新；stop_event 恒传（单独跑时为 None）
+    assert expand_kw == [{"refresh_ongoing": False, "stop_event": None}]
     assert names == {"1": "Show One"}                  # 缓存 name 进入 title 回退表
     assert seen[0] == [("1", 1, 2), ("2", 0, 1)]
     assert seen[1] == [("2", 0, 1)]
@@ -1201,7 +1202,7 @@ def test_main_refresh_ongoing_flag_passthrough(tmp_path, monkeypatch):
     kws = []
     monkeypatch.setattr(m, "expand_seasons", lambda *a, **kw: (kws.append(kw), {})[1])
     m.main(["--refresh-ongoing"])
-    assert kws == [{"refresh_ongoing": True}]
+    assert kws == [{"refresh_ongoing": True, "stop_event": None}]
     with pytest.raises(SystemExit):
         m.main(["--bogus"])
 
@@ -1296,7 +1297,7 @@ def test_main_recheck_dead_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "_TMDB_NAMES", names)
     calls = []
 
-    def fake_batch(pending, rf, ff, mw, write_dead=True):
+    def fake_batch(pending, rf, ff, mw, write_dead=True, **kw):
         calls.append((list(pending), write_dead))
         return []
 

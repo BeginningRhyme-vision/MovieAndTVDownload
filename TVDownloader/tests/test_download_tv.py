@@ -1587,6 +1587,101 @@ def test_run_pipeline_batches_download_submissions(sandbox, monkeypatch):
     assert len(failed) == 20 and all(r["stage"] == "download" for r in failed)
 
 
+# ------------------------------------------------ 流式来源（pipeline 模式）
+def test_list_entry_source_is_three_state():
+    """list 来源永不返回 wait —— 它的存货是确定的。"""
+    source = d.ListEntrySource([{"tmdbId": "1"}, {"tmdbId": "2"}])
+    assert len(source) == 2
+    assert source.poll() == ("item", {"tmdbId": "1"})
+    assert source.poll() == ("item", {"tmdbId": "2"})
+    assert source.poll() == ("done", None)
+    # 耗尽后必须稳定返回 done（主循环会重复问）
+    assert source.poll() == ("done", None)
+
+
+def test_missing_input_exits_in_standalone_but_continues_when_streaming(
+    sandbox, monkeypatch, capsys,
+):
+    """results.jsonl 缺失在两种模式下含义完全不同。
+
+    单独跑下载：它是唯一片源，没有就无事可做。
+    pipeline 模式：全新部署时它本来就还不存在（TV 侧还要先展开季集才会写出
+    第一条），此时若照旧 return，下载侧会在启动瞬间退出、整条流水线只剩取流
+    在跑——首次部署必现。
+    """
+    monkeypatch.setattr(d, "INPUT_JSONL", str(sandbox / "nope.jsonl"))
+    d._run_pipeline()
+    assert "找不到" in capsys.readouterr().out
+
+    # 装上流式来源钩子后，缺文件不再退出，而是等取流实时产出。
+    real = d.ListEntrySource
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
+
+    class _EmptyStream:
+        """立刻收工的流式来源：验的是"缺文件不退出"，不是投递本身。"""
+
+        def __init__(self, entries):
+            assert list(entries) == []      # 缺文件 -> 空存量
+
+        def poll(self):
+            return "done", None
+
+    monkeypatch.setattr(d, "ListEntrySource", _EmptyStream)
+    try:
+        d._run_pipeline()
+    finally:
+        monkeypatch.setattr(d, "ListEntrySource", real)
+    assert "等待取流侧实时产出" in capsys.readouterr().out
+
+
+def test_streaming_source_wait_does_not_block_the_main_loop(sandbox, monkeypatch):
+    """来源返回 wait 时主循环必须继续推进在途任务，而不是原地卡住。
+
+    这是 TV 侧季集展开阶段（全新部署约 2.5 小时无产出）的常态：
+    poll 一直 wait，此刻 pending 为空，主循环靠 STREAM_IDLE_POLL_SECONDS
+    让出 CPU 后重新问来源要货；若写成 wait(空集合) 就是 100% CPU 空转。
+    """
+    monkeypatch.setattr(d, "INPUT_JSONL", str(sandbox / "nope.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
+
+    seen = []
+
+    class _SlowStream:
+        """前 3 次 wait（模拟展开阶段），然后出一集，再收工。"""
+
+        def __init__(self, entries):
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            if self.calls <= 3:
+                return "wait", None
+            if self.calls == 4:
+                return "item", {
+                    "tmdbId": "1", "season": 1, "episode": 1, "urls": ["u"],
+                }
+            return "done", None
+
+    monkeypatch.setattr(d, "ListEntrySource", _SlowStream)
+    monkeypatch.setattr(d, "process_one_entry", lambda entry, processed: (
+        seen.append(d.record_episode_key(entry)),
+        (d.record_episode_key(entry), False,
+         {"error": "没有找到媒体播放列表", "retriable": False}),
+    )[1])
+
+    d._run_pipeline()
+    # wait 没有让主循环卡死，后到的那一集仍被消费
+    assert seen == ["1_S01E01"]
+
+
 def test_run_pipeline_retries_only_retriable_entries(sandbox, monkeypatch):
     """分批投递不影响多轮语义：只有可重试的失败才进下一轮。"""
     entries = [
