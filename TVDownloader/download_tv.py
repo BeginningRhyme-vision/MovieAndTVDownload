@@ -9,6 +9,7 @@ import math
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -80,7 +81,15 @@ _MULTI_ROUND_CFG = _CFG.get("multi_round", {}) or {}
 MULTI_ROUND_ENABLED = _MULTI_ROUND_CFG.get("enabled", False)
 # 最大轮次至少为 1（含第一轮）；关闭多轮时强制 1 轮。
 MAX_ROUNDS = max(1, int(_MULTI_ROUND_CFG.get("max_rounds", 1))) if MULTI_ROUND_ENABLED else 1
-ROUND_COOLDOWN_SECONDS = max(0, int(_MULTI_ROUND_CFG.get("cooldown_seconds", 300)))
+# 轮次间冷却：只为源站的**短时**抖动留恢复窗口。原设 300s 是按"等风控解除"
+# 定的，电影侧 200 部实跑证伪了该前提（403/429 零触发，502 才是主因，而 502
+# 是源站容量问题、冷却再久也不解决），TV 侧同步降到 60s 对齐。
+# ⚠️ TV 侧刻意**不设**"源站回源故障长冷却分档"（电影侧的
+# SOURCE_OUTAGE_COOLDOWN_SECONDS）：那套机制在电影侧已被实测推翻并默认关闭
+# （1800s 既跨不过小时级的故障窗口、又比短档多烧 29 分钟，一轮只救回 2 部）。
+# 这类失败交由跨运行重试兜底——failed 的集下次运行本就会自动重投（本脚本只按
+# success 跳过），那时往往已过数小时，恰好落在源站真正恢复的窗口里。
+ROUND_COOLDOWN_SECONDS = max(0, int(_MULTI_ROUND_CFG.get("cooldown_seconds", 60)))
 # 两个独立的下载态状态文件（区别于 SUCCESS_LOG/FAILED_LOG）。
 DOWNLOAD_OK_LOG = resolve_file(_CFG.get("download_ok_log"), "download_ok.jsonl")
 DOWNLOAD_FAIL_LOG = resolve_file(_CFG.get("download_fail_log"), "download_fail.jsonl")
@@ -140,6 +149,23 @@ TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
 SAMPLE_COUNT = int(_CFG.get("sample_count", 10))
 SEG_RETRY_MAX = int(_CFG.get("seg_retry_max", 20))
 SEG_RETRY_DELAY = float(_CFG.get("seg_retry_delay", 1))
+# 采样阶段的分片重试预算，与正片**分层**。
+#
+# 采样只是为了测码率/分辨率来决定"这条候选流要不要"，探不到就换下一条流即可，
+# 完全不必按正片那套死磕：正片是"这一集最后的希望"，采样是"四选一里的一个"。
+# 共用 SEG_RETRY_MAX=20 的后果（电影侧实跑实测）：源站持续吐 400/502 时，
+# 单条流采样要耗 35 分钟，10 部片在采样阶段空转 90 分钟仍无结论。
+#
+# TV 侧的放大效应更大：一部剧几十上百集，每集 vidup master 有 1080/720/480/360
+# 四档候选流，这个损失要乘以集数。**它占死的是下载窗口，本可成功的集会被饿死**，
+# 直接触及"不得降低下载成功率"这根红线。
+#
+# 取 3 而非电影侧的 5：电影侧把 L1(urllib3) 的 status_forcelist 清空了，单次
+# 循环只发 1 个请求，故要靠循环次数补回容错；TV 侧 L1 仍保留 status_forcelist
+# （见 get_session），单次循环底下实际有 3 个请求，3 次循环 ≈ 9 个请求，
+# 与电影侧调整前等价，足以跨过源站几秒级抖动。
+# L3 退避 1+2+4 ≈ 7s，远低于正片那套（封顶 60s）。
+SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 3)))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
@@ -363,17 +389,38 @@ def disk_monitor_loop():
 def wait_for_disk_gate():
     """开新片前调用：磁盘吃紧时在此阻塞，直到放行或监控线程停止。
     只阻塞尚未开始的下载，不影响已在跑的任务。未开启兜底时立即返回。
+
+    收到进程级中断时立即返回：此刻再等磁盘放行毫无意义（任务马上就要收尾），
+    而 disk_monitor_stop 要到 main() 的 finally 才置位——那时主线程正等着
+    线程池收工，卡在这里的 worker 反而会把这个等待拖成死结。
+    返回后调用方会在下载入口处再判一次 interrupted，不会真的开下。
     """
     if not DISK_GUARD_ENABLED:
         return
     while not disk_gate.wait(timeout=DISK_CHECK_INTERVAL):
-        # 若监控线程已停止（主流程退出中），不再苦等，放行让任务自然收尾。
-        if disk_monitor_stop.is_set():
+        # 若监控线程已停止（主流程退出中）或收到中断，不再苦等，放行让任务自然收尾。
+        if disk_monitor_stop.is_set() or interrupted.is_set():
             return
 
 
 class UnsupportedPlaylistError(RuntimeError):
     """播放列表使用了当前手工分片下载器不支持的 HLS 功能。"""
+
+
+# ---- 进程级中断信号 ----
+# ⚠️ 为什么必须有它（电影侧服务器实跑踩到的坑，TV 侧同源）：分片重试是
+# `time.sleep(退避)` 的长循环，退避第 7 次起封顶 60s，单分片最多 20 次
+# （最坏 20×60s ≈ 20 分钟）。Ctrl+C 只会中断**主线程**，线程池里的 worker
+# 察觉不到，会各自把重试跑完才罢休。电影侧实测表现：中断统计都打印完了，
+# 进程却还挂着 31 个线程继续刷失败日志，`kill -INT` 形同虚设，只能 kill -9。
+#
+# ⚠️ 而 kill -9 会截断正在写的 results.jsonl / success.jsonl —— 断点续跑的
+# 账本被写坏，代价远不止"退出慢一点"。
+#
+# mp4 直链层早有同款机制（_download_mp4_chunk 的 abort_event），但那是**每集
+# 一个**的局部信号，只能在"这一集判失败"时打断自己；进程级中断需要这个全局的。
+# 两层并存不冲突：块层同时看 abort_event 与 interrupted，任一置位即放弃退避。
+interrupted = threading.Event()
 
 
 # 并发开大后用于观察是否被源站风控：统计 403/429/503 的出现次数。
@@ -1599,9 +1646,17 @@ def download_single_segment(url, index, retry_max, delay, headers=None):
     确定性失败（401/403/404/410/416，或源站返回 HTML/m3u8 而非视频数据）立即
     上抛、不再退避重试：这类结果重下必然复现，白等十几分钟只会占死下载窗口、
     延误换下一个取流节点。与 mp4 直链块层（_download_mp4_chunk）语义对齐。
+
+    全局 `interrupted` 置位（Ctrl+C / SIGTERM）时立即放弃：开跑前先看一眼，
+    退避也用 `interrupted.wait()` 而非裸 sleep。否则 Ctrl+C 后每个 worker 都
+    要把剩余重试跑完（最坏 20×60s），进程要拖十几分钟才退得掉——见该事件的注释。
     """
     last_error = None
     for attempt in range(1, retry_max + 1):
+        # 已中断：不再发起新请求。抛错让上层按"这一分片失败"处理，
+        # 整集随之失败并被记为可重试，下次运行重下即可。
+        if interrupted.is_set():
+            raise RuntimeError(f"分片 {index + 1} 已取消（收到中断信号）")
         try:
             # 外层已经负责精确重试次数，因此这里关闭额外应用层重试。
             content = request_with_retry(
@@ -1627,7 +1682,11 @@ def download_single_segment(url, index, retry_max, delay, headers=None):
                 f"    分片 {index + 1} 下载失败 "
                 f"({attempt}/{retry_max}): {exc}; {wait:.1f}s 后重试"
             )
-            time.sleep(wait)
+            # 可打断的退避：中断信号一到立刻醒来，不必空等完这一轮。
+            if interrupted.wait(wait):
+                raise RuntimeError(
+                    f"分片 {index + 1} 已取消（收到中断信号）"
+                ) from exc
 
     raise RuntimeError(
         f"分片 {index + 1} 重试 {retry_max} 次后仍失败: {last_error}"
@@ -1643,6 +1702,7 @@ def download_segments(
     init_url=None,
     force_init=False,
     headers=None,
+    retry_max=None,
 ):
     """
     并发下载、按索引顺序写入分片。
@@ -1664,9 +1724,15 @@ def download_segments(
     init 段——否则 fMP4 中间采样片缺 moov，ffprobe 无法探测分辨率/编码。
     headers 为取流阶段记录的节点专属请求头，透传给每个分片请求；为空时用全局
     HEADERS（与旧版行为一致）。
+    retry_max 为单分片的重试预算，缺省取 SEG_RETRY_MAX（正片那套死磕）。
+    采样调用传 SAMPLE_SEG_RETRY_MAX：探不到就换下一条候选流，不该按正片死磕
+    （见该常量的注释——共用预算会把下载窗口占死，本可成功的集会被饿死）。
     """
     if end_idx is None:
         end_idx = len(segment_urls)
+
+    if retry_max is None:
+        retry_max = SEG_RETRY_MAX
 
     indices = list(range(start_idx, min(end_idx, len(segment_urls))))
     if not indices:
@@ -1683,9 +1749,11 @@ def download_segments(
         # fMP4 的 init 段携带 moov（编解码参数），必须位于所有媒体分片之前。
         # 正片拼接时只在 wb（start_idx==0）写一次；中间采样单独成文件时用
         # force_init 强制补写，保证该采样文件自身可被 ffprobe 探测。
+        # init 段同样用本次的 retry_max：采样阶段若在这里死磕 20 次，
+        # 分片层分层就白做了（fMP4 源每条候选流都要先过这一关）。
         if init_url and (mode == "wb" or force_init):
             init_data = download_single_segment(
-                init_url, -1, SEG_RETRY_MAX, SEG_RETRY_DELAY, headers
+                init_url, -1, retry_max, SEG_RETRY_DELAY, headers
             )
             output_file.write(init_data)
             init_bytes = len(init_data)
@@ -1709,7 +1777,7 @@ def download_segments(
                     download_single_segment,
                     segment_urls[index],
                     index,
-                    SEG_RETRY_MAX,
+                    retry_max,
                     SEG_RETRY_DELAY,
                     headers,
                 )
@@ -1920,14 +1988,27 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
     退避重试，立即抛错让工作线程尽快归还。否则同片其它块失败后，在跑的块仍会
     跑满 SEG_RETRY_MAX 次退避（最长可达十几分钟），占死下载槽位、拖慢换节点，
     直接损害整体下载成功率。
+
+    全局 `interrupted`（Ctrl+C / SIGTERM）与 abort_event 同权：任一置位即放弃。
+    前者是进程级"整个任务要停"，后者是集级"这一集不用救了"，两者都意味着
+    继续退避毫无意义。
     """
     last_error = None
     request_headers = dict(headers)
     request_headers["Range"] = f"bytes={start}-{end}"
     expected = end - start + 1
+
+    def _aborted():
+        return interrupted.is_set() or (
+            abort_event is not None and abort_event.is_set()
+        )
+
     for attempt in range(1, SEG_RETRY_MAX + 1):
-        if abort_event is not None and abort_event.is_set():
-            raise RuntimeError(f"直链块 {index + 1} 已随整片失败取消")
+        if _aborted():
+            raise RuntimeError(
+                f"直链块 {index + 1} 已取消"
+                f"（{'收到中断信号' if interrupted.is_set() else '整片已判失败'}）"
+            )
         try:
             session = get_session()
             merged = dict(HEADERS)
@@ -1966,7 +2047,7 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
                 # 抛出其它确定性状态码（如 401），同样不必退避重试。
                 or is_permanent_http_failure(exc)
                 or attempt == SEG_RETRY_MAX
-                or (abort_event is not None and abort_event.is_set())
+                or _aborted()
             ):
                 break
             wait = min(SEG_RETRY_DELAY * (2 ** (attempt - 1)), 60)
@@ -1975,12 +2056,15 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
                 f"    直链块 {index + 1} 下载失败 "
                 f"({attempt}/{SEG_RETRY_MAX}): {exc}; {wait:.1f}s 后重试"
             )
-            # 用 Event.wait 代替 sleep：整片一旦判失败可立刻醒来，不必空等完退避。
+            # 可打断的退避：整片判失败或收到进程级中断时立刻醒来，不空等完退避。
+            # ⚠️ 这里绝不能在 abort_event 为 None 时退化成裸 sleep —— 那样
+            # 单节点（无 abort_event）的集在 Ctrl+C 后仍会把退避走满。
+            # interrupted 是模块级的、永远存在，故直接用它兜底。
             if abort_event is not None:
                 if abort_event.wait(wait):
                     break
-            else:
-                time.sleep(wait)
+            elif interrupted.wait(wait):
+                break
     raise RuntimeError(
         f"直链块 {index + 1} 重试后仍失败: {last_error}"
     ) from last_error
@@ -2404,6 +2488,9 @@ def process_one_entry(entry, processed_ids):
                         # moov，否则 fMP4 采样片缺编解码参数导致 ffprobe 探测失败。
                         force_init=True,
                         headers=node_headers,
+                        # 采样探不到就换下一条候选流，别按正片那套死磕
+                        # （见 SAMPLE_SEG_RETRY_MAX 的注释）。
+                        retry_max=SAMPLE_SEG_RETRY_MAX,
                     )
                 )
                 sample_failed_set = set(sample_failed_indices)
@@ -2584,6 +2671,13 @@ def process_one_entry(entry, processed_ids):
         # 磁盘水位兜底：仅在此处（尚未开始任何下载动作前）阻塞。磁盘吃紧时新集
         # 在闸门前等待，不会占用 temp/带宽；已在跑的下载不受影响。
         wait_for_disk_gate()
+        # 中断后不再开新集：此刻开下只会在第一个分片上立刻取消、白占一次调度，
+        # 还会在 temp 留下待清理的残骸。判为可重试失败，下次运行照常重下。
+        # （wait_for_disk_gate 收到中断会提前返回，故这一判必须在它之后。）
+        if interrupted.is_set():
+            return normalized_id, False, {
+                "error": "已取消（收到中断信号）", "retriable": True,
+            }
         print(f"\n开始处理: {label} - {title}")
         os.makedirs(TEMP_DIR, exist_ok=True)
 
@@ -2909,8 +3003,45 @@ def preflight_check_ffmpeg():
     print("[ffmpeg 预检通过] ffmpeg 与 ffprobe 均已就绪", flush=True)
 
 
+def install_interrupt_handler():
+    """让 Ctrl+C / SIGTERM 置位全局 `interrupted`，把中断意图传达给工作线程。
+
+    ⚠️ 只靠 Python 默认的 KeyboardInterrupt 是不够的：它只打断**主线程**，
+    线程池里正在退避重试的分片 worker 毫不知情，会各自把重试跑完
+    （最坏 20×60s）。电影侧服务器实跑实测——中断统计都打印完了，进程还挂着
+    31 个线程继续刷失败日志，只能 kill -9；而 kill -9 会截断正在写的
+    results.jsonl / success.jsonl，把断点续跑的账本写坏。
+
+    首次收到信号：置位事件 + 恢复默认处理器，然后照常抛 KeyboardInterrupt 走
+    正常收尾（落盘、打统计、释放锁）。
+    再按一次 Ctrl+C 就是默认行为（立即终止），给"等不及了"留出硬退出的口子。
+
+    pipeline 模式下该处理器同样生效：`downloader.main()` 在主线程里跑，
+    取流线程则由 pipeline 的 stop_event 负责收尾，两条路径互不干扰。
+    """
+    def _handler(signum, _frame):
+        interrupted.set()
+        print(
+            f"\n⚠️ 收到信号 {signum}，正在停止所有下载线程"
+            f"（再按一次 Ctrl+C 可强制退出）...",
+            flush=True,
+        )
+        # 恢复默认：第二次信号直接杀进程，不再走优雅收尾。
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        raise KeyboardInterrupt()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _handler)
+        except ValueError:
+            # 非主线程注册会抛 ValueError（如被 import 进别的框架里跑），忽略即可。
+            pass
+
+
 def main():
     acquire_main_lock()
+    install_interrupt_handler()
     preflight_check_ffmpeg()
     if S3_ENABLED:
         preflight_check_s3()
@@ -3307,6 +3438,9 @@ def _run_pipeline():
             # 语义完全不变：本轮每一集仍会被逐一投递，且全部有结论后才进下一轮；
             # 附带收益是磁盘占用更平滑（未投递的集不占 temp）。
             source_exhausted = False
+            # 来源暂时没货（只有流式来源会出现）。它决定主循环的 wait 要不要
+            # 加超时：见下面循环里的说明。
+            source_waiting = False
             round_download_futures = set()
 
             def submit_downloads():
@@ -3316,7 +3450,9 @@ def _run_pipeline():
                 循环去推进在途的转封装/上传——绝不能在这里阻塞，否则已下载完的
                 集无人提交转封装、成品堆在 temp、上传信号量不释放。
                 """
-                nonlocal source_exhausted
+                nonlocal source_exhausted, source_waiting
+                # 每次投递重新判定：槽位填满或来源耗尽而返回时，"饿着"就不再成立。
+                source_waiting = False
                 while len(round_download_futures) < DOWNLOAD_QUEUE_DEPTH:
                     if source_exhausted:
                         return True
@@ -3325,6 +3461,7 @@ def _run_pipeline():
                         source_exhausted = True
                         return True
                     if state == "wait":
+                        source_waiting = True
                         return False
                     f = download_executor.submit(
                         process_one_entry, entry, processed_ids
@@ -3354,7 +3491,27 @@ def _run_pipeline():
                     time.sleep(STREAM_IDLE_POLL_SECONDS)
                     submit_downloads()
                     continue
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # 🔑 来源正饿着时必须定时醒来重问：「取流侧产出了新集」**不是
+                # future 完成事件**，无法唤醒 wait。若一直无超时阻塞，新集就得
+                # 干等到某个在途的转封装/上传恰好完成才被顺带发现——而在途的慢
+                # 任务恰恰是上传（一集几百 MB 传 R2），最坏要等上几分钟，期间
+                # 下载槽位全空着。
+                #
+                # 这等于制造了一个"假反压"：效果与反压相同（停止投递新集），
+                # 理由却完全不同 —— 取流饿着跟磁盘压力毫无关系。真正的反压有
+                # 三道闸门各司其职（DOWNLOAD_QUEUE_DEPTH / upload_semaphore /
+                # disk_gate），不需要也不应该靠"主循环恰好没醒"来间接限流。
+                #
+                # TV 侧取流是瓶颈（有源率个位数、每集要打多个 provider），
+                # "饿着"是常态而非边角场景，故这里的损失会被持续放大。
+                #
+                # 槽位已满或来源已耗尽时 source_waiting 为 False，保持无超时
+                # 阻塞，不做无谓唤醒；list 来源永不返回 wait，故单独跑下载时
+                # 该值恒为 False，行为与改动前完全一致。
+                timeout = STREAM_IDLE_POLL_SECONDS if source_waiting else None
+                done, _ = wait(
+                    pending, return_when=FIRST_COMPLETED, timeout=timeout
+                )
                 for future in done:
                     pending.discard(future)
                     round_download_futures.discard(future)
@@ -3389,7 +3546,10 @@ def _run_pipeline():
                 flush=True,
             )
             if ROUND_COOLDOWN_SECONDS > 0:
-                time.sleep(ROUND_COOLDOWN_SECONDS)
+                # 可打断的冷却：默认 300s，Ctrl+C 后干等这么久会让收尾看起来像卡死。
+                if interrupted.wait(ROUND_COOLDOWN_SECONDS):
+                    print("\n收到中断信号，不再进入下一轮。", flush=True)
+                    break
             current_batch = round_failed_retriable
             round_no += 1
 

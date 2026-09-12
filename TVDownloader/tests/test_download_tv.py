@@ -7,6 +7,8 @@ No network / ffmpeg / boto3 calls are made.
 
 import json
 import os
+import threading
+import time
 
 import pytest
 
@@ -16,6 +18,29 @@ import download_tv as d
 def _read_jsonl(path):
     with open(path, encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
+
+
+class _FakeInterrupt:
+    """替身中断事件：永不置位，但把每次退避时长记进 sink，供断言退避轮数。"""
+
+    def __init__(self, sink):
+        self.sink = sink
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout=None):
+        self.sink.append(timeout)
+        return False
+
+    def set(self):
+        raise AssertionError("测试替身不应被置位")
+
+
+def _always_set_event():
+    ev = threading.Event()
+    ev.set()
+    return ev
 
 
 @pytest.fixture
@@ -598,7 +623,8 @@ def test_process_one_entry_happy_path_builds_job(sandbox, monkeypatch):
     monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
 
     def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
-                      init_url=None, force_init=False, headers=None):
+                      init_url=None, force_init=False, headers=None,
+                      retry_max=None):
         if end_idx is None:
             end_idx = len(urls)
         n = end_idx - start_idx
@@ -650,7 +676,8 @@ def _z1_env(monkeypatch, variants):
     monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
 
     def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
-                      init_url=None, force_init=False, headers=None):
+                      init_url=None, force_init=False, headers=None,
+                      retry_max=None):
         if end_idx is None:
             end_idx = len(urls)
         n = end_idx - start_idx
@@ -660,6 +687,31 @@ def _z1_env(monkeypatch, variants):
 
     monkeypatch.setattr(d, "download_segments", fake_download)
     return sampled
+
+
+def test_sampling_uses_tiered_retry_budget(sandbox, monkeypatch):
+    """采样用 SAMPLE_SEG_RETRY_MAX，正片仍用 SEG_RETRY_MAX（默认值）。
+
+    采样只是为择优探码率，探不到就该快速换下一条候选流；正片才需要死磕。
+    两者共用同一个预算会让一条烂流把下载窗口占满，直接拖垮成功率。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    monkeypatch.setattr(d, "SAMPLE_SEG_RETRY_MAX", 3)
+    budgets = []
+    _z1_env(monkeypatch, [("1920x1080", "https://cdn/1080.m3u8", 5000.0)])
+    inner = d.download_segments
+
+    def spy(*args, **kwargs):
+        budgets.append(kwargs.get("retry_max"))
+        return inner(*args, **kwargs)
+
+    monkeypatch.setattr(d, "download_segments", spy)
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, _job = d.process_one_entry(entry, set())
+    assert ok is True
+    # 第一次是采样（分层预算），第二次是正片（None -> 回落 SEG_RETRY_MAX）
+    assert budgets == [3, None]
 
 
 def test_variant_sampling_stops_after_higher_stream_wins(sandbox, monkeypatch):
@@ -943,9 +995,12 @@ def test_download_single_segment_skips_retry_on_permanent_status(sandbox, monkey
 
 
 def test_download_single_segment_still_retries_transient(sandbox, monkeypatch):
-    """瞬时错误（503）仍要重试满次数——这才是重试真正能救回来的场景。"""
+    """瞬时错误（503）仍要重试满次数——这才是重试真正能救回来的场景。
+
+    退避走 `interrupted.wait()` 而非裸 sleep，所以这里桩掉整个事件来记录等待。
+    """
     sleeps = []
-    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(d, "interrupted", _FakeInterrupt(sleeps))
     calls = []
 
     def fake_request(method, url, **kwargs):
@@ -956,6 +1011,47 @@ def test_download_single_segment_still_retries_transient(sandbox, monkeypatch):
     with pytest.raises(RuntimeError):
         d.download_single_segment("u", 0, 3, 1)
     assert len(calls) == 3 and len(sleeps) == 2
+
+
+def test_download_single_segment_aborts_before_request_when_interrupted(
+    sandbox, monkeypatch
+):
+    """中断已置位：连第一个请求都不该发出去，直接上抛取消。"""
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 20)
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(url)
+        raise AssertionError("中断后不应再发请求")
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    monkeypatch.setattr(d, "interrupted", _always_set_event())
+    with pytest.raises(RuntimeError, match="已取消（收到中断信号）"):
+        d.download_single_segment("u", 0, 20, 1)
+    assert calls == []
+
+
+def test_download_single_segment_backoff_wakes_up_on_interrupt(
+    sandbox, monkeypatch
+):
+    """退避等待期间收到中断：立刻醒来放弃，不空等完整个退避窗口。"""
+    monkeypatch.setattr(d, "interrupted", threading.Event())
+    monkeypatch.setattr(d, "SEG_RETRY_DELAY", 30)
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append(url)
+        # 首次失败进入退避，退避中主动置位中断。
+        threading.Timer(0.05, d.interrupted.set).start()
+        raise d.requests.HTTPError("boom", response=_FakeResp(503))
+
+    monkeypatch.setattr(d, "request_with_retry", fake_request)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="已取消（收到中断信号）"):
+        d.download_single_segment("u", 0, 5, 30)
+    # 裸 sleep 的旧实现这里要等满 30s。
+    assert time.monotonic() - started < 5
+    assert len(calls) == 1
 
 
 def test_request_with_retry_short_circuits_permanent_status(monkeypatch):
@@ -1199,9 +1295,36 @@ def test_download_mp4_chunk_aborts_immediately_when_event_set(mp4_env, monkeypat
     session = _install_range_session(monkeypatch, b"", status=500)
     abort = threading.Event()
     abort.set()
-    with pytest.raises(RuntimeError, match="已随整片失败取消"):
+    with pytest.raises(RuntimeError, match="已取消（整片已判失败）"):
         d._download_mp4_chunk("u", {}, 0, 9, 0, abort)
     assert session.calls == []
+
+
+def test_download_mp4_chunk_aborts_immediately_when_interrupted(
+    mp4_env, monkeypatch
+):
+    """进程级中断置位：即便没有 abort_event，块层也要立刻放弃。"""
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "interrupted", _always_set_event())
+    session = _install_range_session(monkeypatch, b"", status=500)
+    with pytest.raises(RuntimeError, match="已取消（收到中断信号）"):
+        d._download_mp4_chunk("u", {}, 0, 9, 0)
+    assert session.calls == []
+
+
+def test_download_mp4_chunk_backoff_wakes_up_on_interrupt(mp4_env, monkeypatch):
+    """无 abort_event 时退避也必须可打断（不能退化成裸 sleep）。"""
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "SEG_RETRY_DELAY", 30)
+    monkeypatch.setattr(d, "interrupted", threading.Event())
+    session = _install_range_session(monkeypatch, b"", status=500)
+    threading.Timer(0.05, d.interrupted.set).start()
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="重试后仍失败"):
+        d._download_mp4_chunk("u", {}, 0, 9, 0)
+    # 裸 sleep 的旧实现这里要等满 30s。
+    assert time.monotonic() - started < 5
+    assert len(session.calls) == 1
 
 
 def test_download_mp4_chunk_abort_wakes_up_backoff(mp4_env, monkeypatch):
@@ -1680,6 +1803,93 @@ def test_streaming_source_wait_does_not_block_the_main_loop(sandbox, monkeypatch
     d._run_pipeline()
     # wait 没有让主循环卡死，后到的那一集仍被消费
     assert seen == ["1_S01E01"]
+
+
+def test_streaming_new_entry_is_picked_up_while_a_slow_task_is_inflight(
+    sandbox, monkeypatch,
+):
+    """🔑 来源饿着时，新集不能干等在途慢任务完成才被投递。
+
+    「取流侧产出了新集」不是 future 完成事件，无法唤醒 wait(FIRST_COMPLETED)。
+    若 wait 无超时，新集就要等某个在途的转封装/上传恰好完成才被顺带发现——
+    在途的慢任务恰恰是上传（一集几百 MB 传 R2），最坏几分钟，期间下载槽位全空。
+
+    这构成"假反压"：效果与反压相同却与磁盘压力无关。TV 侧取流是瓶颈，
+    "饿着"是常态，损失会被持续放大。
+
+    本例：投出一个 3 秒的在途任务后来源持续 wait，**0.5 秒后**才放出第二集
+    （用定时器延后，确保主循环此时已经真正阻塞在 wait 上；若让工作线程立刻
+    放行，主线程会在同一次投递循环里就取走它，压根走不到 wait，测不出问题）。
+    测量"第二集被投递的时刻"而非总耗时——总耗时必然包含慢任务的 3s。
+    """
+    monkeypatch.setattr(d, "INPUT_JSONL", str(sandbox / "nope.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
+
+    released = threading.Event()
+    seen = []
+    slow_started_at = {}
+    fast_started_at = {}
+
+    class _StarvingStream:
+        """先出"慢任务"，随后持续 wait；0.5s 后才放出第二集。
+
+        第二集的可见时机与"在途任务完成"完全解耦，正好检验主循环是否靠超时
+        轮询主动发现它。
+        """
+
+        def __init__(self, entries):
+            self.sent_slow = False
+            self.sent_fast = False
+
+        def poll(self):
+            if not self.sent_slow:
+                self.sent_slow = True
+                return "item", {
+                    "tmdbId": "1", "season": 1, "episode": 1, "urls": ["slow"],
+                }
+            if not released.is_set():
+                return "wait", None       # 来源饿着
+            if not self.sent_fast:
+                self.sent_fast = True
+                return "item", {
+                    "tmdbId": "2", "season": 1, "episode": 1, "urls": ["fast"],
+                }
+            return "done", None
+
+    def fake_process(entry, processed):
+        key = d.record_episode_key(entry)
+        seen.append(key)
+        if entry["urls"] == ["slow"]:
+            # 模拟在途慢任务（上传一集大文件）：它完成前，新集不该被它拖着。
+            slow_started_at["t"] = time.time()
+            time.sleep(3)
+        else:
+            fast_started_at["t"] = time.time()
+        return key, False, {"error": "没有找到媒体播放列表", "retriable": False}
+
+    monkeypatch.setattr(d, "ListEntrySource", _StarvingStream)
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+
+    timer = threading.Timer(0.5, released.set)
+    timer.daemon = True
+    timer.start()
+    try:
+        d._run_pipeline()
+    finally:
+        timer.cancel()
+
+    assert seen == ["1_S01E01", "2_S01E01"]
+    # 关键断言：第二集应在它可取之后（慢任务开始 +0.5s）很快被投递，
+    # 而不是等慢任务跑完 3s。无超时的旧实现必然 ≈3s。
+    lag = fast_started_at["t"] - slow_started_at["t"]
+    assert lag < 1.5, (
+        f"新集在慢任务开始 {lag:.1f}s 后才被投递，"
+        f"说明 wait 没有按 source_waiting 加超时"
+    )
 
 
 def test_run_pipeline_retries_only_retriable_entries(sandbox, monkeypatch):

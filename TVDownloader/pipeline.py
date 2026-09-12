@@ -306,6 +306,10 @@ def main():
         print("\n\n⚠️ [pipeline] 收到中断信号，正在收尾...", flush=True)
     finally:
         downloader.ListEntrySource = real_list_source
+        # 到这里 downloader.main() 已返回（正常收尾或 Ctrl+C 后收尾完毕），
+        # 取流线程通常早已放完哨兵在待命态，shutdown 是瞬时的。
+        # 默认 30s 只是兜底：仅当取流正阻塞在满队列的 put 上才会用到，
+        # 而 shutdown 会排空队列主动解开它。
         worker.shutdown()
         # ⚠️ 收尾统计必须在 finally 里：Ctrl+C 时它才是最该被看到的东西
         # （跑了多久、取到多少、下了多少、有多少留给下次）。
