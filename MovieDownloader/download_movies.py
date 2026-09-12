@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import functools
 import hashlib
 import importlib
 import os
@@ -1400,14 +1401,19 @@ def merge_next_batch(round_failed_retriable, revived):
 # pipeline 模式下取流线程本就常驻，把请求丢给它即可，主循环一步都不阻塞。
 #
 # 约定（三个方法，都**不得阻塞**）：
-#   dispatch(entries)  -> 投递重取请求，立即返回
+#   dispatch(entries)  -> 投递重取请求，立即返回。可返回实际接收条数：同一 id
+#                         已在途时钩子会拒收（B-2，避免预检投一次、下载失败又投
+#                         一次白烧配额）；返回 0 表示全被合并进在途，调用方
+#                         不应再计入每片重取上限。返回 None 视为全部接收。
 #   collect()          -> 取走目前已完成的重取结果（entry 列表），没有就返回空
 #   pending_count()    -> 还有多少条在途（已投递但没出结果）
 #
 # ⚠️ 重取结果**不能走主队列回流**：主队列有哨兵语义，取流主任务一结束就被
 # 标记 done，之后推进去的东西再也取不出来（实测验证过），异步重取会形同虚设。
-# 故走这条独立通道，由轮次循环在每轮末尾 collect 后并入 next_batch——
-# 与同步路径的 revived 走完全相同的合并逻辑，语义一致。
+# 故走这条独立通道：首轮由 pipeline.QueueEntrySource 直接 collect 随到随投
+# （R-B，新链接在首轮内就被下载）；第 2 轮起来源是 list，由轮次循环在轮末
+# collect 后并入 next_batch——与同步路径的 revived 走完全相同的合并逻辑。
+# 投递时机：handle_done_future 发现直链过期即投（不攒到轮末），预检也是即投。
 async_refetch_hook = None
 
 # 本轮投出异步重取后，等待结果回来的上限（秒）。
@@ -1429,6 +1435,8 @@ def refetch_entries(entries, refetch_counts):
 
     - 新 urls 会**追加写入 INPUT_JSONL**：与取流侧的落盘行为一致，这样即使本次
       运行中途被中断，下次启动也能按 fetched_at 择新直接用上新链接，重取不白做。
+      超过 AUTO_REFETCH_TIMEOUT 仍没跑完的重取也一样：本轮不再等，但后台跑完
+      后若成功照样落盘（见 _persist_late_refetch），只是赶不上本轮重投。
     - refetch_counts 记录每部片已被重取几次，达 AUTO_REFETCH_MAX_PER_MOVIE 即
       不再重取（新链接同样可能在排队期间再过期，但必须有上限防空转）。
     - 取流侧任何异常都不得逃逸：重取是"锦上添花"的捞回，失败了退回原状即可，
@@ -1514,10 +1522,22 @@ def refetch_entries(entries, refetch_counts):
                     flush=True,
                 )
         except TimeoutError:
-            unfinished = sum(1 for f in future_to_entry if not f.done())
+            # 超时只是"本轮不再等"，不是"作废"。仍在跑的 future 已经把取流请求
+            # 发出去了，结果白丢很可惜：给它们挂完成回调，跑完后照样把成功结果
+            # 追加进 INPUT_JSONL，下次运行按 fetched_at 择新就能直接用上。
+            # 只给**此刻未完成**的挂回调：已在上面循环里收下的 future 不会重复落盘；
+            # 若 future 恰在超时与挂回调之间完成，add_done_callback 会当场同步调用，
+            # 同样不重不漏。
+            late = [f for f in future_to_entry if not f.done()]
+            for future in late:
+                future.add_done_callback(
+                    functools.partial(
+                        _persist_late_refetch, str(future_to_entry[future]["tmdbId"])
+                    )
+                )
             print(
-                f"⚠️ 重取已达 {AUTO_REFETCH_TIMEOUT}s 上限，放弃仍在跑的 "
-                f"{unfinished} 部（不是真淘汰，下次运行会再试），"
+                f"⚠️ 重取已达 {AUTO_REFETCH_TIMEOUT}s 上限，不再等待仍在跑的 "
+                f"{len(late)} 部（后台跑完后若成功仍会落盘，供下次运行使用），"
                 f"主循环继续推进下载。",
                 flush=True,
             )
@@ -1525,11 +1545,41 @@ def refetch_entries(entries, refetch_counts):
         executor.shutdown(wait=False, cancel_futures=True)
         raise
     # 超时放弃的 future 不等它跑完：wait=False 让主循环立刻回到 wait(pending)，
-    # 已提交的取流请求在后台线程里自然收尾。
+    # 已提交的取流请求在后台线程里自然收尾（成功结果由完成回调落盘）；
+    # 还没开跑的被 cancel，留给下次运行。
     executor.shutdown(wait=False, cancel_futures=True)
 
     print(f"[自动重取流] 完成：{len(revived)}/{len(pending)} 部拿到新直链", flush=True)
     return revived
+
+
+def _persist_late_refetch(tmdb_id, future):
+    """refetch_entries 超时后才跑完的重取：成功则落盘 INPUT_JSONL，供下次运行使用。
+
+    在 executor 的 worker 线程里执行（或被 cancel 时在主线程）。本轮主循环早已
+    离开 refetch_entries，这里不能再往 revived 里塞，唯一能做的就是把新链接
+    持久化，让"跨运行重试"接力。任何异常都不能逃逸——回调里抛错只会被
+    concurrent.futures 吞掉记日志，但没必要留这种噪音。
+    """
+    try:
+        if future.cancelled():
+            return
+        try:
+            status, result = future.result()
+        except (Exception, SystemExit) as exc:
+            print(f"  [重取失败·迟到] {tmdb_id}: {exc}", flush=True)
+            return
+        if status != "ok" or not result or not result.get("urls"):
+            print(f"  [重取无果·迟到] {tmdb_id}: {status}", flush=True)
+            return
+        write_log(INPUT_JSONL, result)
+        print(
+            f"  [重取成功·迟到] {tmdb_id}: {len(result['urls'])} 个新节点已落盘，"
+            f"下次运行可用",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"  [重取迟到落盘异常] {tmdb_id}: {exc}", flush=True)
 
 
 def is_stale_entry(entry, now=None):
@@ -1593,6 +1643,64 @@ def refresh_stale_entries(entries, refetch_counts):
         flush=True,
     )
     return refreshed
+
+
+def dispatch_stale_entries_async(entries, refetch_counts):
+    """pipeline 模式的启动预检：把陈旧条目**非阻塞**地投给 async_refetch_hook。
+
+    与 refresh_stale_entries 同一目的、不同手段：pipeline 的前提是主循环一步
+    都不阻塞，故不能同步等新链接回来。改为只投递、立即返回——旧链接照常进
+    首轮（它未必真失效），新链接由首轮来源（QueueEntrySource）随到随投：若对应
+    的旧存量条目还没发出则就地替换掉它，已发出/在下则等它离开处理态再投；
+    即使本次运行没赶上消费，AsyncRefetcher 也已把结果追加进 INPUT_JSONL，
+    下次运行按 fetched_at 择新直接用上。
+
+    为什么必须有这条路：pipeline 模式下 results.jsonl 里的存量片每次运行都
+    拿同一条旧 url 重投；取流线程只补 results.jsonl 里**没有**的 id，不会主动
+    换链接。而 mp4 直链 404/416、不支持 Range、长度不符这类"确定性但不挂
+    需重新取流 marker"的失败，也不进 download_dead —— 没有这条预检，
+    这些片会每次运行判死一遍、永远用不到新链接。
+
+    投递计入 refetch_counts（每片重取上限跨预检与轮次共用）。返回投递数。
+    """
+    hook = async_refetch_hook
+    if (
+        hook is None or not entries
+        or STALE_LINK_SECONDS <= 0 or not AUTO_REFETCH_ENABLED
+    ):
+        return 0
+
+    now = time.time()
+    to_dispatch = []
+    for entry in entries:
+        if not is_stale_entry(entry, now):
+            continue
+        tmdb_id = entry.get("tmdbId")
+        if tmdb_id is None:
+            continue
+        key = str(tmdb_id)
+        if refetch_counts.get(key, 0) >= AUTO_REFETCH_MAX_PER_MOVIE:
+            continue
+        refetch_counts[key] = refetch_counts.get(key, 0) + 1
+        to_dispatch.append(entry)
+    if not to_dispatch:
+        return 0
+
+    try:
+        hook.dispatch(to_dispatch)
+    except Exception as exc:  # noqa: BLE001
+        # 预检是锦上添花：投不出去就沿用旧链接，绝不影响首轮下载。
+        print(f"⚠️ 启动预检投递失败，沿用原直链继续: {exc}", flush=True)
+        return 0
+
+    hours = STALE_LINK_SECONDS / 3600
+    print(
+        f"\n[启动预检] {len(to_dispatch)}/{len(entries)} 部的直链已超过 "
+        f"{hours:.0f} 小时，已交给取流线程异步换新（不阻塞首轮下载；"
+        f"旧链接照常先试，新链接回收后并入下一轮或留待下次运行）。",
+        flush=True,
+    )
+    return len(to_dispatch)
 
 
 def update_success_log(tmdb_id, new_record):
@@ -4785,6 +4893,38 @@ def _run_pipeline(run_volume=None):
                 round_failed_retriable.append(entry)
             if should_refetch and round_failed_expired is not None:
                 round_failed_expired.append(entry)
+                # R-B：pipeline 模式下直链过期**发现即投递**，不攒到轮末。
+                # 首轮来源（QueueEntrySource）会直接消费重取结果，新链接在
+                # 首轮内就能下掉；攒到轮末再投则首轮只等 ASYNC_REFETCH_WAIT_SECONDS
+                # 便收尾，单片重取常常不止这么久，换回的新链接没有轮次去用。
+                # 末轮（且来源不再是队列）不投：拿到也没轮次消费，白耗取流配额。
+                if (
+                    streaming
+                    and async_refetch_hook is not None
+                    and AUTO_REFETCH_ENABLED
+                    and (round_no == 1 or round_no < MAX_ROUNDS)
+                ):
+                    key = str(tmdb_id) if tmdb_id is not None else None
+                    used = refetch_counts.get(key, 0) if key else AUTO_REFETCH_MAX_PER_MOVIE
+                    if key and used < AUTO_REFETCH_MAX_PER_MOVIE:
+                        try:
+                            accepted = async_refetch_hook.dispatch([entry])
+                            if accepted is not None and accepted <= 0:
+                                # 该片的重取仍在途（多半是预检投的那次还没回来），
+                                # 钩子已合并，不重复计额度。
+                                print(
+                                    f"  → 直链过期，该片重取仍在途，合并等待结果",
+                                    flush=True,
+                                )
+                            else:
+                                refetch_counts[key] = used + 1
+                                print(
+                                    f"  → 直链过期，已即刻投递异步重取"
+                                    f"（第 {used + 1}/{AUTO_REFETCH_MAX_PER_MOVIE} 次）",
+                                    flush=True,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"⚠️ 异步重取投递失败 {tmdb_id}: {exc}", flush=True)
             # 整节点采样全挂：本轮冷却要走长档（源站回源故障是小时级，
             # 60s 跨不过去）。只记一次标志，不关心具体是哪几部片。
             if (
@@ -4945,12 +5085,18 @@ def _run_pipeline(run_volume=None):
         # 那样写是恒 False 的死判据，pipeline 模式照样会进来。
         # 队列语义要到下面 ListEntrySource(current_batch) 那步才出现。
         #
-        # pipeline 模式不做预检的理由：它的整个前提是"主循环一步都不阻塞"
+        # pipeline 模式不能做同步预检：它的整个前提是"主循环一步都不阻塞"
         # （为此专门建了 AsyncRefetcher），而 refetch_entries 是同步的，
         # 最长能堵住 AUTO_REFETCH_TIMEOUT。此时取流线程已在灌队列，堵住主循环
         # 反而会让队列里的直链继续变旧——与本预检的目的正相反。
+        # 但也不能**不做**：存量片每次运行都拿同一条旧 url 重投，取流线程又
+        # 只补 results.jsonl 里没有的 id，那些"确定性失败却不挂需重新取流
+        # marker"的片（mp4 404/416、不支持 Range、长度不符）就永远换不到链接。
+        # 故改走非阻塞投递：旧链接照常先试，新链接由轮末 collect 并入下一轮。
         if not streaming:
             current_batch = refresh_stale_entries(current_batch, refetch_counts)
+        else:
+            dispatch_stale_entries_async(current_batch, refetch_counts)
         while True:
             # 每轮开头清空 download_fail 状态文件，只记录本轮下载失败。
             truncate_log(DOWNLOAD_FAIL_LOG)
@@ -5057,12 +5203,14 @@ def _run_pipeline(run_volume=None):
             # `tmdb_ids_to_links.py --refetch-failed` 后再重跑本脚本。
             #
             # 两条路径（互斥，由运行模式决定）：
-            #   - 异步（pipeline 模式）：dispatch 只投递、立即返回，主循环不阻塞；
-            #     结果由**下一轮**开头的 collect() 取回并入 next_batch。
+            #   - 异步（pipeline 模式）：过期片已在 handle_done_future 里**发现即投递**
+            #     （R-B）。首轮来源（QueueEntrySource）会随到随投、且在途归零前不
+            #     报 done，故首轮末这里通常无事可做；第 2 轮起来源是 list，不再
+            #     直接消费重取结果，改由这里等一等再 collect() 并入 next_batch。
             #   - 同步（只跑下载，无取流线程）：走原有的 refetch_entries 老路。
             revived = []
             if async_refetch_hook is not None:
-                # 先收上一轮（及更早）已完成的重取结果——它们是真正救回来的片，
+                # 先收已完成的重取结果——它们是真正救回来的片，
                 # 与同步路径的 revived 等价，走同一套 merge_next_batch 合并。
                 try:
                     revived = async_refetch_hook.collect()
@@ -5073,28 +5221,38 @@ def _run_pipeline(run_volume=None):
             if AUTO_REFETCH_ENABLED and round_failed_expired and has_more_rounds:
                 try:
                     if async_refetch_hook is not None:
-                        # 次数上限仍由这里把关：钩子只负责投递，不认识 refetch_counts。
-                        to_dispatch = []
-                        for entry in round_failed_expired:
-                            tid = entry.get("tmdbId")
-                            if tid is None:
-                                continue
-                            key = str(tid)
-                            if refetch_counts.get(key, 0) >= AUTO_REFETCH_MAX_PER_MOVIE:
-                                continue
-                            refetch_counts[key] = refetch_counts.get(key, 0) + 1
-                            to_dispatch.append(entry)
-                        if to_dispatch:
-                            async_refetch_hook.dispatch(to_dispatch)
+                        if not streaming:
+                            # 装了钩子却不是流式来源（正常部署不会出现）：
+                            # 没人在轮中投递，退回轮末集中投递。次数上限仍由
+                            # 这里把关：钩子只负责投递，不认识 refetch_counts。
+                            to_dispatch = []
+                            for entry in round_failed_expired:
+                                tid = entry.get("tmdbId")
+                                if tid is None:
+                                    continue
+                                key = str(tid)
+                                if refetch_counts.get(key, 0) >= AUTO_REFETCH_MAX_PER_MOVIE:
+                                    continue
+                                refetch_counts[key] = refetch_counts.get(key, 0) + 1
+                                to_dispatch.append(entry)
+                            if to_dispatch:
+                                async_refetch_hook.dispatch(to_dispatch)
+                                print(
+                                    f"\n[自动重取流] {len(to_dispatch)} 部因直链过期失败，"
+                                    f"已交给取流线程异步重取（不阻塞本轮下载）",
+                                    flush=True,
+                                )
+                        # 有在途就等一等再判 next_batch：dispatch 是异步的，
+                        # 立刻判会发现 next_batch 为空而 break，重取成功的新
+                        # 链接就没有任何轮次去消费（端到端实测复现过）。
+                        # 有上限、且在途清零就提前退出，不会白等满。
+                        if async_refetch_hook.pending_count() > 0:
                             print(
-                                f"\n[自动重取流] {len(to_dispatch)} 部因直链过期失败，"
-                                f"已交给取流线程异步重取（不阻塞本轮下载）",
+                                f"\n[自动重取流] 本轮 {len(round_failed_expired)} 部直链过期"
+                                f"已投异步重取，等待在途结果"
+                                f"（最多 {ASYNC_REFETCH_WAIT_SECONDS}s）...",
                                 flush=True,
                             )
-                            # 投完必须等一等再判 next_batch：dispatch 是异步的，
-                            # 立刻判会发现 next_batch 为空而 break，重取成功的新
-                            # 链接就没有任何轮次去消费（端到端实测复现过）。
-                            # 有上限、且一有结果就提前退出，不会白等满。
                             deadline = time.time() + ASYNC_REFETCH_WAIT_SECONDS
                             while time.time() < deadline:
                                 fresh = async_refetch_hook.collect()
@@ -5105,12 +5263,12 @@ def _run_pipeline(run_volume=None):
                                     revived.extend(async_refetch_hook.collect())
                                     break
                                 time.sleep(1)
-                            if revived:
-                                print(
-                                    f"[自动重取流] 收回 {len(revived)} 部新直链，"
-                                    f"并入下一轮",
-                                    flush=True,
-                                )
+                        if revived:
+                            print(
+                                f"[自动重取流] 收回 {len(revived)} 部新直链，"
+                                f"并入下一轮",
+                                flush=True,
+                            )
                     else:
                         revived = refetch_entries(round_failed_expired, refetch_counts)
                 except (Exception, SystemExit) as exc:
@@ -5137,7 +5295,8 @@ def _run_pipeline(run_volume=None):
                 expired_left = len(round_failed_expired)
                 expired_note = (
                     f"，本轮另有 {expired_left} 部直链过期已投异步重取"
-                    f"（结果下一轮回收；未赶上则由 results.jsonl 承接，下次运行再用）"
+                    f"（首轮随到随下、之后并入下一轮；未赶上则由 results.jsonl 承接，"
+                    f"下次运行再用）"
                     if expired_left > 0 else ""
                 )
             else:

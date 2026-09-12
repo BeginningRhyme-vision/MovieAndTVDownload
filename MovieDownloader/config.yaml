@@ -165,16 +165,8 @@ tmdb_ids_to_links:
   # 某轮"待重跑"占比 ≥90% 且数量 ≥50 时判定为基础设施故障，直接等满上限。
   round_backoff: 30
   round_backoff_max: 300
-  # ---- 最终捞回（跑满 max_rounds 后的加时赛）----
-  # 常规轮退避最长 round_backoff_max（300s），扛得住分钟级抖动；但"代理套餐额度
-  # 耗尽""enc-dec 长时间维护"这类故障要几十分钟才恢复，整批会被打成 unresolved
-  # 等下次运行——而下次运行要人来发起。加时赛用长冷却再试几轮，自动把它们捞回。
-  # 加时赛里判死的 ID 照常写 fail_file（同样走白名单 + dead_confirm，同等可信）。
-  # enabled: false 时行为与旧版一致（跑满即写 unresolved.txt）。
-  final_retry:
-    enabled: true
-    rounds: 2               # 加时赛轮数（与 max_rounds 分开计）
-    cooldown_seconds: 1800  # 每轮加时赛前的冷却（秒）。短于此等于再烧一次常规轮
+  # 跑满 max_rounds 仍未捞回的 ID 直接写 unresolved_file、留给下次运行自动重试，
+  # 进程内不再做长冷却重试（曾有 30 分钟级"加时赛"，已取消，与下载侧的跨运行重试对齐）。
   # 单个 HTTP 请求超时（秒）。启用 Session 连接复用后握手更快。
   # 分阶段实测：正常各阶段中位 0.5~3.7s、单请求 P90≈15s、取流循环 max≈13s，
   # 20s 给卡死请求留太久空耗线程；降到 12s 可让长尾/卡死请求早 3~8s 放弃，

@@ -46,12 +46,14 @@ def test_sentinel_closes_the_source():
     assert source.delivered == 1
 
 
-def test_backlog_is_delivered_before_queue_items():
-    """断点续跑存量必须先发、且一条不漏。
+def test_queue_items_are_delivered_before_backlog_and_backlog_is_not_lost():
+    """🔴 R-A：实时队列优先于存量，但存量必须一条不漏地发完。
 
-    下载侧启动时把既有 results.jsonl 读成 entries；取流侧的 load_processed_ids
-    会跳过这些 id，它们**永远不会从队列里出来**。来源若只认队列，这批片就被
-    静默丢弃——跑一次全量会凭空少掉一批本该下载的片。
+    队列里是刚签出的直链，有时效；大存量（几十万部）若先发完，队列会灌满、
+    取流线程在 on_result 里等 ENQUEUE_TIMEOUT 后 dropped，新鲜链接本次运行
+    根本消费不到——这是直接砍取流成果的路径。
+    另一方面下载侧启动时读的 results.jsonl 存量，取流侧 load_processed_ids 会跳过，
+    它们**永远不会从队列里出来**，来源若只认队列这批片就被静默丢弃。
     """
     q = queue.Queue()
     q.put({"tmdbId": "new"})
@@ -68,9 +70,23 @@ def test_backlog_is_delivered_before_queue_items():
         if state == "item":
             got.append(entry["tmdbId"])
 
-    assert got == ["old1", "old2", "new"]
+    assert got == ["new", "old1", "old2"]
     assert source.backlog_total == 2
     assert source.delivered == 3
+
+
+def test_backlog_is_consumed_only_while_queue_is_idle():
+    """队列有货就发队列，队列空档才发存量，队列再来货又切回队列。"""
+    q = queue.Queue()
+    source = p.QueueEntrySource(q, backlog=[{"tmdbId": "b1"}, {"tmdbId": "b2"}])
+
+    q.put({"tmdbId": "q1"})
+    assert source.poll()[1]["tmdbId"] == "q1"
+    assert source.poll()[1]["tmdbId"] == "b1"    # 队列空档 → 存量
+    q.put({"tmdbId": "q2"})
+    assert source.poll()[1]["tmdbId"] == "q2"    # 队列又有货 → 队列优先
+    assert source.poll()[1]["tmdbId"] == "b2"
+    assert source.poll() == ("wait", None)       # 存量发完、队列未关 → wait 不是 done
 
 
 def test_backlog_is_snapshotted():
@@ -88,6 +104,7 @@ def test_queue_items_already_sent_via_backlog_are_skipped():
     取流线程 start 之后就同时**落盘 + 入队**，而下载侧要稍后才读 results.jsonl
     拿 backlog。这中间取流产出的片会同时进两边。第二份虽会被
     process_one_entry 的 processing_ids 拦下，但要白占一个下载槽位走一遭。
+    R-A 后队列优先，故先发队列那份、存量里的同 id 被跳过；反向亦然。
     """
     q = queue.Queue()
     q.put({"tmdbId": "1", "title": "queue-copy"})
@@ -101,9 +118,20 @@ def test_queue_items_already_sent_via_backlog_are_skipped():
         if state == "done":
             break
         if state == "item":
-            got.append(entry["tmdbId"])
+            got.append((entry["tmdbId"], entry["title"]))
 
-    assert got == ["1", "2"], "同一 id 被投递了两次"
+    assert got == [("1", "queue-copy"), ("2", "genuinely-new")], "同一 id 被投递了两次"
+    assert source.skipped_duplicates == 1
+
+
+def test_backlog_item_already_sent_is_skipped_when_queue_copy_arrives_later():
+    """存量先发（队列当时空），随后队列里来了同 id 的副本 → 跳过。"""
+    q = queue.Queue()
+    source = p.QueueEntrySource(q, backlog=[{"tmdbId": "1", "title": "backlog"}])
+    assert source.poll()[1]["title"] == "backlog"
+    q.put({"tmdbId": "1", "title": "queue-copy"})
+    q.put(p._SENTINEL)
+    assert source.poll() == ("done", None)
     assert source.skipped_duplicates == 1
 
 
@@ -128,10 +156,156 @@ def test_consecutive_duplicates_do_not_stall_the_source():
     q.put({"tmdbId": "2"})
     source = p.QueueEntrySource(q, backlog=[{"tmdbId": "1"}])
 
-    assert source.poll()[1]["tmdbId"] == "1"      # backlog
-    # 5 个重复项应被连续跳过，直接拿到 id=2，而不是先返回 wait
+    assert source.poll()[1]["tmdbId"] == "1"      # 队列首条
+    # 4 个队列重复项应被连续跳过，直接拿到 id=2，而不是先返回 wait
     assert source.poll()[1]["tmdbId"] == "2"
+    assert source.skipped_duplicates == 4
+    # 队列空 → 轮到存量，存量里的 1 也是重复 → 跳过 → 无货 → wait
+    assert source.poll() == ("wait", None)
     assert source.skipped_duplicates == 5
+
+
+# ---------------------------------------- QueueEntrySource × 重取结果（R-B）
+
+class _StubRefetcher:
+    """只模拟 QueueEntrySource 用到的两个方法：collect / pending_count。"""
+
+    def __init__(self):
+        self.results = []
+        self.pending = 0
+
+    def collect(self):
+        out, self.results = self.results, []
+        return out
+
+    def pending_count(self):
+        return self.pending
+
+
+def test_revived_entries_are_delivered_first_and_bypass_seen():
+    """🔴 R-B：重取结果时效最紧，排在队列与存量之前；且不受 _seen 拦截。
+
+    重取结果就是同一 id 的新链接——旧链接早已投递过（所以才过期失败），
+    若按普通去重处理就会被当成重复丢掉，新链接白换。
+    """
+    q = queue.Queue()
+    r = _StubRefetcher()
+    source = p.QueueEntrySource(q, refetcher=r)
+
+    q.put({"tmdbId": "1", "urls": ["old"]})
+    assert source.poll()[1]["urls"] == ["old"]
+
+    q.put({"tmdbId": "9", "urls": ["queue"]})
+    r.results = [{"tmdbId": "1", "urls": ["new"]}]
+    state, entry = source.poll()
+    assert (state, entry["tmdbId"], entry["urls"]) == ("item", "1", ["new"])
+    assert source.poll()[1]["tmdbId"] == "9"
+    assert source.revived_delivered == 1
+    assert source.skipped_duplicates == 0
+
+
+def test_revived_entry_replaces_unsent_backlog_item_in_place():
+    """预检投出的重取结果若先于对应存量条目回来，就地替换掉那条旧链接。
+
+    否则旧链接还要白试一遍（它本就是因陈旧才被投的），之后再多发一份新的。
+    """
+    q = queue.Queue()
+    r = _StubRefetcher()
+    backlog = [
+        {"tmdbId": "a", "urls": ["a-old"]},
+        {"tmdbId": "b", "urls": ["b-old"]},
+    ]
+    source = p.QueueEntrySource(q, backlog=backlog, refetcher=r)
+    r.results = [{"tmdbId": "b", "urls": ["b-new"]}]
+
+    got = [source.poll()[1] for _ in range(2)]
+    assert [(e["tmdbId"], e["urls"][0]) for e in got] == [("a", "a-old"), ("b", "b-new")]
+    assert source.poll() == ("wait", None)
+    assert source.revived_delivered == 1
+    assert source.delivered == 2
+
+
+def test_revived_entry_is_held_while_old_link_is_still_downloading():
+    """旧链接还在下载线程里时，新链接先压着，等它退出处理态再投。
+
+    此刻投出去会被 process_one_entry 判 "duplicate entry currently processing"
+    直接丢掉，新链接白换。
+    """
+    q = queue.Queue()
+    r = _StubRefetcher()
+    busy = {"1"}
+    source = p.QueueEntrySource(q, refetcher=r, is_busy=lambda k: k in busy)
+
+    q.put({"tmdbId": "1", "urls": ["old"]})
+    assert source.poll()[1]["urls"] == ["old"]
+    r.results = [{"tmdbId": "1", "urls": ["new"]}]
+    assert source.poll() == ("wait", None)     # 压住，不投
+    assert source.revived_delivered == 0
+
+    busy.clear()
+    state, entry = source.poll()
+    assert (state, entry["urls"]) == ("item", ["new"])
+    assert source.revived_delivered == 1
+
+
+def test_source_waits_for_inflight_refetch_after_sentinel_then_finishes():
+    """🔴 R-B：队列关了、存量发完，但还有重取在途 → wait 而不是 done。
+
+    否则首轮就此收尾，换回的新链接没有轮次去下（以前只等 120s 的老病）。
+    在途归零后要再收一次尾（AsyncRefetcher 先 put 后减计数，故不会漏）。
+    """
+    q = queue.Queue()
+    r = _StubRefetcher()
+    source = p.QueueEntrySource(q, refetcher=r)
+
+    q.put({"tmdbId": "1", "urls": ["old"]})
+    q.put(p._SENTINEL)
+    assert source.poll()[1]["urls"] == ["old"]
+
+    r.pending = 1
+    assert source.poll() == ("wait", None)
+    assert source.poll() == ("wait", None)
+
+    r.pending = 0
+    r.results = [{"tmdbId": "1", "urls": ["new"]}]
+    state, entry = source.poll()
+    assert (state, entry["urls"]) == ("item", ["new"])
+    assert source.poll() == ("done", None)
+    assert source.poll() == ("done", None)
+
+
+def test_source_after_sentinel_waits_while_held_revived_entry_is_busy():
+    """队列关闭 + 在途归零，但缓冲里还压着一条等旧链接退出处理态的新链接 → wait。"""
+    q = queue.Queue()
+    r = _StubRefetcher()
+    busy = {"1"}
+    source = p.QueueEntrySource(q, refetcher=r, is_busy=lambda k: k in busy)
+    q.put({"tmdbId": "1", "urls": ["old"]})
+    q.put(p._SENTINEL)
+    assert source.poll()[1]["urls"] == ["old"]
+    r.results = [{"tmdbId": "1", "urls": ["new"]}]
+    assert source.poll() == ("wait", None)
+    busy.clear()
+    assert source.poll()[1]["urls"] == ["new"]
+    assert source.poll() == ("done", None)
+
+
+def test_broken_refetcher_does_not_break_the_source():
+    """collect / pending_count 抛异常只告警，来源照常收尾（绝不能卡死主循环）。"""
+
+    class _Broken:
+        def collect(self):
+            raise RuntimeError("boom")
+
+        def pending_count(self):
+            raise RuntimeError("boom")
+
+    q = queue.Queue()
+    q.put({"tmdbId": "1"})
+    q.put(p._SENTINEL)
+    source = p.QueueEntrySource(q, refetcher=_Broken())
+    assert source.poll()[1]["tmdbId"] == "1"
+    assert source.poll() == ("done", None)
 
 
 def test_shutdown_unblocks_a_producer_stuck_on_a_full_queue():
@@ -329,6 +503,40 @@ def test_bad_argv_is_rejected_before_anything_starts(monkeypatch):
     assert started == [], f"错误参数下仍启动了组件: {started}"
 
 
+def test_main_wires_refetcher_into_first_round_source(monkeypatch):
+    """🔴 R-B 接线：首轮 QueueEntrySource 必须拿到 refetcher 与 is_busy，
+    否则重取结果只能等轮末 collect，首轮内根本消费不到。"""
+    monkeypatch.setattr(p.sys, "argv", ["pipeline.py"])
+    monkeypatch.setattr(p.fetcher, "_parse_args", lambda argv: None)
+    monkeypatch.setattr(p.FetchWorker, "start", lambda self: None)
+    monkeypatch.setattr(p.FetchWorker, "shutdown", lambda self, timeout=None: None)
+    monkeypatch.setattr(p.AsyncRefetcher, "start", lambda self: None)
+    monkeypatch.setattr(p.downloader, "AUTO_REFETCH_ENABLED", True)
+
+    captured = {}
+
+    def fake_downloader_main():
+        src = p.downloader.ListEntrySource([{"tmdbId": "b"}])
+        captured["source"] = src
+        captured["hook"] = p.downloader.async_refetch_hook
+
+    monkeypatch.setattr(p.downloader, "main", fake_downloader_main)
+    p.main()
+
+    src = captured["source"]
+    assert isinstance(src, p.QueueEntrySource)
+    assert src._refetcher is captured["hook"]
+    assert isinstance(captured["hook"], p.AsyncRefetcher)
+    # is_busy 直连下载侧 processing_ids（按 normalize 后的 id 比较）
+    p.downloader.processing_ids.add("42")
+    try:
+        assert src._is_busy("42") is True
+        assert src._is_busy(42) is True
+        assert src._is_busy("43") is False
+    finally:
+        p.downloader.processing_ids.discard("42")
+
+
 def test_queue_and_timeout_come_from_config():
     """两个反压参数必须来自 config，且取值合理。
 
@@ -425,12 +633,14 @@ def test_collect_returns_revived_entries_and_preserves_metadata(
     """重取成功的片要能被收回，且保留 entry 上 result 没有的历史元数据。"""
     outcomes = {
         "1": ("ok", {"tmdbId": "1", "urls": [{"url": "new", "type": "mp4"}],
-                     "fetched_at": 999}),
+                     "fetched_at": 999,
+                     "captions": [{"url": "new.vtt", "lang": "en"}]}),
     }
     r, stop, written = _make_refetcher(monkeypatch, tmp_path, outcomes)
     try:
         r.dispatch([{"tmdbId": "1", "title": "T", "year": 2020,
-                     "urls": [{"url": "old", "type": "mp4"}]}])
+                     "urls": [{"url": "old", "type": "mp4"}],
+                     "captions": [{"url": "old.vtt", "lang": "en"}]}])
         deadline = time.time() + 5
         got = []
         while time.time() < deadline and not got:
@@ -441,6 +651,8 @@ def test_collect_returns_revived_entries_and_preserves_metadata(
         entry = got[0]
         assert entry["urls"] == [{"url": "new", "type": "mp4"}]
         assert entry["fetched_at"] == 999
+        # 字幕列表要跟 urls 一起换新，不能留着旧节点的字幕地址
+        assert entry["captions"] == [{"url": "new.vtt", "lang": "en"}]
         # 历史元数据必须保留（逐键覆盖而非整体替换）
         assert entry["title"] == "T"
         assert entry["year"] == 2020
@@ -546,3 +758,115 @@ def test_entry_without_tmdb_id_still_clears_inflight(monkeypatch, tmp_path):
         assert r.pending_count() == 0
     finally:
         stop.set()
+
+
+def test_duplicate_dispatch_while_inflight_is_merged(monkeypatch, tmp_path):
+    """B-2：同一 id 在途期间再次 dispatch 必须被拒收——预检投一次、旧链接失败
+    又投一次是常态，第二次拿到的还是同一批源的新链接，纯烧取流配额。
+    在途归零后再投则要正常接收（这是每片上限 refetch_counts 的事，不归钩子管）。
+    """
+    gate = threading.Event()
+    calls = []
+
+    def slow_fetch(tid, providers=None):
+        calls.append(str(tid))
+        gate.wait(5)
+        return "ok", {"tmdbId": tid, "urls": [{"url": "u", "type": "mp4"}]}
+
+    monkeypatch.setattr(p.fetcher, "process_tmdb_id", slow_fetch)
+    monkeypatch.setattr(p.downloader, "write_log", lambda path, rec: None)
+    stop = threading.Event()
+    r = p.AsyncRefetcher(2, stop)
+    r.start()
+    try:
+        assert r.dispatch([{"tmdbId": "1"}]) == 1
+        assert r.dispatch([{"tmdbId": "1"}, {"tmdbId": 1}]) == 0, "在途期间重复投递必须拒收"
+        assert r.dispatch([{"tmdbId": "2"}, {"tmdbId": "1"}]) == 1
+        assert r.pending_count() == 2
+        assert r.dispatched == 2
+        assert r.skipped_inflight == 3
+
+        gate.set()
+        deadline = time.time() + 5
+        while time.time() < deadline and r.pending_count() > 0:
+            time.sleep(0.02)
+        assert r.pending_count() == 0
+        assert sorted(calls) == ["1", "2"], "拒收的不能再进取流"
+        assert len(r.collect()) == 2
+
+        # 在途归零后再投同一 id：正常接收
+        assert r.dispatch([{"tmdbId": "1"}]) == 1
+    finally:
+        gate.set()
+        stop.set()
+
+
+def test_inflight_id_is_released_even_when_fetch_raises(monkeypatch, tmp_path):
+    """B-2 护栏：取流抛异常/无果也要释放在途 id，否则该片此后永远投不进去。"""
+    def boom(tid, providers=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(p.fetcher, "process_tmdb_id", boom)
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop)
+    r.start()
+    try:
+        assert r.dispatch([{"tmdbId": "1"}]) == 1
+        deadline = time.time() + 5
+        while time.time() < deadline and r.pending_count() > 0:
+            time.sleep(0.02)
+        assert r.pending_count() == 0
+        assert r.dispatch([{"tmdbId": "1"}]) == 1
+    finally:
+        stop.set()
+
+
+def test_refetcher_passes_providers_through(monkeypatch, tmp_path):
+    """B-1：命令行 --providers 覆盖时，重取必须用同一份源列表；未覆盖时传 None
+    （让取流侧用 config 的 ACTIVE_PROVIDERS），不能各说各话。"""
+    seen = []
+
+    def spy(tid, providers=None):
+        seen.append(providers)
+        return "ok", {"tmdbId": tid, "urls": [{"url": "u", "type": "mp4"}]}
+
+    monkeypatch.setattr(p.fetcher, "process_tmdb_id", spy)
+    monkeypatch.setattr(p.downloader, "write_log", lambda path, rec: None)
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop, providers=["vidlink"])
+    r.start()
+    r2 = p.AsyncRefetcher(1, stop)
+    r2.start()
+    try:
+        r.dispatch([{"tmdbId": "1"}])
+        r2.dispatch([{"tmdbId": "2"}])
+        deadline = time.time() + 5
+        while time.time() < deadline and (r.pending_count() or r2.pending_count()):
+            time.sleep(0.02)
+        assert len(seen) == 2
+        assert ["vidlink"] in seen
+        assert None in seen
+    finally:
+        stop.set()
+
+
+def test_main_passes_cli_providers_to_refetcher(monkeypatch):
+    """B-1 接线：pipeline.py --providers X 时，AsyncRefetcher 拿到的就是 X。"""
+    monkeypatch.setattr(p.sys, "argv", ["pipeline.py", "--providers", "vidlink,vidup"])
+    monkeypatch.setattr(p.FetchWorker, "start", lambda self: None)
+    monkeypatch.setattr(p.FetchWorker, "shutdown", lambda self, timeout=None: None)
+    monkeypatch.setattr(p.AsyncRefetcher, "start", lambda self: None)
+    monkeypatch.setattr(p.downloader, "AUTO_REFETCH_ENABLED", True)
+    captured = {}
+    monkeypatch.setattr(
+        p.downloader, "main",
+        lambda: captured.setdefault("hook", p.downloader.async_refetch_hook),
+    )
+    p.main()
+    assert captured["hook"]._providers == ["vidlink", "vidup"]
+
+    # 不带 --providers：None，交给取流侧用 config 默认
+    monkeypatch.setattr(p.sys, "argv", ["pipeline.py"])
+    captured.clear()
+    p.main()
+    assert captured["hook"]._providers is None

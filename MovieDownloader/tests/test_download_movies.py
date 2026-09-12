@@ -3111,6 +3111,61 @@ def test_refetch_gives_up_at_the_round_timeout(sandbox, monkeypatch):
     assert elapsed < 10
 
 
+def test_refetch_persists_results_that_finish_after_the_timeout(sandbox, monkeypatch):
+    """超时后才跑完的重取，成功结果仍要落盘 INPUT_JSONL，供下次运行使用。
+
+    超时只是"本轮不再等"。取流请求已经发出去了，结果白丢就等于下次运行再
+    花一遍取流成本；落了盘，下次启动按 fetched_at 择新就能直接用上。
+    """
+    import threading
+    monkeypatch.setattr(d, "AUTO_REFETCH_TIMEOUT", 1)
+    monkeypatch.setattr(d, "AUTO_REFETCH_WORKERS", 4)
+    release = threading.Event()
+    persisted = threading.Event()
+
+    class Hanging(_FakeFetcher):
+        def process_tmdb_id(self, tmdb_id):
+            if str(tmdb_id).startswith("slow"):
+                release.wait(30)
+            return super().process_tmdb_id(tmdb_id)
+
+    fetcher = Hanging({
+        "fast": ("ok", {"tmdbId": "fast", "urls": [{"url": "u"}]}),
+        "slow-ok": ("ok", {"tmdbId": "slow-ok", "urls": [{"url": "late"}],
+                           "fetched_at": 123}),
+        "slow-retry": ("retry", None),
+    })
+    _install_fake_fetcher(monkeypatch, fetcher)
+
+    real_write_log = d.write_log
+
+    def spying_write_log(path, record):
+        real_write_log(path, record)
+        if record.get("tmdbId") == "slow-ok":
+            persisted.set()
+
+    monkeypatch.setattr(d, "write_log", spying_write_log)
+
+    revived = d.refetch_entries(
+        [{"tmdbId": "fast", "urls": []},
+         {"tmdbId": "slow-ok", "urls": []},
+         {"tmdbId": "slow-retry", "urls": []}], {}
+    )
+    # 本轮只收到快的那部；慢的没赶上重投
+    assert [e["tmdbId"] for e in revived] == ["fast"]
+    with open(d.INPUT_JSONL, encoding="utf-8") as fh:
+        assert [json.loads(l)["tmdbId"] for l in fh if l.strip()] == ["fast"]
+
+    # 放行慢的：成功那部要在后台落盘，无果那部不能写
+    release.set()
+    assert persisted.wait(5), "超时后完成的成功重取没有落盘"
+    with open(d.INPUT_JSONL, encoding="utf-8") as fh:
+        rows = [json.loads(l) for l in fh if l.strip()]
+    assert [r["tmdbId"] for r in rows] == ["fast", "slow-ok"]
+    assert rows[1]["urls"] == [{"url": "late"}]
+    assert rows[1]["fetched_at"] == 123
+
+
 # ------------------------------------------------- 单实例锁
 
 def test_main_lock_refuses_a_second_downloader(tmp_path, monkeypatch):
@@ -4200,7 +4255,7 @@ def test_rotation_stands_down_when_another_process_is_running(
 
 
 def test_startup_precheck_is_skipped_in_pipeline_mode(tmp_path, monkeypatch):
-    """🔴 pipeline 模式下不得做启动预检。
+    """🔴 pipeline 模式下不得做**同步**启动预检。
 
     ⚠️ 这里必须走真实的 `_run_pipeline`。判据曾被写成
     `hasattr(current_batch, "poll")` —— 而该处的 current_batch 就是
@@ -4241,6 +4296,307 @@ def test_startup_precheck_is_skipped_in_pipeline_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "ListEntrySource", lambda entries: d._ListEntrySource(entries))
     d._run_pipeline()
     assert called == [], "pipeline 模式下不该做同步预检"
+
+
+class _FakeAsyncHook:
+    """模拟 pipeline.AsyncRefetcher 的三方法约定，记录 dispatch 过的条目。"""
+
+    def __init__(self, results=None):
+        self.dispatched = []
+        self._results = list(results or [])
+
+    def dispatch(self, entries):
+        self.dispatched.extend(entries)
+
+    def collect(self):
+        out, self._results = self._results, []
+        return out
+
+    def pending_count(self):
+        return 0
+
+
+def _setup_pipeline_precheck(tmp_path, monkeypatch, entries):
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_MOVIE", 2)
+    inp = tmp_path / "in.jsonl"
+    inp.write_text(
+        "".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8"
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(inp))
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (entry["tmdbId"], False, {"error": "x"}),
+    )
+    monkeypatch.setattr(
+        d, "ListEntrySource", lambda entries: d._ListEntrySource(entries)
+    )
+    hook = _FakeAsyncHook()
+    monkeypatch.setattr(d, "async_refetch_hook", hook)
+    return hook
+
+
+def test_pipeline_mode_dispatches_stale_backlog_async(tmp_path, monkeypatch, capsys):
+    """🔴 R1：pipeline 模式下陈旧存量片必须有换链接的路径。
+
+    以前 pipeline 模式直接跳过预检，存量片每次运行都拿同一条旧 url 重投；
+    取流线程只补 results.jsonl 里没有的 id，那些"确定性失败却不挂需重新取流
+    marker"的片（mp4 404/416、不支持 Range、长度不符）永远换不到链接。
+    修复后：陈旧片走 async_refetch_hook.dispatch 非阻塞投递，新鲜片不投。
+    """
+    now = int(time.time())
+    hook = _setup_pipeline_precheck(tmp_path, monkeypatch, [
+        {"tmdbId": "55", "title": "old", "urls": ["u"], "fetched_at": now - 999999},
+        {"tmdbId": "56", "title": "fresh", "urls": ["u"], "fetched_at": now - 60},
+        {"tmdbId": "57", "title": "no-ts", "urls": ["u"]},
+    ])
+    d._run_pipeline()
+
+    assert [e["tmdbId"] for e in hook.dispatched] == ["55"], (
+        "只有 fetched_at 超阈值的片该被投递；新鲜片与缺戳片都不该动"
+    )
+    assert "[启动预检] 1/3" in capsys.readouterr().out
+
+
+def test_pipeline_precheck_is_nonblocking_and_old_link_still_tried(tmp_path, monkeypatch):
+    """预检投递不得阻塞、也不得拦下旧链接：首轮照常用旧 url 下载。"""
+    now = int(time.time())
+    tried = []
+    hook = _setup_pipeline_precheck(tmp_path, monkeypatch, [
+        {"tmdbId": "55", "title": "old", "urls": ["old-u"], "fetched_at": now - 999999},
+    ])
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: tried.append(entry["urls"]) or (
+            entry["tmdbId"], False, {"error": "x", "retriable": False}
+        ),
+    )
+    d._run_pipeline()
+    assert tried == [["old-u"]], "旧链接未必真失效，首轮必须照常尝试"
+    assert len(hook.dispatched) == 1
+
+
+def test_pipeline_precheck_respects_per_movie_refetch_cap(tmp_path, monkeypatch):
+    """预检消耗计入 refetch_counts：达上限的片不再投递，防跨轮无限空转。"""
+    now = int(time.time())
+    counts = {}
+    hook = _FakeAsyncHook()
+    monkeypatch.setattr(d, "async_refetch_hook", hook)
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_MOVIE", 1)
+    entries = [
+        {"tmdbId": "55", "urls": ["u"], "fetched_at": now - 999999},
+        {"tmdbId": "56", "urls": ["u"], "fetched_at": now - 999999},
+    ]
+    counts["56"] = 1  # 已用完
+    assert d.dispatch_stale_entries_async(entries, counts) == 1
+    assert [e["tmdbId"] for e in hook.dispatched] == ["55"]
+    assert counts == {"55": 1, "56": 1}
+
+
+def test_pipeline_precheck_noop_without_hook_or_when_disabled(monkeypatch):
+    """没装钩子 / 关闭自动重取 / 阈值为 0 时，预检必须是空操作。"""
+    now = int(time.time())
+    entries = [{"tmdbId": "55", "urls": ["u"], "fetched_at": now - 999999}]
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+
+    monkeypatch.setattr(d, "async_refetch_hook", None)
+    counts = {}
+    assert d.dispatch_stale_entries_async(entries, counts) == 0
+    assert counts == {}
+
+    hook = _FakeAsyncHook()
+    monkeypatch.setattr(d, "async_refetch_hook", hook)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", False)
+    assert d.dispatch_stale_entries_async(entries, counts) == 0
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 0)
+    assert d.dispatch_stale_entries_async(entries, counts) == 0
+    assert hook.dispatched == []
+    assert counts == {}
+
+
+def test_pipeline_precheck_dispatch_failure_does_not_break_run(monkeypatch, capsys):
+    """钩子投递抛异常时只告警、沿用旧链接，绝不让预检崩掉流水线。"""
+    now = int(time.time())
+
+    class _Broken(_FakeAsyncHook):
+        def dispatch(self, entries):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(d, "async_refetch_hook", _Broken())
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 86400)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    entries = [{"tmdbId": "55", "urls": ["u"], "fetched_at": now - 999999}]
+    assert d.dispatch_stale_entries_async(entries, {}) == 0
+    assert "投递失败" in capsys.readouterr().out
+
+
+def test_pipeline_precheck_result_is_consumed_next_round(tmp_path, monkeypatch):
+    """预检换回的新链接由首轮轮末 collect 并入第二轮——即使旧链接的失败是
+    "确定性不可重试"（不进 round_failed_retriable），也必须靠 revived 进下一轮。"""
+    now = int(time.time())
+    old = {"tmdbId": "55", "title": "old", "urls": ["old-u"], "fetched_at": now - 999999}
+    hook = _setup_pipeline_precheck(tmp_path, monkeypatch, [old])
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", True)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 2)
+    monkeypatch.setattr(d, "ROUND_COOLDOWN_SECONDS", 0)
+    new = dict(old, urls=["new-u"], fetched_at=now)
+    hook._results = [new]
+
+    tried = []
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: tried.append(entry["urls"]) or (
+            entry["tmdbId"], False, {"error": "直链块不可用(404/416)", "retriable": False}
+        ),
+    )
+    d._run_pipeline()
+    assert tried == [["old-u"], ["new-u"]], (
+        "首轮用旧链接；预检换到的新链接必须在第二轮被消费"
+    )
+
+
+def test_pipeline_expired_link_is_dispatched_immediately_in_first_round(
+    tmp_path, monkeypatch, capsys
+):
+    """🔴 R-B：pipeline 模式下直链过期必须发现即投递，不能攒到轮末。
+
+    首轮来源是 QueueEntrySource，会直接消费重取结果；若攒到轮末才投，
+    首轮只等 ASYNC_REFETCH_WAIT_SECONDS 便收尾，换回的新链接没有轮次去用。
+    """
+    now = int(time.time())
+    fresh = {"tmdbId": "55", "title": "fresh", "urls": ["u"], "fetched_at": now - 60}
+    hook = _setup_pipeline_precheck(tmp_path, monkeypatch, [fresh])
+    monkeypatch.setattr(d, "ASYNC_REFETCH_WAIT_SECONDS", 0)
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (
+            entry["tmdbId"], False,
+            {"error": f"403 {d._NEEDS_REFETCH_MARKER}", "retriable": False,
+             "needs_refetch": True},
+        ),
+    )
+    d._run_pipeline()
+    assert [e["tmdbId"] for e in hook.dispatched] == ["55"], (
+        "新鲜片预检不投；下载发现过期后必须即刻投递（MAX_ROUNDS=1 也要投，"
+        "因为首轮来源能随到随下）"
+    )
+    out = capsys.readouterr().out
+    assert "已即刻投递异步重取（第 1/2 次）" in out
+
+
+def test_pipeline_immediate_dispatch_respects_per_movie_cap(tmp_path, monkeypatch):
+    """即刻投递同样受 AUTO_REFETCH_MAX_PER_MOVIE 约束：预检已用完额度的片不再投。"""
+    now = int(time.time())
+    old = {"tmdbId": "55", "title": "old", "urls": ["u"], "fetched_at": now - 999999}
+    hook = _setup_pipeline_precheck(tmp_path, monkeypatch, [old])
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_MOVIE", 1)
+    monkeypatch.setattr(d, "ASYNC_REFETCH_WAIT_SECONDS", 0)
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (
+            entry["tmdbId"], False,
+            {"error": d._NEEDS_REFETCH_MARKER, "retriable": False,
+             "needs_refetch": True},
+        ),
+    )
+    d._run_pipeline()
+    assert len(hook.dispatched) == 1, "预检占 1 次额度后，下载失败不得再投第 2 次"
+
+
+def test_pipeline_merged_dispatch_does_not_consume_quota(tmp_path, monkeypatch, capsys):
+    """B-2：钩子因同片在途而拒收（dispatch 返回 0）时，不得计入 refetch_counts。
+    否则"预检投一次 + 下载失败合并一次"就把 2 次额度全吃光，真正的第二次重取
+    机会没了。"""
+    now = int(time.time())
+    old = {"tmdbId": "55", "title": "old", "urls": ["u"], "fetched_at": now - 999999}
+    hook = _setup_pipeline_precheck(tmp_path, monkeypatch, [old])
+
+    class _Merging(_FakeAsyncHook):
+        def dispatch(self, entries):
+            if self.dispatched:
+                return 0  # 已有在途：拒收
+            self.dispatched.extend(entries)
+            return len(entries)
+
+    hook = _Merging()
+    monkeypatch.setattr(d, "async_refetch_hook", hook)
+    monkeypatch.setattr(d, "ASYNC_REFETCH_WAIT_SECONDS", 0)
+    counts_seen = {}
+    real = d.dispatch_stale_entries_async
+
+    def spy(entries, counts):
+        counts_seen["ref"] = counts
+        return real(entries, counts)
+
+    monkeypatch.setattr(d, "dispatch_stale_entries_async", spy)
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (
+            entry["tmdbId"], False,
+            {"error": d._NEEDS_REFETCH_MARKER, "retriable": False,
+             "needs_refetch": True},
+        ),
+    )
+    d._run_pipeline()
+    assert len(hook.dispatched) == 1
+    assert counts_seen["ref"] == {"55": 1}, "被合并的投递不计额度"
+    assert "该片重取仍在途，合并等待结果" in capsys.readouterr().out
+
+
+def test_pipeline_immediate_dispatch_failure_only_warns(tmp_path, monkeypatch, capsys):
+    """即刻投递抛异常只告警，不得让 handle_done_future / 主循环崩掉。"""
+    now = int(time.time())
+    fresh = {"tmdbId": "55", "title": "fresh", "urls": ["u"], "fetched_at": now - 60}
+    _setup_pipeline_precheck(tmp_path, monkeypatch, [fresh])
+
+    class _Broken(_FakeAsyncHook):
+        def dispatch(self, entries):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(d, "async_refetch_hook", _Broken())
+    monkeypatch.setattr(d, "ASYNC_REFETCH_WAIT_SECONDS", 0)
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (
+            entry["tmdbId"], False,
+            {"error": d._NEEDS_REFETCH_MARKER, "retriable": False,
+             "needs_refetch": True},
+        ),
+    )
+    d._run_pipeline()
+    assert "异步重取投递失败 55: boom" in capsys.readouterr().out
+
+
+def test_standalone_mode_does_not_dispatch_immediately(tmp_path, monkeypatch):
+    """非 pipeline（list 来源）下不即刻投递：来源不能随到随下，仍走轮末集中投递。"""
+    now = int(time.time())
+    fresh = {"tmdbId": "55", "title": "fresh", "urls": ["u"], "fetched_at": now - 60}
+    hook = _setup_pipeline_precheck(tmp_path, monkeypatch, [fresh])
+    monkeypatch.setattr(d, "ListEntrySource", d._ListEntrySource)
+    monkeypatch.setattr(d, "refresh_stale_entries", lambda entries, counts: entries)
+    monkeypatch.setattr(d, "ASYNC_REFETCH_WAIT_SECONDS", 0)
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, ids: (
+            entry["tmdbId"], False,
+            {"error": d._NEEDS_REFETCH_MARKER, "retriable": False,
+             "needs_refetch": True},
+        ),
+    )
+    d._run_pipeline()
+    # MAX_ROUNDS=1：末轮不投；即刻投递路径也因非 streaming 不触发
+    assert hook.dispatched == []
 
 
 def test_startup_precheck_runs_in_standalone_mode(tmp_path, monkeypatch):

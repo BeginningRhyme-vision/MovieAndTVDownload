@@ -57,66 +57,155 @@ class QueueEntrySource:
     🔴 backlog 不能省：下载侧启动时会把已有的 results.jsonl 读成一批 entries
     （断点续跑的存量——上次取到但没下完的片）。取流侧的 load_processed_ids 会
     跳过这些 id，**它们永远不会再从队列里出来**；若来源只认队列，这批片就被
-    静默丢弃了。故先把存量发完，再转入队列流式消费。
+    静默丢弃了。故存量必须一条不漏地发完。
+
+    🔴 投递顺序：重取结果 > 实时队列 > backlog（R-A）。
+    队列里是**刚签出的直链**，有时效；backlog 是躺在 results.jsonl 里的旧链接，
+    再等一会儿也不会更坏。若先把存量发完再看队列，大存量（几十万部）场景下
+    队列会灌满、取流线程在 on_result 里等 ENQUEUE_TIMEOUT 后被迫 dropped，
+    新鲜链接本次运行根本消费不到，等下次运行从文件读出来时早已过期——
+    这是直接砍取流成果的路径。故队列有货就先发队列，队列空档才发 backlog。
+    重取结果（AsyncRefetcher 换回的新直链）时效最紧、且是救回失败片的唯一
+    机会，排最前。
 
     🔴 backlog 与队列必须去重：取流线程在 worker.start() 后就同时**落盘 + 入队**，
     而下载侧要稍后才读 results.jsonl 拿 backlog。这中间取流产出的片会**同时**
     出现在两边。第二份虽会被 process_one_entry 的 processing_ids 拦下，
     但仍要白占一个下载槽位走一遭（与 merge_next_batch 规避的是同一类浪费）。
-    故用 _seen 记住已投递过的 id，队列侧遇到重复直接跳过。
+    故用 _seen 记住已投递过的 id，两边遇到重复都直接跳过。
+    重取结果**不受 _seen 拦截**：它就是同一 id 的新链接，必须放行。
+
+    🔴 重取结果在首轮内消费（R-B）：以前重取结果只在轮末 collect 并入下一轮，
+    首轮只等 ASYNC_REFETCH_WAIT_SECONDS 就收尾，而单片重取常常不止这么久
+    ——新链接明明换回来了，本次运行却没有轮次去下。这里让来源直接从
+    refetcher 拿结果，随到随投；且 backlog 与队列都发完后，只要还有重取在途
+    就返回 wait 而不是 done，让首轮把最后几条也等回来下掉。
     """
 
-    def __init__(self, q, backlog=()):
+    def __init__(self, q, backlog=(), refetcher=None, is_busy=None):
         self._q = q
         self._backlog = list(backlog)
         self._backlog_next = 0
+        # backlog 里每个 id 的位置：重取结果若先于对应存量条目回来，就地替换
+        # 掉那条旧链接（它本就是因陈旧才被预检投递的），不再多发一份。
+        self._backlog_index = {}
+        for idx, entry in enumerate(self._backlog):
+            key = self._key(entry)
+            if key is not None and key not in self._backlog_index:
+                self._backlog_index[key] = idx
+        self._refetcher = refetcher
+        # is_busy(key) -> 该 id 是否正在下载侧处理中（processing_ids）。
+        # 预检投出的重取结果可能在旧链接**还在下**时就回来了，此刻投出去会被
+        # process_one_entry 判"重复条目"直接丢掉，新链接白换。故先压在缓冲里，
+        # 等那部片离开处理态再投。
+        self._is_busy = is_busy
+        self._revived_buf = []
         self._closed = False
         self._seen = set()
         self.delivered = 0
         self.skipped_duplicates = 0
         self.backlog_total = len(self._backlog)
+        # 重取结果中被本来源直接投递（含就地替换进 backlog）的条数。
+        self.revived_delivered = 0
 
     @staticmethod
     def _key(entry):
         tid = entry.get("tmdbId")
         return str(tid) if tid is not None else None
 
-    def poll(self):
-        # 先发断点续跑存量。它本身已被下载侧按 tmdbId 去重过（entry_by_id），
-        # 故这里只需登记 id，不必再判重。
-        if self._backlog_next < len(self._backlog):
-            entry = self._backlog[self._backlog_next]
-            self._backlog_next += 1
+    def _poll_revived(self):
+        """取一条可投的重取结果；没有返回 None。绝不阻塞。"""
+        if self._refetcher is None:
+            return None
+        try:
+            self._revived_buf.extend(self._refetcher.collect())
+        except Exception as exc:  # noqa: BLE001
+            print(f"⚠️ 收取异步重取结果失败: {exc}", flush=True)
+        for i, entry in enumerate(self._revived_buf):
             key = self._key(entry)
+            idx = self._backlog_index.get(key) if key is not None else None
+            if idx is not None and idx >= self._backlog_next:
+                # 对应存量条目还没轮到：直接换成新链接，旧的那条不再投。
+                self._backlog[idx] = entry
+                self.revived_delivered += 1
+                del self._revived_buf[i]
+                return self._poll_revived()
+            if key is not None and self._is_busy is not None:
+                try:
+                    if self._is_busy(key):
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass
+            del self._revived_buf[i]
             if key is not None:
                 self._seen.add(key)
+            self.revived_delivered += 1
             self.delivered += 1
+            return entry
+        return None
+
+    def poll(self):
+        # ① 重取结果：时效最紧，且是失败片的唯一救回机会。
+        entry = self._poll_revived()
+        if entry is not None:
             return "item", entry
 
-        if self._closed:
-            return "done", None
-
+        # ② 实时队列：刚签出的直链，比 backlog 更经不起等。
         # 队列侧可能重复：把已投递过的直接丢弃，继续取下一个。
         # 用循环而非递归——队列里可能连着多个重复项，递归会白白加深栈。
-        while True:
+        while not self._closed:
             try:
                 item = self._q.get_nowait()
             except queue.Empty:
-                return "wait", None
+                break
             if item is _SENTINEL:
                 # 取流侧已收工且存货取尽。哨兵是**最后一个**入队的元素，
                 # 故此刻队列里不可能还有真结果。
                 self._closed = True
-                return "done", None
+                break
             key = self._key(item)
             if key is not None and key in self._seen:
-                # 已由 backlog（或队列里更早的一条）投递过，跳过以免白占槽位。
+                # 已由队列里更早的一条（或 backlog）投递过，跳过以免白占槽位。
                 self.skipped_duplicates += 1
                 continue
             if key is not None:
                 self._seen.add(key)
             self.delivered += 1
             return "item", item
+
+        # ③ 队列空档（或已关闭）：发一条断点续跑存量。
+        while self._backlog_next < len(self._backlog):
+            entry = self._backlog[self._backlog_next]
+            self._backlog_next += 1
+            key = self._key(entry)
+            if key is not None and key in self._seen:
+                # 同一部片已从队列里先到过（取流启动到下载侧读 results.jsonl
+                # 之间的重叠窗口），跳过。
+                self.skipped_duplicates += 1
+                continue
+            if key is not None:
+                self._seen.add(key)
+            self.delivered += 1
+            return "item", entry
+
+        # ④ 三处都没货。取流没收工 → wait；收工了再看重取：
+        #    有在途 / 有压在缓冲里等下载槽位腾出的 → wait，本轮把它们等回来下掉；
+        #    否则再收一次尾（worker 是先 put 结果再减在途计数，故在途归零时
+        #    结果必已入队，这一收不会漏）→ 有就发，没有才 done。
+        if not self._closed:
+            return "wait", None
+        if self._refetcher is not None:
+            try:
+                if self._refetcher.pending_count() > 0:
+                    return "wait", None
+            except Exception as exc:  # noqa: BLE001
+                print(f"⚠️ 查询异步重取在途数失败: {exc}", flush=True)
+            entry = self._poll_revived()
+            if entry is not None:
+                return "item", entry
+            if self._revived_buf:
+                return "wait", None
+        return "done", None
 
 
 # 队列终止哨兵：取流线程主任务跑完后放入，下载侧读到即知"不会再有新片了"。
@@ -126,7 +215,7 @@ _SENTINEL = object()
 class FetchWorker:
     """在后台线程里跑取流主流程，产出实时推入队列。
 
-    ⚠️ 生命周期（§12.4′ 复杂度①）：取流主任务（8 轮 + 加时赛）跑完后线程**不退出**，
+    ⚠️ 生命周期（§12.4′ 复杂度①）：取流主任务（最多 max_rounds 轮）跑完后线程**不退出**，
     而是转入**待命态**继续服务下载侧的"直链过期，重新取一条"请求——否则那些片
     只能退回 refetch_entries 的同步调用老路（带着 SystemExit / 阻塞主循环的三个坑）。
 
@@ -238,23 +327,39 @@ class AsyncRefetcher:
 
     ⚠️ 结果**不走主队列**：主队列有哨兵语义，取流主任务一结束就被标记 done，
     之后推进去的结果再也取不出来（已实测验证）。故用独立的 _done 队列。
+    首轮由 QueueEntrySource.poll() 直接 collect() 随到随投（R-B），
+    第二轮起来源是 list，由 _run_pipeline 轮末 collect() 并入下一轮。
+
+    ⚠️ worker 先 _done.put 再减 _inflight：故 pending_count()==0 时，
+    结果一定已经在 _done 里，调用方"在途归零后再 collect 一次"就不会漏。
 
     落盘由 refetch_entries 的同款逻辑保证：新结果写进 INPUT_JSONL，
     即使本次运行没赶上消费，下次启动也能按 fetched_at 择新直接用上。
     """
 
-    def __init__(self, workers, stop_event):
+    def __init__(self, workers, stop_event, providers=None):
         self._in = queue.Queue()
         self._done = queue.Queue()
         self._stop = stop_event
         self._workers = max(1, int(workers))
         self._threads = []
+        # 取流源列表（B-1）：与主取流任务保持一致。None 表示用 config 默认
+        # （fetcher.ACTIVE_PROVIDERS）；命令行 --providers 覆盖时必须一并透传，
+        # 否则重取会绕过用户明确禁用/指定的源，与主任务口径不一致。
+        self._providers = list(providers) if providers else None
         # 在途计数（已投递、尚未产出结论）。dispatch 时 +1，worker 处理完 -1，
         # 无论成功/失败/无果都要减——否则主循环会一直以为还有货没回来，
         # 白等满 ASYNC_REFETCH_WAIT_SECONDS。
         self._inflight = 0
+        # 在途 id 集合（B-2）：同一部片"预检投了一次、旧链接下载失败又投一次"
+        # 是常态（预检不等结果，旧链接照常先试）。第二次投递在第一次没回来
+        # 之前毫无意义——拿到的还是同一批源的新链接——纯烧取流配额与源站请求。
+        # 故在途期间的重复投递直接拒收；dispatch 返回实际接收条数，
+        # 调用方据此决定是否计入每片重取上限。
+        self._inflight_ids = set()
         self._lock = threading.Lock()
         self.dispatched = 0
+        self.skipped_inflight = 0
         self.revived = 0
 
     def start(self):
@@ -265,12 +370,25 @@ class AsyncRefetcher:
             self._threads.append(t)
 
     def dispatch(self, entries):
-        """主循环调用：投递重取请求。绝不阻塞（无界队列）。"""
+        """主循环调用：投递重取请求。绝不阻塞（无界队列）。
+
+        返回实际接收的条数：同一 id 已在途的条目被拒收（不计数、不入队）。
+        """
+        accepted = 0
         for entry in entries:
+            tid = entry.get("tmdbId")
+            key = str(tid) if tid is not None else None
             with self._lock:
+                if key is not None and key in self._inflight_ids:
+                    self.skipped_inflight += 1
+                    continue
+                if key is not None:
+                    self._inflight_ids.add(key)
                 self._inflight += 1
                 self.dispatched += 1
             self._in.put(entry)
+            accepted += 1
+        return accepted
 
     def collect(self):
         """主循环调用：取走目前已完成的重取结果。绝不阻塞。"""
@@ -299,15 +417,20 @@ class AsyncRefetcher:
             except Exception as exc:  # noqa: BLE001
                 print(f"  [重取异常] {entry.get('tmdbId')}: {exc}", flush=True)
             finally:
+                tid = entry.get("tmdbId")
                 with self._lock:
                     self._inflight -= 1
+                    if tid is not None:
+                        self._inflight_ids.discard(str(tid))
 
     def _handle(self, entry):
         tmdb_id = entry.get("tmdbId")
         if tmdb_id is None:
             return
         try:
-            status, result = fetcher.process_tmdb_id(tmdb_id)
+            status, result = fetcher.process_tmdb_id(
+                tmdb_id, providers=self._providers
+            )
         except (Exception, SystemExit) as exc:
             # 单片重取失败绝不能带塌整批；SystemExit 一并兜住
             # （取流侧用它做配置校验），但不拦 KeyboardInterrupt。
@@ -325,6 +448,9 @@ class AsyncRefetcher:
         new_entry = dict(entry)
         new_entry["urls"] = result["urls"]
         new_entry["fetched_at"] = result.get("fetched_at")
+        # 字幕列表同步：旧 captions 指向旧节点的字幕地址，跟旧 urls 一起作废；
+        # 取流侧没给就置空，别让下载侧拿着过期地址去拉字幕。
+        new_entry["captions"] = result.get("captions") or []
         self._done.put(new_entry)
         with self._lock:
             self.revived += 1
@@ -345,7 +471,13 @@ def main():
     # 线程里 argparse 才发现打错（如 --typo），那时下载侧已经开跑了：它会拿着
     # 现有 results.jsonl 跑一整轮全量下载，而用户只是想让程序报错停下。
     # 全量场景下这等于误启动几十万部片的下载任务（已探针实测复现）。
-    fetcher._parse_args(argv)
+    args = fetcher._parse_args(argv)
+    # 命令行 --providers 覆盖了 config 时，异步重取也要用同一份源列表（B-1），
+    # 否则重取会绕过用户明确禁用/指定的源，与主取流任务口径不一致。
+    providers_arg = getattr(args, "providers", None)
+    refetch_providers = (
+        fetcher._resolve_providers(providers_arg) if providers_arg else None
+    )
 
     print("=" * 70)
     print("pipeline 模式：取流与下载在同一进程内重叠运行")
@@ -362,36 +494,48 @@ def main():
     # 故多轮语义、轮次冷却、就地重取流的触发时机全部不变（§12.5′ 第 1 步）。
     real_list_source = downloader.ListEntrySource
 
-    def source_factory(entries):
-        if holder["source"] is None:
-            # entries = 下载侧从既有 results.jsonl 读出的存量，必须原样发完，
-            # 否则这批片会被静默丢掉（取流侧不会再产出它们）。
-            holder["source"] = QueueEntrySource(q, backlog=entries)
-            if holder["source"].backlog_total:
-                print(
-                    f"[pipeline] 先消费断点续跑存量 "
-                    f"{holder['source'].backlog_total} 部，再转入实时流",
-                    flush=True,
-                )
-            return holder["source"]
-        return real_list_source(entries)
-
-    downloader.ListEntrySource = source_factory
-
     # 异步重取流：复用 download_movies.auto_refetch 的开关与并发数（用户拍板
     # 不另设开关）。装上钩子后，下载侧的"直链过期"就不再走同步的
     # refetch_entries，而是丢给这里的常驻线程，主循环一步都不阻塞。
+    # 必须先于 source_factory 建好：首轮 QueueEntrySource 要直接消费它的
+    # 结果，让新直链在首轮内就被下载（R-B）。
     refetcher = None
     real_hook = downloader.async_refetch_hook
     if downloader.AUTO_REFETCH_ENABLED:
         refetcher = AsyncRefetcher(
-            downloader.AUTO_REFETCH_WORKERS, worker._stop
+            downloader.AUTO_REFETCH_WORKERS, worker._stop,
+            providers=refetch_providers,
         )
         refetcher.start()
         downloader.async_refetch_hook = refetcher
         print(f"异步重取流已启用（{downloader.AUTO_REFETCH_WORKERS} 个重取线程，"
               f"每部片最多 {downloader.AUTO_REFETCH_MAX_PER_MOVIE} 次）",
               flush=True)
+
+    def _is_busy(key):
+        # 该 id 的旧链接还在下载线程里 → 新链接先压着，等它退出处理态再投，
+        # 否则会被 process_one_entry 判成 "duplicate entry currently processing"。
+        return downloader.normalize_tmdb_id(key) in downloader.processing_ids
+
+    def source_factory(entries):
+        if holder["source"] is None:
+            # entries = 下载侧从既有 results.jsonl 读出的存量，必须发完，
+            # 否则这批片会被静默丢掉（取流侧不会再产出它们）。
+            # 但投递顺序是 重取结果 > 实时队列 > 存量：实时队列里的直链最新鲜，
+            # 且队列满会让取流侧 120s 后丢条目，不能让大存量把它们挤掉（R-A）。
+            holder["source"] = QueueEntrySource(
+                q, backlog=entries, refetcher=refetcher, is_busy=_is_busy
+            )
+            if holder["source"].backlog_total:
+                print(
+                    f"[pipeline] 断点续跑存量 {holder['source'].backlog_total} 部，"
+                    f"实时流有货时优先下实时流，空档时消费存量",
+                    flush=True,
+                )
+            return holder["source"]
+        return real_list_source(entries)
+
+    downloader.ListEntrySource = source_factory
 
     started = time.time()
     worker.start()
@@ -423,8 +567,12 @@ def _print_summary(worker, source, refetcher, started, interrupted=False):
           + f"，下载侧消费 {delivered} 部，总耗时 {elapsed / 60:.1f} 分钟")
     if refetcher is not None and refetcher.dispatched:
         stranded = refetcher.dispatched - refetcher.revived
+        in_round = getattr(source, "revived_delivered", 0) if source else 0
         print(f"[pipeline] 异步重取：投递 {refetcher.dispatched} 部，"
               f"换到新直链 {refetcher.revived} 部"
+              + (f"（{in_round} 部在首轮内即刻消费）" if in_round else "")
+              + (f"（{refetcher.skipped_inflight} 次因同片重取在途而合并）"
+                 if getattr(refetcher, "skipped_inflight", 0) else "")
               + (f"（{stranded} 部未及回收，已落盘 results.jsonl，"
                  f"下次运行自动使用）" if stranded > 0 else ""))
     if worker.error is not None:
