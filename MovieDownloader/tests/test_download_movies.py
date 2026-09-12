@@ -2280,23 +2280,22 @@ def test_unknown_resolution_constant_matches_literals():
 
 
 # ---------------------------------------------------------------------------
-# 源站回源故障的长冷却分档（待办 I）
+# 源站回源故障的冷却分档（**默认已关闭**，2026-09-12 起）
 # ---------------------------------------------------------------------------
-# 实测：这类失败 96.7% 发生在单节点片上，且换代理无效（直连与 3 个住宅 IP
-# 全是 502），恢复以小时计。60s×3 轮必然全部撞墙。
+# 判据函数 is_source_outage 与整条接线都保留，但长冷却默认 0（=关闭）：
+# 实测这类故障恢复是小时级，1800s 既跨不过去、又比 60s 多烧 29 分钟；
+# run4 实测长档换来的是"等 30 分钟、第 2 轮 75 部只救回 2 部"。
+# 这些片改由**跨运行重试**承接。
 
 def test_source_outage_detects_whole_node_sampling_failure():
-    """「候选流无一入选」= 整节点采样全挂 → 走长冷却。"""
+    """「候选流无一入选」= 整节点采样全挂。判据函数本身仍要认得它。"""
     assert d.is_source_outage(
         "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
     ) is True
 
 
 def test_source_outage_ignores_quality_rejection():
-    """🔑 画质判死不是源站故障——它确定性出局，重试再久也没用。
-
-    混淆两者会让"源站没坏、只是片子不合格"的轮次白等 30 分钟。
-    """
+    """🔑 画质判死不是源站故障——它确定性出局，重试再久也没用。"""
     assert d.is_source_outage(
         "2 个节点中 2 个因画质不达标被确定性淘汰（≥ 阈值 0.50），判定整片画质不达标"
     ) is False
@@ -2305,7 +2304,7 @@ def test_source_outage_ignores_quality_rejection():
 def test_source_outage_ignores_transient_single_stream_errors():
     """⚠️ 单条流/单个分片的瞬时抖动**不算**源站故障。
 
-    它们几十秒就恢复，拉长到 30 分钟纯属浪费。只有"整个节点的所有候选流
+    它们几十秒就恢复，拉长纯属浪费。只有"整个节点的所有候选流
     都采不到数据"才够格。
     """
     for msg in (
@@ -2318,10 +2317,9 @@ def test_source_outage_ignores_transient_single_stream_errors():
         assert d.is_source_outage(msg) is False, f"不该把 {msg!r} 判成源站故障"
 
 
-def test_source_outage_cooldown_is_much_longer_than_normal():
-    """护栏：长档必须显著长于短档，否则分档就没意义。"""
-    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS >= d.ROUND_COOLDOWN_SECONDS * 10
-    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS == 1800
+def test_long_cooldown_is_disabled_by_default():
+    """默认关闭长档：1800s 跨不过小时级故障，等于纯烧时间。"""
+    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS == 0
     assert d.ROUND_COOLDOWN_SECONDS == 60
 
 
@@ -2362,35 +2360,45 @@ def _run_two_rounds_capturing_cooldown(tmp_path, monkeypatch, error_msg):
     return slept
 
 
-def test_whole_node_sampling_failure_triggers_the_long_cooldown(
-    tmp_path, monkeypatch,
-):
-    """🔴 端到端：整节点采样全挂 → 轮次冷却真的走长档。"""
-    slept = _run_two_rounds_capturing_cooldown(
-        tmp_path, monkeypatch,
-        "本轮候选流无一入选（各流原因见上方日志），下一轮重采",
-    )
+_OUTAGE_MSG = "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
 
-    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS in slept, (
-        f"源站故障轮次应冷却 {d.SOURCE_OUTAGE_COOLDOWN_SECONDS}s，实际睡了 {slept}"
-    )
+
+def test_outage_round_uses_short_cooldown_when_long_is_disabled(
+    tmp_path, monkeypatch, capsys,
+):
+    """🔴 关闭长档后，源站故障轮必须退回**短档**——而不是睡 0 秒。
+
+    这是本次改动最容易写错的地方：`cooldown = LONG if outage else SHORT`
+    在 LONG=0 时会让故障轮一秒都不等，比普通轮还急着重试，与本意正相反。
+    """
+    monkeypatch.setattr(d, "SOURCE_OUTAGE_COOLDOWN_SECONDS", 0)
+    slept = _run_two_rounds_capturing_cooldown(tmp_path, monkeypatch, _OUTAGE_MSG)
+
+    assert d.ROUND_COOLDOWN_SECONDS in slept, f"应退回短档，实际睡了 {slept}"
+    assert 0 not in slept, "0 是'关闭分档'的意思，不是'不等待'"
+    # 日志要讲清楚这些片没被放弃，只是改由跨运行重试承接
+    assert "跨运行重试" in capsys.readouterr().out
+
+
+def test_long_cooldown_still_works_when_configured(tmp_path, monkeypatch):
+    """开关仍然有效：配了非 0 值就该用它（保留给"短时抽风"型故障）。"""
+    monkeypatch.setattr(d, "SOURCE_OUTAGE_COOLDOWN_SECONDS", 300)
+    slept = _run_two_rounds_capturing_cooldown(tmp_path, monkeypatch, _OUTAGE_MSG)
+
+    assert 300 in slept, f"配了长档就该用，实际睡了 {slept}"
 
 
 def test_ordinary_transient_failure_keeps_the_short_cooldown(
     tmp_path, monkeypatch,
 ):
-    """🔑 反向：普通瞬时失败仍走 60s，绝不能被拖成 30 分钟。
-
-    这是分档的意义所在——只给真正的源站故障付等待成本。
-    """
+    """🔑 普通瞬时失败走短档。即便长档开着也不该被它拖长。"""
+    monkeypatch.setattr(d, "SOURCE_OUTAGE_COOLDOWN_SECONDS", 300)
     slept = _run_two_rounds_capturing_cooldown(
         tmp_path, monkeypatch, "请求失败(HTTP Error 502)",
     )
 
     assert d.ROUND_COOLDOWN_SECONDS in slept
-    assert d.SOURCE_OUTAGE_COOLDOWN_SECONDS not in slept, (
-        f"普通抖动不该走长冷却，实际睡了 {slept}"
-    )
+    assert 300 not in slept, f"普通抖动不该走长冷却，实际睡了 {slept}"
 
 
 def test_bitrate_reject_message_does_not_lead_with_resolution(monkeypatch):

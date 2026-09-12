@@ -87,23 +87,23 @@ MAX_ROUNDS = max(1, int(_MULTI_ROUND_CFG.get("max_rounds", 1))) if MULTI_ROUND_E
 # 源站容量问题、冷却再久也不解决——三轮 10 分钟纯空转占了总时长 13%。
 ROUND_COOLDOWN_SECONDS = max(0, int(_MULTI_ROUND_CFG.get("cooldown_seconds", 60)))
 # 【源站回源故障专用的长冷却】本轮存在"整节点采样全挂"的片时，改用本值。
+# **默认 0 = 关闭分档**，所有轮次统一走 ROUND_COOLDOWN_SECONDS。
 #
-# 为什么要分档（500 部实跑 §12.18 / 待办 I 的实测结论）：
-#   - 30 部这类失败中 29 部是**单节点**片，没有备用源可切，只能等源站恢复；
-#   - 实测确认是 **CDN 回源故障**而非 IP 拦截——同一条分片 url 直连与住宅代理
-#     各试 3 次全是 502，且域名根路径返回 200（拦截会在根路径就 403）。
-#     故换代理、换节点都无效，唯一变量是**时间**；
-#   - 这类故障的恢复是**小时级**：故障后约 4 小时复测，3 部里 2 部恢复正常
-#     （分片返回 200 + 2MB 数据）。而 60s × 3 轮只跨几分钟，必然全部撞墙——
-#     实测代价约 5-7.5 小时无效重试，换回 0 部成功。
+# 为什么默认关掉（2026-09-12 run4 实测推翻了原设计）：
+#   原值 1800s 的立论是"等源站恢复"，但同一批实测也测出这类故障的恢复是
+#   **小时级**（故障后约 4 小时复测，3 部里 2 部才恢复）。1800s 只有 0.5 小时，
+#   **既跨不过故障窗口，又比 60s 多烧 29 分钟**，两头不讨好。
+#   run4 的账：长档触发 → 等 30 分钟 → 第 2 轮投 75 部**只救回 2 部**
+#   （第 1 轮 99 部）。30 分钟冷却 + 2 小时第 2 轮换来 2 部，不划算。
 #
-# 取 1800s 与取流侧「加时赛」冷却一致（见 config.yaml 的 final_retry），
-# 那里的经验同样适用：短于此基本等于再烧一次常规轮，没有意义。
+# 那这些片怎么办：**交给跨运行重试**。它天然已经存在（§12.28 E）——下次运行
+# 时 results.jsonl 里的失败片会自动重投，而那时往往已经过了几小时，
+# 恰好落在源站真正恢复的窗口里。用"下次再跑"换"本次干等"，成本低得多。
 #
-# ⚠️ 只在**存在**该类失败时才生效；其余失败（单流抖动、个别分片失败等）
-# 仍走 60s 快速重试，不受影响——它们几十秒就恢复，拉长纯属浪费。
+# 保留这个开关而不是删掉代码：真遇到"源站短时抽风、几分钟就好"的场景时，
+# 设一个几百秒的值仍然有意义。判据函数 is_source_outage 也一并保留。
 SOURCE_OUTAGE_COOLDOWN_SECONDS = max(
-    0, int(_MULTI_ROUND_CFG.get("source_outage_cooldown_seconds", 1800))
+    0, int(_MULTI_ROUND_CFG.get("source_outage_cooldown_seconds", 0))
 )
 
 # ---- 轮次间就地重取流（直链过期自愈）----
@@ -4935,16 +4935,27 @@ def _run_pipeline(run_volume=None):
                 break
 
             revived_note = f"、{len(revived)} 部已换到新直链" if revived else ""
-            # 冷却档位：本轮出现过「整节点采样全挂」就走长档。那是源站回源故障，
-            # 恢复以小时计，60s 跨不过去（实测 3 轮全撞墙、0 部救回）。
+            # 冷却档位。⚠️ 长档为 0 表示**关闭分档**，不是"睡 0 秒"——
+            # 后者会让源站故障轮比普通轮还急着重试，与本意正相反。
+            # 默认就是关闭：实测 1800s 跨不过小时级的源站故障，白等（见常量注释）。
+            use_long = bool(round_source_outage) and SOURCE_OUTAGE_COOLDOWN_SECONDS > 0
             cooldown = (
-                SOURCE_OUTAGE_COOLDOWN_SECONDS if round_source_outage
+                SOURCE_OUTAGE_COOLDOWN_SECONDS if use_long
                 else ROUND_COOLDOWN_SECONDS
             )
-            outage_note = (
-                f"（检测到源站采样全挂，冷却延长至 {cooldown}s 以跨过故障窗口）"
-                if round_source_outage else ""
-            )
+            if use_long:
+                outage_note = (
+                    f"（检测到源站采样全挂，冷却延长至 {cooldown}s 以跨过故障窗口）"
+                )
+            elif round_source_outage:
+                # 有故障片但没开长档：说清楚这些片不是被放弃了，只是改由
+                # 下次运行去救——否则看日志的人会以为它们被无视了。
+                outage_note = (
+                    "（本轮有整节点采样全挂的片，长冷却已关闭，"
+                    "它们留给跨运行重试）"
+                )
+            else:
+                outage_note = ""
             print(
                 f"\n本轮有 {len(round_failed_retriable)} 部可重试下载失败{revived_note}，"
                 f"冷却 {cooldown}s 后进入第 {round_no + 1} 轮...{outage_note}",
