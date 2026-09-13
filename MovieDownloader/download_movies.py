@@ -322,14 +322,29 @@ LENIENCY = float(_CFG.get("leniency", 0.8))
 # 且无一节点成功时，整片判死（不进下一轮），而非按默认的乐观口径重投。
 #
 # 为什么可以这么判（用概率代替求证）：画质声明与实际码率是**源站侧的固有属性**，
-# 不是随机变量——同一条 url 下一轮拿到的还是 480p。既然过半节点都实测/声明不达标，
-# 就有充分理由推断其余节点大概率同样不达标，不必再花两轮去"求证"。
-# 实测依据（§12.11 D）：29 部失败片各白跑 3 轮共约 28 分钟（占总时长 37%），
-# 只救回 1 部；其中约 17 部是画质注定不达标。全量几十万部时这个浪费会线性放大。
+# 不是随机变量——同一条 url 下一轮拿到的还是 480p。既然节点都实测/声明不达标，
+# 就有充分理由推断重投同样不达标，不必再花两轮去"求证"。
 #
-# 阈值语义：0.5 = 过半即判死；1.0 = 退回最保守档（全部节点都画质淘汰才判死）；
-# 设 >1.0 等于永不判死（回到改动前的行为）。
-QUALITY_KILL_RATIO = float(_CFG.get("quality_kill_ratio", 0.5))
+# 🔴 2026-09-13：由 0.5 改为 1.0，与 TV 侧统一到用户拍板的判死语义：
+#   **必须确定该片在所有存在资源的节点上都画质不达标才判死，其余一律可重试。**
+#
+#   改前的 0.5（"过半即判死"）会误杀这类片：2 个节点里 1 个画质不达标、
+#   1 个源站 502 —— 1/2 = 0.5 达阈值直接判死，可那个 502 节点**从未给出过
+#   画质结论**，明天源站好了完全可能是 1080p。全量几十万部时这类误杀是
+#   永久丢片，代价高于多跑一轮。
+#
+#   放弃的收益（§12.11 D，200 部实测）：29 部失败片各白跑 3 轮共约 28 分钟
+#   （占总时长 37%）只救回 1 部。这份提速是真实的，但它换来的是误杀风险，
+#   用户权衡后选择"宁可多跑不误杀"。
+#
+# ⚠️ 阈值只是**第一道**防线。真正保证语义的是 `is_quality_dead` 的第 3 道闸门
+# （要求全部节点的 reason_class 都是画质类）——阈值 1.0 挡不住"需重新取流 +
+# 画质"这类组合，因为那两个节点都是确定性失败、都不计入 quality_rejected_nodes。
+# 两者缺一不可，见 `is_quality_dead` 的文档。
+#
+# 阈值语义：1.0 = 全部节点都画质淘汰才判死（当前，与 TV 侧一致）；
+# 0.5 = 过半即判死（旧口径，会误杀混合场景）；>1.0 等于永不判死。
+QUALITY_KILL_RATIO = float(_CFG.get("quality_kill_ratio", 1.0))
 # 各编码在 1080p 基准下的最低码率门槛（kbps）。实际门槛按该流自身高度平方缩放：
 #   门槛 = 基准[codec] × (h/1080)² × LENIENCY
 # 分辨率判定关闭时不做缩放，直接是 基准[codec] × LENIENCY（绝对线）。
@@ -1126,17 +1141,53 @@ _QUALITY_REJECT_CATEGORIES = frozenset({
 })
 
 
-def is_quality_dead(retriable, error_msg):
+def is_quality_dead(retriable, error_msg, node_failures=None):
     """这条失败是否属于"因画质被确定性判死"。
 
-    两个条件都要满足：确定性失败（retriable=False）**且**文案是画质类。
-    只看文案不够——可重试失败的文案里也可能带画质 marker（多节点片里某个节点
-    画质淘汰、另一个节点 502，整片仍可重试）；只看 retriable 更不够，会把
-    "不支持的播放列表结构"这类与门槛无关的确定性失败也记进来。
+    三个条件缺一不可：
+
+      1. `retriable` 为 False —— 可重试失败一律不算（多节点片里某个节点画质
+         淘汰、另一个节点 502，整片仍可重试）；
+      2. 文案归类命中 `_QUALITY_REJECT_CATEGORIES` —— 只看 retriable 不够，
+         会把"不支持的播放列表结构"这类与门槛无关的确定性失败也记进来；
+      3. **全部节点都给出了画质结论** —— 见下方。
+
+    🔴 第 3 条是 2026-09-13 与 TV 侧对齐时补的（此前电影侧只有前两条）。
+
+    业务红线（用户拍板，两侧统一）：**判死必须确定该片在所有存在资源的节点上
+    都画质不达标**，其余情况一律可重试。判死的代价是永久丢一部，远高于多跑一轮。
+
+    没有第 3 条时的漏洞：`error_msg` 只保留**末节点**文案，而 `retriable`
+    是 `any_retriable or _classify_failure(msg)`。当**非画质的确定性失败**
+    （需重新取流 / 不支持的播放列表结构 / 直链块 404）排在前面、画质失败恰好
+    落在末位时：
+
+      - 这些节点不会让 `any_retriable` 变 True（它们本身就是确定性失败）；
+      - 也不计入 `quality_rejected_nodes`（类型不是 QualityRejectedError，
+        故外层概率判死那条路径正确地没有触发）；
+      - 但末节点文案是画质的 → 前两个条件双双成立 → 整片被判死。
+
+    而那个"需重新取流"的节点**从未给出过画质结论** —— 换条新直链完全可能是
+    1080p。判死它直接违背上面的红线。
+
+    node_failures：`process_one_entry` 的逐节点归因（也落在 failed.jsonl 里）。
+      - 非空 → 要求**每个**节点的 reason_class 都在画质类目里（合取）；
+      - None / 空 → 没有节点级信息（旧记录，或异常抛在节点循环之外），
+        退回前两个条件。这不是放水：那些路径本就没有"多节点"语义，
+        单节点片的判死结论与三条件版一致。
     """
     if retriable:
         return False
-    return classify_reject_reason(error_msg) in _QUALITY_REJECT_CATEGORIES
+    if classify_reject_reason(error_msg) not in _QUALITY_REJECT_CATEGORIES:
+        return False
+    if not node_failures:
+        return True
+    # 合取：任一节点没给出画质结论（5xx/直链失效/结构不支持/超时…），
+    # 就说明"该片在所有节点上都画质不达标"尚未被证实 → 不判死。
+    return all(
+        (node or {}).get("reason_class") in _QUALITY_REJECT_CATEGORIES
+        for node in node_failures
+    )
 
 
 def load_dead_ids(threshold_fn=None):
@@ -3626,6 +3677,25 @@ def process_one_entry(entry, processed_ids):
         processing_ids.add(normalized_id)
 
     handed_off_to_conversion = False
+    # 以下四个必须在 try **之外**初始化：下面的 except 会读它们，而异常可能在
+    # 进入节点循环之前就抛出（wait_for_disk_gate 的磁盘闸门、os.makedirs 的
+    # 权限/ENOSPC、print 的 BrokenPipeError），那时它们若还没定义就是 NameError
+    # ——真异常会被 NameError 顶掉，错误文案彻底失真。
+    any_retriable = False  # 只要有任一节点是“可重试失败”，整片就值得下一轮重试
+    # 有任一节点的 mp4 签名直链已过期。必须独立记录而不能事后从 last_exc 的
+    # 文案里读——`msg` 取的是**最后一个**节点的错误，若过期节点排在前面
+    # （如「节点1 vidlink 403 过期 → 节点2 502」），needs_refetch 就永远看不到
+    # 那条 marker，该直链在剩余所有轮次里都是废的。这是 §10.21 B-2「两条重投
+    # 路径不能互斥」在多节点场景下的漏网。
+    any_needs_refetch = False
+    # 画质确定性淘汰的节点数（认**类型** QualityRejectedError，不认文案）。
+    quality_rejected_nodes = 0
+    # 逐节点失败归因：每个失败节点一条 {node_index, provider, node_type,
+    # reason_class, retriable, error}。它是「判死必须全部节点都给出画质结论」
+    # 这条业务红线的**数据基础**——error 只留末节点文案，没有它就无法区分
+    # 「三个节点都画质不达标」与「一个画质不达标 + 两个 502」。
+    # 节点循环之外抛出的异常会让它保持为空列表（那时本就没有节点上下文）。
+    node_failures = []
     cleanup_paths = set()
     final_ts = os.path.join(TEMP_DIR, f"temp_{safe_file_token(tmdb_id)}.ts")
     temp_mp4 = os.path.join(TEMP_DIR, f"temp_{safe_file_token(tmdb_id)}.mp4")
@@ -4032,19 +4102,10 @@ def process_one_entry(entry, processed_ids):
         os.makedirs(TEMP_DIR, exist_ok=True)
 
         # 方案C：依次尝试各取流节点，任一节点下完即成功；全部失败才判失败。
+        # （any_retriable / any_needs_refetch / quality_rejected_nodes /
+        #   node_failures 均在 try 之外初始化，见那里的注释。）
         conversion_job = None
         last_exc = None
-        any_retriable = False  # 只要有任一节点是“可重试失败”，整片就值得下一轮重试
-        # 有任一节点的 mp4 签名直链已过期。必须独立记录而不能事后从 last_exc 的
-        # 文案里读——`msg` 取的是**最后一个**节点的错误，若过期节点排在前面
-        # （如「节点1 vidlink 403 过期 → 节点2 502」），needs_refetch 就永远看不到
-        # 那条 marker，该直链在剩余所有轮次里都是废的。这是 §10.21 B-2「两条重投
-        # 路径不能互斥」在多节点场景下的漏网。
-        any_needs_refetch = False
-        # 画质确定性淘汰的节点数。分母用**全部**节点（len(urls)），不是"拿到画质
-        # 信息的节点数"——后者会把「2 个画质淘汰 + 1 个 502」算成 2/2=100% 判死，
-        # 那个 502 节点从没被真正看过画质，据此判死过于激进。
-        quality_rejected_nodes = 0
 
         # mp4 跨节点码率择优：把 mp4 节点按实测码率重排，最优的先试。
         # 见 `_rank_mp4_nodes` —— 它只重排、不淘汰任何节点，故 fallback 能力
@@ -4080,13 +4141,27 @@ def process_one_entry(entry, processed_ids):
                 break
             except Exception as exc:
                 last_exc = exc
+                node_error = str(exc)
+                node_retriable = _classify_failure(node_error)
+                # 画质淘汰的节点单独计数（认**类型**不认文案，判据演进时零改动）。
                 if isinstance(exc, QualityRejectedError):
                     quality_rejected_nodes += 1
-                if needs_refetch(str(exc)):
+                # 每个失败节点一条：provider + 失败类目 + 可否重试。
+                # 类目供「判死必须全部节点都给出画质结论」这道闸门使用；
+                # 原始文案供人工排查（源站措辞变了时类目会落到"其他"）。
+                node_failures.append({
+                    "node_index": idx,
+                    "provider": node.get("provider"),
+                    "node_type": node.get("type"),
+                    "reason_class": classify_reject_reason(node_error),
+                    "retriable": node_retriable,
+                    "error": node_error,
+                })
+                if needs_refetch(node_error):
                     any_needs_refetch = True
                 # 记录本节点失败是否可重试：任一可重试即让整片进入外层多轮，
                 # 避免末节点恰为确定性失败时“连坐”误伤前面本可恢复的瞬时节点。
-                if _classify_failure(str(exc)):
+                if node_retriable:
                     any_retriable = True
                 # 本节点失败：清掉本轮残留的 ts，避免污染下一个节点。
                 remove_file(final_ts)
@@ -4137,6 +4212,11 @@ def process_one_entry(entry, processed_ids):
             "retriable": retriable,
             # 与 error 文案解耦：过期节点排在非末位时，文案里读不到过期 marker。
             "needs_refetch": any_needs_refetch,
+            # 逐节点归因：error 只留末节点文案，这里保留每个节点各自的
+            # provider / 类目 / 可否重试。判死闸门（is_quality_dead 第 3 条）
+            # 读它，落盘后则纯供人工复盘。
+            # 空列表表示异常抛在节点循环之外（磁盘闸门、建目录等）。
+            "node_failures": node_failures,
         }
     finally:
         # 下载成功后临时文件和 ID 锁交给转封装阶段管理。
@@ -4864,6 +4944,20 @@ def _run_pipeline(run_volume=None):
                 "urls": entry.get("urls", []),
                 "error": error_msg,
                 "stage": "download",
+                # 跨运行可见的失败性质。DOWNLOAD_FAIL_LOG 虽也记 retriable，
+                # 但它每轮开头清空、只反映本轮，跨运行读不到。
+                "retriable": retriable,
+                # 逐节点归因：error 只留末节点文案，这里保留每个节点各自的
+                # provider / 类目 / 可否重试。
+                #
+                # ⚠️ 这两个字段目前**只写不读**：电影侧判死结论由独立的
+                # download_dead.jsonl 持久化，没有"重读 failed.jsonl 复判"的
+                # 路径（TV 侧有 load_quality_dead_keys，那边才是刚需）。
+                # 留它们是为了事后能回答"这片到底挂在哪个源、为什么没判死"
+                # ——只看末节点文案是答不出来的，而判死是不可逆动作，出问题时
+                # 必须能复盘。代价是单条记录体积增约 7 成，由 failed.jsonl
+                # 的 100MB 轮转兜住（轮转按整行原样回填，字段不会丢）。
+                "node_failures": info.get("node_failures") or [],
             })
             # 下载态状态文件：本轮下载失败逐条记录（含可否重试）。
             write_log(DOWNLOAD_FAIL_LOG, {
@@ -4874,7 +4968,9 @@ def _run_pipeline(run_volume=None):
             })
             # 画质判死：持久化到 DOWNLOAD_DEAD_LOG，下次运行直接跳过，
             # 不再重新采样求证同一个结论（见 DOWNLOAD_DEAD_LOG 的注释）。
-            if is_quality_dead(retriable, error_msg):
+            # 🔴 必须传 node_failures：判死要求**全部节点**都给出画质结论，
+            # 不传的话"某节点直链失效 + 末节点画质不达标"会被误判死。
+            if is_quality_dead(retriable, error_msg, info.get("node_failures")):
                 record_quality_dead(
                     tmdb_id,
                     entry.get("title"),

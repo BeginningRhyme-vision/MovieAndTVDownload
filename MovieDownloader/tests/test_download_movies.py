@@ -837,11 +837,12 @@ def _quality_env(monkeypatch, per_node):
 
 
 def test_majority_quality_rejection_kills_the_movie(sandbox, monkeypatch):
-    """3 节点里 2 个画质淘汰 + 1 个 502 → 判死，不再进下一轮。
+    """3 节点里 2 个画质淘汰 + 1 个 502，**在旧口径 0.5 下**判死。
 
-    这正是 §12.11 D 的现场（892515）：改动前 any_retriable 只要有一个 502 就把
-    整片标成可重试，而画质声明下一轮一模一样，必然再挂。29 部这样的片白跑两轮
-    共 28 分钟只救回 1 部。
+    这正是 §12.11 D 的现场（892515）。
+    ⚠️ 2026-09-13 起默认阈值已改为 1.0，本用例显式把阈值按回 0.5，
+    锁的是"阈值 0.5 时概率判死仍按预期工作"这条机制，而**不是**当前默认行为。
+    当前默认行为见 test_default_ratio_keeps_mixed_failure_retryable。
     """
     monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 0.5)
     entry, _ = _quality_env(monkeypatch, [
@@ -916,6 +917,187 @@ def test_kill_ratio_one_point_zero_requires_every_node(sandbox, monkeypatch):
     ])
     _, _ok2, info2 = d.process_one_entry(entry2, set())
     assert info2["retriable"] is False
+
+
+# --- 2026-09-13：默认阈值 0.5 → 1.0，与 TV 侧统一到用户拍板的判死语义 -------
+def test_default_ratio_keeps_mixed_failure_retryable(sandbox, monkeypatch):
+    """🔒 红线（当前默认口径）：1 个画质淘汰 + 1 个 502 → **可重试**，不判死。
+
+    这是本次对齐修掉的核心误杀：改前阈值 0.5 时 1/2 = 0.5 达阈值直接判死，
+    可那个 502 节点**从未给出过画质结论**，源站恢复后完全可能是 1080p。
+
+    ⚠️ 本用例**刻意不 monkeypatch 阈值**，断言的是默认配置下的真实行为。
+    只断言 `QUALITY_KILL_RATIO == 1.0` 是不够的——那只锁住常量，
+    把阈值改回 0.5 时常量断言会红，但"行为是否正确"并没有被验证。
+    """
+    assert d.QUALITY_KILL_RATIO == 1.0, "默认阈值应为 1.0（与 TV 侧一致）"
+    entry, _ = _quality_env(monkeypatch, [
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+        RuntimeError("请求失败(HTTP Error 502)"),
+    ])
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert info["retriable"] is True
+    assert "因画质不达标" not in info["error"]   # 不得改写成判死汇总文案
+    assert d.is_quality_dead(
+        info["retriable"], info["error"], info.get("node_failures")
+    ) is False
+
+
+def test_default_ratio_kills_when_every_node_rejects_quality(sandbox, monkeypatch):
+    """对照组：全部节点画质淘汰 → 判死（否则上一条会变成平凡通过）。"""
+    entry, _ = _quality_env(monkeypatch, [
+        d.QualityRejectedError("声明分辨率 720p 低于红线 1080"),
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+    ])
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert info["retriable"] is False
+    assert d.is_quality_dead(
+        info["retriable"], info["error"], info.get("node_failures")
+    ) is True
+
+
+def test_refetch_node_plus_quality_node_is_not_dead_end_to_end(sandbox, monkeypatch):
+    """🔒 端到端红线：节点1 直链失效 + 节点2 画质不达标 → **不判死**。
+
+    这个组合是第 3 道闸门存在的唯一理由：两个节点**都是确定性失败**
+    （any_retriable 保持 False），末节点文案又是画质的，前两道闸门双双失守。
+    单靠阈值 1.0 拦不住它——那两个节点里只有 1 个计入 quality_rejected_nodes，
+    概率判死本就没触发，是 retriable 的文案兜底路径把它判成了判死。
+
+    业务含义：直链失效的节点换条新 url 完全可能是 1080p，凭什么替它断定
+    "整片画质不达标"。
+    """
+    entry, _ = _quality_env(monkeypatch, [
+        RuntimeError("直链已失效（HTTP 403），需重新取流: x"),
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+    ])
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    # 两个节点都是确定性失败，整片 retriable 确实是 False
+    assert info["retriable"] is False
+    # 但**不是**画质判死：有节点从未给出画质结论
+    assert d.is_quality_dead(
+        info["retriable"], info["error"], info.get("node_failures")
+    ) is False
+    # 且仍会进重取桶——这才是这部片真正的出路
+    assert info.get("needs_refetch") is True
+
+
+def test_node_failures_records_each_node(sandbox, monkeypatch):
+    """逐节点归因必须逐条记录，这是第 3 道闸门的数据基础。"""
+    entry, _ = _quality_env(monkeypatch, [
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+        RuntimeError("请求失败(HTTP Error 502)"),
+    ])
+    _, _ok, info = d.process_one_entry(entry, set())
+    nf = info.get("node_failures")
+    assert len(nf) == 2
+    assert [n["node_index"] for n in nf] == [1, 2]
+    assert [n["reason_class"] for n in nf] == ["分辨率低于红线", "源站5xx"]
+    assert [n["retriable"] for n in nf] == [False, True]
+    assert all(n["provider"] == "vidlink" for n in nf)
+
+
+def test_node_failures_survives_exception_before_node_loop(sandbox, monkeypatch):
+    """🔒 节点循环之外抛异常时，四个统计变量不得 NameError。
+
+    它们现在都在 try **之外**初始化。改回 try 内的话，磁盘闸门/建目录抛异常时
+    except 读 any_retriable 会 NameError——真异常被顶掉、错误文案彻底失真。
+    """
+    def boom():
+        raise OSError("disk gate exploded")
+
+    monkeypatch.setattr(d, "wait_for_disk_gate", boom)
+    entry = {"tmdbId": "77", "title": "T", "urls": [
+        {"url": "https://a/0.mp4", "provider": "vidlink", "type": "mp4",
+         "headers": {}, "quality": None, "size": None}]}
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert "disk gate exploded" in info["error"]   # 真异常没被 NameError 顶掉
+    assert info["node_failures"] == []             # 本就没有节点上下文
+
+
+def _dead_ledger_env(tmp_path, monkeypatch, per_node):
+    """端到端跑 _run_pipeline，返回判死账本里的 id 集合。
+
+    覆盖的是「判死结论落盘」这条路径——只测 is_quality_dead 的单元行为
+    不够：落账本处若忘了传 node_failures，单元测试照样全绿（反向验证实测过）。
+    """
+    _isolate_logs(tmp_path, monkeypatch)
+    dead_log = tmp_path / "download_dead.jsonl"
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(dead_log))
+    monkeypatch.setattr(d, "_mp4_preflight", lambda *a, **k: None)
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+
+    calls = []
+
+    def fake_mp4(node, output_path, label, runtime_minutes=None, preflight=None):
+        exc = per_node[len(calls)]
+        calls.append(node["url"])
+        raise exc
+
+    monkeypatch.setattr(d, "_download_mp4_direct", fake_mp4)
+
+    line = {"tmdbId": "55", "title": "T", "urls": [
+        {"url": "https://a/%d.mp4" % i, "provider": "vidlink", "type": "mp4",
+         "headers": {}, "quality": None, "size": None}
+        for i in range(len(per_node))
+    ]}
+    input_path = tmp_path / "results.jsonl"
+    input_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+
+    d._run_pipeline()
+    return d.load_dead_ids()
+
+
+def test_dead_ledger_skips_when_a_node_lacks_quality_verdict(tmp_path, monkeypatch):
+    """🔒 端到端：直链失效 + 画质不达标 → **不得**写进 download_dead.jsonl。
+
+    这条路径是第 3 道闸门的最后一环。落账本处若忘了传 node_failures，
+    这部片会被永久跳过——而它真正需要的只是重新取一条链接。
+    """
+    assert _dead_ledger_env(tmp_path, monkeypatch, [
+        RuntimeError("直链已失效（HTTP 403），需重新取流: x"),
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+    ]) == set()
+
+
+def test_dead_ledger_records_when_every_node_rejects_quality(tmp_path, monkeypatch):
+    """对照组：全部节点画质淘汰 → 必须写进账本（否则上一条是平凡通过）。"""
+    assert _dead_ledger_env(tmp_path, monkeypatch, [
+        d.QualityRejectedError("声明分辨率 720p 低于红线 1080"),
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+    ]) == {"55"}
+
+
+def test_failed_log_persists_node_failures(tmp_path, monkeypatch):
+    """failed.jsonl 必须落 node_failures / retriable，供事后复盘判死结论。
+
+    电影侧没有"重读 failed.jsonl 复判判死"的路径（那是 TV 侧的
+    load_quality_dead_keys），但判死不可逆，出问题时必须能回答
+    "这片挂在哪个源、为什么(没)判死"——末节点文案答不出来。
+    """
+    _dead_ledger_env(tmp_path, monkeypatch, [
+        d.QualityRejectedError("声明分辨率 480p 低于红线 1080"),
+        RuntimeError("请求失败(HTTP Error 502)"),
+    ])
+    rows = [json.loads(x) for x in
+            (tmp_path / "failed.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()]
+    download_rows = [r for r in rows if r.get("stage") == "download"]
+    assert download_rows, "应有一条 download 阶段的失败记录"
+    nf = download_rows[-1].get("node_failures")
+    assert [n["reason_class"] for n in nf] == ["分辨率低于红线", "源站5xx"]
+    # retriable 同样必须落盘：只看 error 文案（末节点的 502）会得出
+    # "这是个可重试的 5xx"，读不出前面那个节点是画质淘汰。
+    assert download_rows[-1].get("retriable") is True
 
 
 def test_successful_node_is_never_killed(sandbox, monkeypatch):
@@ -3602,6 +3784,53 @@ def test_is_quality_dead_requires_both_conditions():
     # 确定性失败但与画质无关 → 不进判死账本（它们不受门槛变更影响）
     assert d.is_quality_dead(False, "不支持的播放列表结构") is False
     assert d.is_quality_dead(False, "缺少 tmdbId 或 urls") is False
+
+
+# --- 第 3 道闸门：必须**全部节点**都给出画质结论才判死（2026-09-13 与 TV 侧对齐）
+# 业务红线（用户拍板，两侧统一）：判死必须确定"该片在所有存在资源的节点上都画质
+# 不达标"，其余情况一律可重试。误判死 = 永久丢一部，代价远高于多跑一轮。
+_QUALITY_NODE = {"reason_class": "分辨率低于红线"}
+_BITRATE_NODE = {"reason_class": "码率未达门槛"}
+_REFETCH_NODE = {"reason_class": d._REFETCH_REASON_LABEL}
+_5XX_NODE = {"reason_class": "源站5xx"}
+_STRUCT_NODE = {"reason_class": "不支持的播放列表结构"}
+_CHUNK404_NODE = {"reason_class": "直链块不可用(404/416)"}
+
+
+def test_quality_dead_requires_every_node_to_report_quality():
+    """全部节点都是画质类结论 → 判死（这才是"所有节点都不达标"）。"""
+    msg = d.bitrate_reject_message("640x360", "h264", 300, 1600)
+    assert d.is_quality_dead(False, msg, [_QUALITY_NODE]) is True
+    assert d.is_quality_dead(False, msg, [_QUALITY_NODE, _BITRATE_NODE]) is True
+
+
+@pytest.mark.parametrize("other_node, label", [
+    (_REFETCH_NODE, "直链失效（换新链接可能就是 1080p）"),
+    (_5XX_NODE, "源站 5xx（今天挂了、明天可能好）"),
+    (_STRUCT_NODE, "结构不支持（该节点从未给出画质结论）"),
+    (_CHUNK404_NODE, "直链块 404"),
+])
+def test_quality_dead_blocked_when_any_node_lacks_quality_verdict(other_node, label):
+    """🔒 红线：任一节点没给出画质结论 → 绝不判死，无论它排在第几位。
+
+    成因：error_msg 只留**末节点**文案，而"需重新取流/结构不支持/直链块404"
+    这类**非画质的确定性失败**既不会让 any_retriable 变 True、也不计入
+    quality_rejected_nodes，于是画质失败恰好落在末位时前两道闸门双双失守。
+    （改动前电影侧实测 14 个场景中 10 个违背业务语义。）
+    """
+    msg = d.bitrate_reject_message("640x360", "h264", 300, 1600)
+    assert d.is_quality_dead(False, msg, [other_node, _QUALITY_NODE]) is False, label
+    assert d.is_quality_dead(False, msg, [_QUALITY_NODE, other_node]) is False, label
+
+
+def test_quality_dead_without_node_failures_falls_back_to_two_conditions():
+    """无逐节点信息（旧记录 / 异常抛在节点循环之外）→ 退回两条件口径。
+
+    不是放水：那些路径本就没有"多节点"语义，单节点片结论与三条件版一致。
+    """
+    msg = d.bitrate_reject_message("640x360", "h264", 300, 1600)
+    assert d.is_quality_dead(False, msg, None) is True
+    assert d.is_quality_dead(False, msg, []) is True
 
 
 def test_record_and_load_dead_ids_round_trip(tmp_path, monkeypatch):
