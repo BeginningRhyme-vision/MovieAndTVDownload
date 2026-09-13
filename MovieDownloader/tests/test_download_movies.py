@@ -3219,6 +3219,98 @@ def test_streaming_source_does_not_busy_wait_when_producer_is_slow():
     assert source.polls == 5
 
 
+def test_streaming_new_entry_is_picked_up_while_a_slow_task_is_inflight(
+    tmp_path, monkeypatch
+):
+    """🔴 回归：慢任务在途时，来源新产出的片必须被及时投递，不能等它下完。
+
+    这是 2026-09-13 服务器实跑打到脸上的缺陷（"假反压"）：全新部署跑 pipeline，
+    取流侧 94 部成功入队，下载侧却**只投出去 1 部**，16 个槽位空着 15 个，
+    带宽只跑到 4MB/s —— 整条流水线退化成串行下载。
+
+    根因：主循环 `wait(pending)` 无超时，只在**有 future 完成**时才醒；而
+    "取流侧又产出了新片"不是 future 完成事件，队列不是 future，主循环感知不到。
+    修法：来源报 "wait" 时给 wait 加 STREAM_IDLE_POLL_SECONDS 超时。
+
+    ⚠️ 用例写法的两个坑（TV 侧踩过，照搬时注意）：
+      1. **断言总耗时无效** —— 它必然包含慢任务全程（流水线要排空才返回），
+         必须测"第二部**被投递**的时刻"；
+      2. 若让工作线程**立刻**放行第二部，主线程会在同一次投递循环里就取走它、
+         压根走不到 wait，测不出问题 —— 故第二部必须**延后**放行。
+    """
+    _isolate_logs(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "INPUT_JSONL", str(tmp_path / "nope.jsonl"))
+    monkeypatch.setattr(d, "clean_temp_directory", lambda: None)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", False)
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.05)
+
+    fast_ready = threading.Event()
+    release_slow = threading.Event()
+    started_at = {}
+
+    class _LateSource:
+        """第一部立刻给；第二部要等主循环**已经进入 wait** 之后才"到货"。
+
+        这样就复刻了实跑现场：主循环投完第一部后队列暂时空着（返回 wait），
+        随后取流侧才产出第二部 —— 没有超时的话主循环此刻已经睡死了。
+        """
+        def __init__(self):
+            self.sent = 0
+
+        def poll(self):
+            if self.sent == 0:
+                self.sent = 1
+                return "item", {"tmdbId": "slow", "urls": [{"url": "u"}]}
+            if self.sent == 1:
+                # 🔑 第二部必须**延后**到主循环进了 wait 之后才给（fast_ready
+                # 由 0.3s 的 Timer 置位）。若在这里立刻返回 "fast"，主线程会在
+                # **同一次 submit_downloads 循环**里就把它取走、压根走不到
+                # wait —— 那样改坏生产代码用例照样绿（反向验证实测过）。
+                if not fast_ready.is_set():
+                    return "wait", None
+                self.sent = 2
+                return "item", {"tmdbId": "fast", "urls": [{"url": "u"}]}
+            return "done", None
+
+    def _fake_process(entry, processed_ids):
+        tid = entry["tmdbId"]
+        started_at[tid] = time.monotonic()
+        if tid == "slow":
+            release_slow.wait(10)
+        return tid, False, {"error": "stub", "retriable": False}
+
+    monkeypatch.setattr(d, "process_one_entry", _fake_process)
+    monkeypatch.setattr(d, "ListEntrySource", lambda entries: _LateSource())
+
+    # 0.3s 后第二部"到货"（此时主循环已在 wait 里），1.2s 后慢任务才放行。
+    # 修复生效：wait 每 0.05s 醒一次 → "fast" 在 ~0.3s 就被投递。
+    # 修复失效：wait 只在 future 完成时醒 → "fast" 要等到 ~1.2s。
+    # 两者相差一个数量级，阈值 0.8s 落在中间，不依赖机器快慢。
+    ready_timer = threading.Timer(0.3, fast_ready.set)
+    release_timer = threading.Timer(1.2, release_slow.set)
+    ready_timer.start()
+    release_timer.start()
+    try:
+        d._run_pipeline()
+    finally:
+        ready_timer.cancel()
+        release_timer.cancel()
+        fast_ready.set()
+        release_slow.set()
+
+    assert set(started_at) == {"slow", "fast"}
+    gap = started_at["fast"] - started_at["slow"]
+    assert gap < 0.8, (
+        f"第二部片等了 {gap:.2f}s 才被投递（慢任务 1.2s 后才放行，"
+        f"而它 0.3s 就该到货）—— 主循环在等 future 完成，而不是在等来源产出。"
+        f"这正是'假反压'：实跑现场 16 个槽位只用了 1 个。"
+    )
+
+
 def test_refetch_survives_system_exit_from_fetcher(sandbox, monkeypatch):
     """取流模块用模块级 `raise SystemExit` 做配置校验，必须被兜住。
 

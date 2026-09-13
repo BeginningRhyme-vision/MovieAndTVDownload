@@ -5226,6 +5226,9 @@ def _run_pipeline(run_volume=None):
             # 附带收益是磁盘占用更平滑（未投递的片不占 temp）。
             source_exhausted = False
             round_download_futures = set()
+            # 来源上次投递时是否报了 "wait"（有货没到，但生产者还活着）。
+            # 它决定下面的 wait(pending) 要不要带超时 —— 见那里的详细说明。
+            source_waiting = False
 
             def submit_downloads():
                 """从来源取片填满下载槽位。返回 False 表示"来源暂时没货但未耗尽"。
@@ -5233,7 +5236,8 @@ def _run_pipeline(run_volume=None):
                 取到 "wait" 时立即停止本次投递（而不是原地等），把控制权交回主循环
                 去推进在途的转封装/上传——绝不能在这里阻塞（见 ListEntrySource 注释）。
                 """
-                nonlocal source_exhausted
+                nonlocal source_exhausted, source_waiting
+                source_waiting = False
                 while len(round_download_futures) < DOWNLOAD_QUEUE_DEPTH:
                     if source_exhausted:
                         return True
@@ -5242,6 +5246,7 @@ def _run_pipeline(run_volume=None):
                         source_exhausted = True
                         return True
                     if state == "wait":
+                        source_waiting = True
                         return False
                     f = download_executor.submit(
                         process_one_entry, entry, processed_ids
@@ -5275,7 +5280,35 @@ def _run_pipeline(run_volume=None):
                     time.sleep(STREAM_IDLE_POLL_SECONDS)
                     submit_downloads()
                     continue
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                # 🔴 来源还在等货时必须给 wait 加超时（2026-09-13 实跑实锤）。
+                #
+                # 症状：全新部署跑 pipeline，取流侧 94 部成功入队，下载侧却
+                # **只投出去 1 部**，16 个槽位空着 15 个，带宽只跑到 4MB/s。
+                #
+                # 根因：无超时的 wait 只在**有 future 完成**时才醒。而"取流侧
+                # 又产出了新片"**不是 future 完成事件** —— 队列不是 future，
+                # 主循环对它完全无感。于是首轮启动时（backlog 为空、片子全靠
+                # 队列实时来）投出第一部后就卡死在这里，非要等那一部整个下完
+                # 才会醒来投第二部，整条流水线退化成**串行下载**。
+                #
+                # ⚠️ 这是"假反压"：效果与反压相同（停止投递新片），理由却完全
+                # 不同——取流侧饿着跟磁盘压力毫无关系。真正的反压有三道闸门各
+                # 司其职（DOWNLOAD_QUEUE_DEPTH / upload_semaphore / disk_gate），
+                # 不该靠"主循环恰好没醒"来间接限流。
+                #
+                # 📌 我此前评估这个缺陷时判断失误，记在这里免得重蹈：曾认为
+                # "电影侧下载是瓶颈、队列长期满，故不容易触发"。恰恰相反——
+                # **全新部署时 backlog 为空，是最容易触发的场景**，而多机分跑
+                # 每台都是全新部署。TV 侧同缺陷已于 2026-09-12 修复。
+                #
+                # 只在 source_waiting 时加超时，其余情形保持无超时阻塞：
+                #   - 槽位已满 / 来源已耗尽 → 没有新片要投，唤醒纯属空耗；
+                #   - 单独跑 download_movies.py → list 来源永不返回 "wait"，
+                #     source_waiting 恒 False，行为与改动前**完全一致**。
+                timeout = STREAM_IDLE_POLL_SECONDS if source_waiting else None
+                done, _ = wait(
+                    pending, return_when=FIRST_COMPLETED, timeout=timeout
+                )
                 for future in done:
                     pending.discard(future)
                     round_download_futures.discard(future)
