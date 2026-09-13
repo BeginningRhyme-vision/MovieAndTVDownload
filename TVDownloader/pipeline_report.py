@@ -234,6 +234,36 @@ def _print_provider_funnel(offered_by, won_by, fallback_wins,
         )
 
 
+def _print_provider_failures(fail_by_provider, fail_rows_without_attr):
+    """各取流源的失败原因拆分（来自 failed.jsonl 的 node_failures）。
+
+    与上面的转化率表互补：那张表回答"哪家下成了"，这张回答"哪家为什么没成"。
+
+    🔑 没有它就只能靠"直链类目 ≈ vidlink"这种代理指标硬猜，而且**无法区分
+    同为 m3u8 的 vidup 与 vidfast**——`error` 字段只保留末节点的文案，
+    前面节点的失败原因此前根本不落盘。
+
+    ⚠️ 计数单位是「节点失败次数」不是「集数」：同一集的多个节点各记一次，
+    且跨轮重投会重复计数。用于看**构成比例**，不要与集数横向相加。
+    """
+    if not fail_by_provider:
+        return
+    print("\n  各源失败原因（单位=节点失败次数，同集多节点各记一次、跨轮会重复计）：")
+    for name in sorted(fail_by_provider, key=lambda n: -sum(fail_by_provider[n].values())):
+        reasons = fail_by_provider[name]
+        total = sum(reasons.values())
+        top = "；".join(
+            f"{reason} {count}（{_pct(count, total)}）"
+            for reason, count in reasons.most_common(4)
+        )
+        print(f"    {name}: 共 {total} 次 —— {top}")
+    if fail_rows_without_attr:
+        print(
+            f"    ⚠️ {fail_rows_without_attr} 条下载失败记录没有逐节点归因——"
+            "加该字段之前的旧记录，或异常抛在节点循环之外（磁盘闸门等）"
+        )
+
+
 def main():
     cfg = _cfg()
     links_cfg = cfg.get("tv_ids_to_links", {}) or {}
@@ -327,11 +357,25 @@ def main():
 
     stage_fail = Counter()
     dl_fail_reason = Counter()
+    # 逐节点归因：provider -> 失败类目计数。来自 download 阶段的 node_failures。
+    fail_by_provider = {}
+    fail_rows_without_attr = 0
     for record in _iter_jsonl(failed_log):
         stage = record.get("stage") or "unknown"
         stage_fail[stage] += 1
         if stage == "download":
             dl_fail_reason[str(record.get("error", ""))[:60] or "未知"] += 1
+            nodes = record.get("node_failures") or []
+            if not nodes:
+                # 旧记录（加该字段之前）或异常抛在节点循环之外。单独计数报出，
+                # 不静默少算——否则各源占比会被悄悄扭曲。
+                fail_rows_without_attr += 1
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                name = str(node.get("provider") or "unknown")
+                reason = str(node.get("reason_class") or "其他")
+                fail_by_provider.setdefault(name, Counter())[reason] += 1
 
     total = len(expected)
     print(f"\n剧集清单：{len(ids)} 部")
@@ -394,6 +438,8 @@ def main():
         "下载失败原因 Top（截断至 60 字符）", dl_fail_reason,
         sum(dl_fail_reason.values()),
     )
+    # 放在整集失败原因之后：先看"整体为什么失败"，再看"拆到每个源是什么构成"。
+    _print_provider_failures(fail_by_provider, fail_rows_without_attr)
 
     print(f"\n【3·转封装落地】{len(finalized)} 集（占下载成功 {_pct(len(finalized), len(downloaded))}）")
 

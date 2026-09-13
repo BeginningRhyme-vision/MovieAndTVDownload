@@ -136,6 +136,43 @@ AUTO_REFETCH_TIMEOUT = max(
 # 两个独立的下载态状态文件（区别于 SUCCESS_LOG/FAILED_LOG）。
 DOWNLOAD_OK_LOG = resolve_file(_CFG.get("download_ok_log"), "download_ok.jsonl")
 DOWNLOAD_FAIL_LOG = resolve_file(_CFG.get("download_fail_log"), "download_fail.jsonl")
+# 【画质判死账本】累计追加，记"因画质被确定性判死"的集 + 当时的判定依据。
+# 启动时并入跳过集，避免每次重跑都把注定失败的集重新采样、重新判死一遍。
+#
+# ⚠️ 与 fail.txt 语义完全不同，勿混用：
+#   fail.txt          = 取流侧"源站明确说没有这一集"，永久排除；
+#   download_dead_log = "有源但画质不达标"，门槛调松后可用 --retry-dead 放回。
+#
+# 🔑 为什么 TV 侧比电影侧更需要它：TV 集级有源率只有个位数，而"取到流了但画质
+# 不达标"在失败构成里占比很高。此前这类集**每次运行都会被完整投入下载队列**、
+# 重新采样求证同一个结论（`load_quality_dead_keys` 只用于跳过重取流，不影响
+# 是否下载），几十万集规模下浪费被线性放大。
+DOWNLOAD_DEAD_LOG = resolve_file(
+    _CFG.get("download_dead_log"), "download_dead.jsonl"
+)
+# --retry-dead 放回判死集的余量系数：要求 新门槛 × 本值 <= 当时实测码率。
+# 为什么要留余量：实测码率是"那次采样窗口"的值、本身有波动。门槛恰好压在
+# 记录值上就放回的话，重新采样很可能测出略低的值又被判死，形成来回震荡、
+# 每轮都白跑。1.05 = 门槛要比记录值低 5% 以上才放回。设 1.0 = 不留余量。
+DEAD_REVIVE_MARGIN = max(1.0, float(_CFG.get("dead_revive_margin", 1.05)))
+# ---- failed.jsonl 归档轮转 ----
+# failed.jsonl 是纯追加、永不清理的。TV 侧几十万集规模下它会持续膨胀，而
+# `load_quality_dead_keys()` **每次启动都要全量顺扫它**，启动成本线性上升。
+#
+# 超过 max_bytes 就在**运行收尾时**轮转：整个文件移进 archive/failed_<时间戳>.jsonl，
+# 再把仍有用的行原样写回一个新的 failed.jsonl。
+#
+# 🔑 为什么必须回填而不是简单移走：两类行还有人要读 ——
+#   ① 带"需重新取流"标记的行（重取闭环靠它挑待重取的集，丢了直接掉成功率）；
+#   ② 画质判死行（load_quality_dead_keys 靠它决定预检跳过哪些集）。
+# 详见 _failed_row_still_useful。设为 0 可关闭轮转。
+_COMPACT_CFG = _CFG.get("failed_log_rotation", {}) or {}
+FAILED_LOG_MAX_BYTES = max(
+    0, int(_COMPACT_CFG.get("max_bytes", 100 * 1024 * 1024))
+)
+# 由 __main__ 按命令行开关置位；模块级默认 False，便于测试直接 monkeypatch。
+RETRY_DEAD_MODE = False
+RETRY_ONLY_MODE = False
 BASE_DIR = resolve_dir(_CFG.get("base_dir"), "downloads")
 # 本地目录与 R2 对象键共用的根段，使两侧严格同构：
 #   本地  {BASE_DIR}/tv/{year}/{tmdbId}/S{ss}/E{ee}/E{ee}.mp4
@@ -251,6 +288,27 @@ _BITRATE_BASELINE_HEIGHT = 1080
 MAX_MISSING_RATIO = float(_CFG.get("max_missing_ratio", 0.02))
 # 小样本豁免：允许至少丢这么多片而不触发阈值（与比例阈值取较大者）。
 MIN_MISSING_ALLOWANCE = int(_CFG.get("min_missing_allowance", 1))
+# 【整集画质判死阈值】本轮尝试过的节点中，因画质不达标被确定性淘汰的比例达到
+# 该值、且无一节点下载成功时，整集直接判死，不再进入下一轮重投。
+#
+# 为什么可以用"概率"代替"逐轮求证"：分辨率与码率是**源站侧的固有属性**，
+# 不是随机变量——同一条 url 下一轮拿到的还是 480p。
+#
+# 🔴 TV 侧默认 1.0（全部节点都画质淘汰才判死），**刻意比电影侧的 0.5 保守**：
+#   - TV 侧大量集只有 1-2 个节点（vidup 单源占多数）。阈值 0.5 时单节点集
+#     只要画质淘汰一次就立刻判死——那不是"概率判死"而是"一次判死"，
+#     比电影侧激进得多；
+#   - TV 侧集级有源率只有个位数，误杀一集的相对代价更高；
+#   - download_tv.py 至今未做过全量实测，没有数据支撑更激进的阈值。
+#
+# ⚠️ 只统计"画质"这一类确定性淘汰（认 QualityRejectedError 类型），
+# 源站 5xx / 采样抖动等瞬时失败**不计入**，故源站抽风不会触发误杀。
+#
+# 取值语义：
+#   1.0  全部节点都因画质淘汰才判死（默认，最保守）
+#   0.5  过半即判死（电影侧口径，TV 侧待实测数据支撑后再考虑）
+#   >1.0 等于永不判死，回到本功能上线前的乐观口径
+QUALITY_KILL_RATIO = float(_CFG.get("quality_kill_ratio", 1.0))
 
 # ---- R2 上传配置 ----
 UPLOAD_PENDING_LOG = resolve_file(_CFG.get("upload_pending_log"), "upload_pending.jsonl")
@@ -450,6 +508,28 @@ class UnsupportedPlaylistError(RuntimeError):
     """播放列表使用了当前手工分片下载器不支持的 HLS 功能。"""
 
 
+class QualityRejectedError(RuntimeError):
+    """本条流 / 本个节点因画质不达标被淘汰——同一条 url 重下必然复现。
+
+    🔑 为什么要用异常类型而不是继续认错误文案：
+    "画质不达标"这个**语义**是稳定的，但它的**判据是会变的**（当前是
+    分辨率红线 + 码率门槛，日后可能改口径）。若上层靠 `"低于红线" in msg`
+    这类字符串识别，判据一变就要同步改判定表、统计表、内层聚合三处，必漏。
+    改成认类型后，判据怎么演进上层都零改动：新增画质关卡时照样 raise 本异常即可。
+
+    🔴 TV 侧引入它的**直接动因**（与电影侧的历史不同，务必理解这一点）：
+    此前内层「全流画质淘汰」与「瞬时采样全挂」共用同一句兜底文案
+    「本轮候选流无一入选」，两种语义混装在一起、无法区分。而该文案又被列进了
+    画质判死类目 —— 一旦有人把它加进 `_PERMANENT_FAILURE_MARKERS`，
+    源站抽风（5xx 采样全挂）的集就会被**永久判死**，直接砍成功率。
+    有了类型层，两条路径产生不同的文案与不同的结论，这个雷被拆掉。
+
+    文案仍保留既有 marker（低于红线 / 码率未达到 / 没有找到高度达标），
+    因为 `_PERMANENT_FAILURE_MARKERS`、`_REJECT_REASON_RULES` 与历史
+    failed.jsonl 都按文案工作，换类型不该破坏它们的兼容性。
+    """
+
+
 # ---- 进程级中断信号 ----
 # ⚠️ 为什么必须有它（电影侧服务器实跑踩到的坑，TV 侧同源）：分片重试是
 # `time.sleep(退避)` 的长循环，退避第 7 次起封顶 60s，单分片最多 20 次
@@ -477,6 +557,73 @@ def record_block_status(status):
         count = block_status_counter[status]
     if count in (1, 10, 50) or count % 200 == 0:
         print(f"  [风控监控] HTTP {status} 累计出现 {count} 次")
+
+
+# ---------- CDN 主机级 429 熔断（只作用于 mp4 直链）----------
+# 背景（电影侧 §12.21 实测确诊）：hakunaymatata 的某台主机整机故障——换 3 个住宅
+# IP、换新签名、冷却 30s 后**恒定** 429（Server 头是 nginx，而正常主机是 Tengine），
+# 当次 341 条 vidlink url 有 153 条指向它。没有熔断时每部片都要把这台坏主机重试
+# 一遍、还跨多轮，白烧大量时间。
+#
+# TV 侧场景完全对应：vidlink 的 CDN 域名同样高度集中（§0.0 实测命中分布
+# bcdn 123 / bcdn4 26 / hcdn3 18 / bcdnxw 4），一台坏主机会牵连成百上千集。
+#
+# 🔑 四条边界（避免把"省时间"做成"降成功率"）：
+#   - **只作用于 mp4 直链**：m3u8 分片层的 429 仍按限流退避重试，语义不变
+#     （_NO_RETRY_HTTP_STATUS 的注释明确写了 429/503 属"必须重试"一类）；
+#   - **只跳过同一台主机的节点**，其余节点（含同域其它主机）照常尝试；
+#   - **不判整集死**：熔断文案不进 _PERMANENT_FAILURE_MARKERS，整集仍可进
+#     下一轮重投——万一主机恢复了还能救回来；
+#   - 计数仅存活于**本次运行**（模块级字典，进程退出即清空），不落盘。
+#     主机故障是临时状态，落盘会让下次运行带着过期结论跑。
+_mp4_host_lock = threading.Lock()
+_mp4_host_429 = {}
+_mp4_host_tripped = set()
+# 单台主机累计多少次 429 后熔断。3 次足以区分"偶发限流"（退避后恢复）与
+# "整机故障"（次次复现）。
+MP4_HOST_CIRCUIT_THRESHOLD = max(
+    1, int(_CFG.get("mp4_host_circuit_threshold", 3))
+)
+# 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS（见上第三条边界）。
+_MP4_HOST_BLOCKED_MARKER = "直链主机疑似故障已熔断"
+
+
+def _host_of(url):
+    """取 url 的主机名；解析不出返回空串。"""
+    try:
+        return str(url).split("://", 1)[1].split("/", 1)[0].lower()
+    except (IndexError, AttributeError):
+        return ""
+
+
+def _mp4_host_record_429(url):
+    """记一次 mp4 直链 429；达到阈值则熔断该主机（本次运行内）。"""
+    host = _host_of(url)
+    if not host:
+        return
+    with _mp4_host_lock:
+        _mp4_host_429[host] = _mp4_host_429.get(host, 0) + 1
+        count = _mp4_host_429[host]
+        newly_tripped = (
+            count >= MP4_HOST_CIRCUIT_THRESHOLD and host not in _mp4_host_tripped
+        )
+        if newly_tripped:
+            _mp4_host_tripped.add(host)
+    # 打印放在锁外：避免 I/O 拖住其它线程的计数。
+    if newly_tripped:
+        print(
+            f"  [主机熔断] {host} 累计 {count} 次 429，本次运行内跳过该主机的"
+            f"全部 mp4 直链节点（其余节点不受影响）",
+            flush=True,
+        )
+
+
+def _mp4_host_is_tripped(url):
+    host = _host_of(url)
+    if not host:
+        return False
+    with _mp4_host_lock:
+        return host in _mp4_host_tripped
 
 
 # 确定性 HTTP 状态码：同一条 url 重试必然复现同样结果，重试纯属浪费时间与槽位。
@@ -783,6 +930,12 @@ _PERMANENT_FAILURE_MARKERS = (
     "没有找到高度达标",           # 声明分辨率全部低于红线（含容差）
     "低于红线",                   # 实测分辨率低于红线
     "码率未达到",                 # 采样码率未达到按高度平方缩放的门槛
+    # 画质汇总判死（内层"全流均因画质不达标" / 外层概率判死）。
+    # 这两句都不含上面的单因 marker，不单列就会被判成可重试、白烧后续轮次。
+    # ⚠️ 与 QualityRejectedError 类型互为双保险：类型管进程内传递，
+    # 文案管落盘后（failed.jsonl 重载时只剩字符串）的判定。
+    "均因画质不达标被淘汰",
+    "因画质不达标",
     "服务器返回的不是视频分片",   # 源返回 HTML/m3u8，通常是无效源
     # ---- mp4 直链：同一条 url 重下必然复现的确定性失败 ----
     # 本脚本读的是固化的 results.jsonl，没有重新取流的能力，多轮重投拿到的
@@ -814,6 +967,10 @@ _MP4_CHUNK_NO_RETRY_MARKERS = (
     "服务器未按 Range 响应",      # 200 全量响应，服务端不支持 Range
     "服务器返回的不是视频分片",   # 首块是 HTML/m3u8
     "直链块不可用",               # 404 直链不存在 / 416 Range 越界
+    # 429 整机故障：实测换 IP/换签名/冷却后恒定 429，退避 20 次纯空耗。
+    # ⚠️ 它**不在** _PERMANENT_FAILURE_MARKERS 里——只短路本层重试、尽快换
+    # 节点，整集仍可进下一轮重投（主机万一恢复还能救回）。
+    _MP4_HOST_BLOCKED_MARKER,
 )
 
 
@@ -870,6 +1027,12 @@ def plan_retry_buckets(retriable, error_msg, refetch_flag=None):
 # 不参与任何判定逻辑，改动零风险。
 _REJECT_REASON_RULES = (
     ("缺少字段/无媒体列表", ("缺少 tmdbId/season/episode 或 urls", "没有找到媒体播放列表")),
+    # 画质汇总判死（内层全流淘汰 / 外层达阈值节点淘汰）：单列类目，便于在收尾
+    # 统计里直接看到"被概率口径判死"的集有多少，是评估该口径是否过激的一手数据。
+    # ⚠️ 必须排在"候选流无一入选"之前：汇总文案里附带了**末节点**的原始错误，
+    # 而末节点常常正是"本轮候选流无一入选"。首个命中者胜出，排在后面就会被抢走，
+    # 判死集全被记到"无一入选"类目下，正好污染要用来评估本口径的那份数据。
+    ("画质整体不达标(判死)", ("因画质不达标", "均因画质不达标被淘汰")),
     # “候选流无一入选”是汇总文案（不含单因 marker），须先于单因规则匹配。
     ("候选流无一入选", ("候选流无一入选",)),
     ("不支持的播放列表结构", ("不支持的播放列表结构",)),
@@ -886,6 +1049,9 @@ _REJECT_REASON_RULES = (
     ("直链块不可用(404/416)", ("直链块不可用",)),
     ("直链不支持Range", ("直链不支持 Range", "服务器未按 Range 响应")),
     ("直链总长异常", ("直链总长异常", "直链下载长度不符")),
+    # 主机级熔断：与下面的"直链块重试耗尽"分开，便于跑完后直接看出
+    # "有多少集是被某台坏 CDN 主机拖累的"（该数偏高说明要盯 vidlink 的 CDN）。
+    ("直链主机熔断(429)", (_MP4_HOST_BLOCKED_MARKER,)),
     ("直链块重试耗尽", ("直链块",)),
     ("直链探测失败", ("直链探测失败",)),
     ("源站5xx", ("HTTP Error 5", "500 Server Error", "502", "503", "504")),
@@ -914,24 +1080,75 @@ def classify_reject_reason(error_msg):
 # ⚠️ 只收"源确实给了流、但这条流画质不达标"的类目。源站 5xx / 超时 / 直链失效
 # 绝不能进来——那是"今天源站挂了"，重取完全可能换到好流；把它们当画质判死会
 # 永久放弃可救回的集，直接违背"尽可能提高成功率"这条红线。
+#
+# 🔴 为什么"候选流无一入选"**不在**这里（2026-09-13 审查移除）：
+# 那句是内层的**兜底汇总文案**，语义混装 —— 它既可能是"全部流真不达标"，
+# 也可能是"源站 5xx 导致采样全挂"。TV 侧源站 5xx 频发，后者是常态。
+# 此前它被列在这里，只是靠 `_classify_failure` 判它可重试（→ is_quality_dead
+# 的第一道闸门挡住）才没出事 —— 那是**巧合性**的安全：一旦有人把该文案加进
+# `_PERMANENT_FAILURE_MARKERS`（理由还很正当："全流不达标就是确定性失败"），
+# 闸门当场失效，源站抽风的集开始被永久判死，且没有任何测试会拦。
+#
+# 现在内层已用 QualityRejectedError 把两条路径拆开：
+#   - 全流画质淘汰 → 抛 QualityRejectedError，文案"均因画质不达标被淘汰"
+#     → 归入"画质整体不达标(判死)"类目 → 本集合收它；
+#   - 混合/纯瞬时 → 抛普通 RuntimeError，文案仍是"候选流无一入选"
+#     → 可重试，绝不判死。
+# 故本集合不再需要（也绝不能）收"候选流无一入选"。
 _QUALITY_REJECT_CATEGORIES = frozenset({
+    "画质整体不达标(判死)",
     "分辨率低于红线",
     "码率未达门槛",
-    "候选流无一入选",
 })
 
 
-def is_quality_dead(retriable, error_msg):
+def is_quality_dead(retriable, error_msg, node_failures=None):
     """这次失败是不是"画质不达标"型的确定性淘汰。
 
-    两个条件缺一不可：
-      - retriable 为 False：可重试的失败一律不算（多节点集里"某节点画质淘汰 +
-        某节点 502"整集仍可重试，算进来等于永久误杀）；
-      - 文案归类命中 _QUALITY_REJECT_CATEGORIES。
+    三个条件缺一不可：
+
+      1. `retriable` 为 False —— 可重试的失败一律不算（多节点集里"某节点画质
+         淘汰 + 某节点 502"整集仍可重试，算进来等于永久误杀）；
+      2. 文案归类命中 `_QUALITY_REJECT_CATEGORIES`；
+      3. **全部节点都给出了画质结论** —— 见下方。
+
+    🔴 第 3 条是 2026-09-13 审查补的，缺了它会真实误杀（实测 3/8 场景违背语义）。
+
+    业务红线（用户拍板）：**必须确定该集在所有存在资源的节点上都画质不达标
+    才判死，其余情况一律可重试。** 因为有跨运行重试兜底，判死的代价是永久
+    丢一集，远高于多跑一轮。
+
+    没有第 3 条时的漏洞：`error_msg` 只保留**末节点**文案，而 `retriable`
+    是 `any_retriable or _classify_failure(msg)`。当**非画质的确定性失败**
+    （需重新取流 / 不支持的播放列表结构 / 直链块 404）排在前面、画质失败恰好
+    落在末位时：
+
+      - 这些节点不会让 `any_retriable` 变 True（它们本身就是确定性失败）；
+      - 也不计入 `quality_rejected_nodes`（类型不是 QualityRejectedError，
+        故外层概率判死那条路径正确地没有触发）；
+      - 但末节点文案是画质的 → 前两个条件双双成立 → 整集被判死。
+
+    而那个"需重新取流"的节点**从未给出过画质结论** —— 换条新直链完全可能是
+    1080p。判死它直接违背上面的红线。
+
+    node_failures：`process_one_entry` 的逐节点归因（也落在 failed.jsonl 里）。
+      - 非空 → 要求**每个**节点的 reason_class 都在画质类目里（合取）；
+      - None / 空 → 没有节点级信息（旧记录，或异常抛在节点循环之外），
+        退回前两个条件。这不是放水：那些路径本就没有"多节点"语义，
+        单节点集的判死结论与三条件版一致。
     """
     if retriable:
         return False
-    return classify_reject_reason(error_msg) in _QUALITY_REJECT_CATEGORIES
+    if classify_reject_reason(error_msg) not in _QUALITY_REJECT_CATEGORIES:
+        return False
+    if not node_failures:
+        return True
+    # 合取：任一节点没给出画质结论（5xx/直链失效/结构不支持/超时…），
+    # 就说明"该集在所有节点上都画质不达标"尚未被证实 → 不判死。
+    return all(
+        (node or {}).get("reason_class") in _QUALITY_REJECT_CATEGORIES
+        for node in node_failures
+    )
 
 
 def load_quality_dead_keys():
@@ -964,7 +1181,12 @@ def load_quality_dead_keys():
                 if not key:
                     continue
                 if is_quality_dead(
-                    record.get("retriable", False), record.get("error", "")
+                    record.get("retriable", False),
+                    record.get("error", ""),
+                    # 落盘的逐节点归因：同口径复判，避免"内存里不判死、
+                    # 重载后却判死"这种前后不一致。旧记录没有该字段 → None，
+                    # 退回两条件口径（见 is_quality_dead 文档）。
+                    record.get("node_failures"),
                 ):
                     keys.add(key)
                 else:
@@ -976,6 +1198,267 @@ def load_quality_dead_keys():
         print(f"⚠️ 读取 {FAILED_LOG} 失败，预检不做画质跳过: {exc}", flush=True)
         return set()
     return keys
+
+
+# ---------- 画质判死的跨运行持久化（DOWNLOAD_DEAD_LOG） ----------
+# 从判死文案里回抽实测码率与门槛。TV 侧只有一种措辞（由三处 raise 生成）：
+#   分辨率 854x480 流（h264）码率未达到门槛：372 kbps < 1600 kbps
+# 只锚定"码率未达到门槛：N kbps < M kbps"这段公共前缀，措辞微调也不会失效。
+#
+# ⚠️ 抽出来的是**末节点**的数值：外层判死文案只嵌末节点错误，前面节点的实测值
+# 落盘时已不存在。这让 --retry-dead 偏保守（多节点集可能漏救几集），
+# 但绝不会误救——不会把仍不达标的集放回去白跑。
+_DEAD_BITRATE_RE = re.compile(
+    r"码率未达到门槛[：:]\s*([0-9.]+)\s*kbps\s*<\s*([0-9.]+)\s*kbps"
+)
+_DEAD_RESOLUTION_RE = re.compile(r"分辨率 (\d+x\d+) 流（([^）]+)）")
+
+
+def parse_dead_quality_evidence(error_msg):
+    """从画质判死文案里抽出判定依据，供门槛变更后离线复判。
+
+    返回 dict（可能只含部分键）或 None（文案里没有码率数值）。
+    没有数值的判死——例如"分辨率低于红线"、或全部节点都只报"候选流无一入选"
+    的汇总——一律返回 None：没有依据可存，`--retry-dead` 对它们只能整集放回。
+    """
+    if not error_msg:
+        return None
+    match = _DEAD_BITRATE_RE.search(error_msg)
+    if not match:
+        return None
+    evidence = {
+        "bitrate_kbps": float(match.group(1)),
+        "threshold_kbps": float(match.group(2)),
+    }
+    detail = _DEAD_RESOLUTION_RE.search(error_msg)
+    if detail:
+        evidence["resolution"] = detail.group(1)
+        evidence["codec"] = detail.group(2)
+    return evidence
+
+
+def load_dead_keys(threshold_fn=None):
+    """读 DOWNLOAD_DEAD_LOG，返回要跳过的**集级 key** 集合。
+
+    threshold_fn 为 None（默认，正常运行）：全部判死集一律跳过。
+    传入函数时（`--retry-dead`）：对每条记录用当前门槛复判，
+    **该 key 的全部记录都判定"可以放回"时才放回**（合取语义）。
+
+    🔑 为什么必须按 key 聚合：账本是纯追加的，同一集可能有多行（重取换链接后
+    再次判死、`--retry-dead` 放回后又判死）。逐行 add/discard 会让结论
+    **取决于哪一行排在最后**，随追加顺序漂移、不确定。改成合取后：
+    只要有任何一条记录证明它现在仍不达标，就继续跳过。
+
+    ⚠️ 与 load_quality_dead_keys（读 FAILED_LOG、取最后一条）的语义差异是
+    **有意的**：那个账本服务"要不要重取流"，宽松些无非多花点代理配额；
+    这个账本服务"要不要下载"，误放回要白下整集，故取保守的合取语义。
+
+    缺依据的记录在 `--retry-dead` 下一律放回——没有依据就无法证明它仍不达标。
+    """
+    if not os.path.exists(DOWNLOAD_DEAD_LOG):
+        return set()
+
+    # 先按 key 归拢全部记录，再统一裁决——避免逐行覆盖带来的行序依赖。
+    records_by_key = {}
+    try:
+        with open(DOWNLOAD_DEAD_LOG, "r", encoding="utf-8") as file:
+            for line in file:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = record_episode_key(record)
+                if not key:
+                    continue
+                records_by_key.setdefault(key, []).append(record)
+    except OSError as exc:
+        # 读不了账本只退回"不跳过"，绝不因此中断启动。
+        print(f"⚠️ 读取 {DOWNLOAD_DEAD_LOG} 失败，不做判死跳过: {exc}", flush=True)
+        return set()
+
+    if threshold_fn is None:
+        return set(records_by_key)
+
+    dead = set()
+    revived = 0
+    for key, records in records_by_key.items():
+        # 合取：任一条记录判定"仍不达标"，该集就继续跳过。
+        if all(threshold_fn(record) for record in records):
+            revived += 1
+        else:
+            dead.add(key)
+    if revived:
+        print(f"[判死复判] {revived} 集在当前门槛下不再判死，已放回重试队列")
+    return dead
+
+
+def dead_record_passes_now(record):
+    """当前配置门槛下，这条判死记录是否该被放回重试。
+
+    口径：用记录里的**实测码率**对比**现在算出来的**门槛。门槛按记录的
+    分辨率高度与编码重算（而非沿用记录里的旧门槛），这样 bitrate_* 与
+    leniency 任一处改动都能被识别到。
+
+    ⚠️ 留 DEAD_REVIVE_MARGIN 余量：实测码率是**那次采样窗口**的值，本身有波动。
+    门槛恰好压在记录值上时放回，重新采样很可能测出略低的值又被判死一次，
+    形成来回震荡、每轮都白跑。要求"新门槛 × 余量 <= 记录值"才放回。
+
+    🔴 height 缺失必须挡住：TV 侧 `bitrate_threshold` 按 (h/1080)² 缩放，
+    height=0 会让门槛恒为 0，`0 × 余量 <= 任何码率` **恒真** —— 这批记录会被
+    无条件放回。故 height 抽不出来时一律不放回（保守）。
+    """
+    evidence = record.get("evidence") or {}
+    bitrate = evidence.get("bitrate_kbps")
+    if bitrate is None:
+        # 没有依据 → 无法证明现在仍不达标，放回（见 load_dead_keys 文档）。
+        return True
+
+    resolution = str(evidence.get("resolution") or "")
+    height = 0
+    if "x" in resolution:
+        try:
+            height = int(resolution.split("x")[1])
+        except (ValueError, IndexError):
+            height = 0
+    # height=0 会让 (h/1080)² 归零、门槛恒真，保守起见不放回。
+    if height <= 0:
+        return False
+
+    current = bitrate_threshold(height, evidence.get("codec"))
+    return current * DEAD_REVIVE_MARGIN <= float(bitrate)
+
+
+def record_quality_dead(entry, error_msg, urls=None):
+    """把一集画质判死记进 DOWNLOAD_DEAD_LOG（纯追加）。
+
+    同一集可能在不同运行里被记多次（--retry-dead 放回后再次判死、
+    重取换链接后新节点仍不达标）。不做去重：写入端保持纯追加，
+    **合并规则放在读取端** `load_dead_keys`（按集级 key 聚合），
+    避免去重要重写整个文件、与多线程共用的 write_log 冲突。
+    """
+    write_log(DOWNLOAD_DEAD_LOG, {
+        **_entry_identity(entry),
+        "dead_at": int(time.time()),
+        "reason_class": "quality",
+        "error": error_msg,
+        "evidence": parse_dead_quality_evidence(error_msg) or {},
+        "node_count": len(urls or []),
+    })
+
+
+# ---------- failed.jsonl 轮转归档 ----------
+def _failed_row_still_useful(record, done_keys, dead_keys):
+    """这条 failed.jsonl 记录是否还有人要读；决定轮转时回不回填。
+
+    两类行必须留下（TV 侧比电影侧多一类，漏掉任一类都会造成实际损失）：
+
+    1. **带"需重新取流"标记的行** —— `refetch_entries` 与人工补救都靠它找待重取
+       的集。丢了 = 重试链断裂，直接掉下载成功率。
+    2. **画质判死行** —— `load_quality_dead_keys` 每次启动扫 FAILED_LOG 推导
+       "预检要跳过哪些集"。丢了不会downgrade正确性，但那些集会重新进入重取
+       队列、白烧住宅代理配额（TV 侧这类集占比很高）。
+
+    已成功（done_keys）或已进独立判死账本（dead_keys）的集不必再留：
+    前者不会再被重取，后者的结论已由 download_dead.jsonl 持久化。
+    """
+    key = record_episode_key(record)
+    if not key or key in done_keys or key in dead_keys:
+        return False
+    if _NEEDS_REFETCH_MARKER in str(record.get("error", "")):
+        return True
+    # 画质判死行：仅 stage=download 的行参与（与 load_quality_dead_keys 同口径）。
+    if record.get("stage") == "download" and is_quality_dead(
+        record.get("retriable", False),
+        record.get("error", ""),
+        record.get("node_failures"),
+    ):
+        return True
+    return False
+
+
+def compact_failed_log():
+    """failed.jsonl 超限时轮转：整体归档，把仍有用的行写回新文件。
+
+    返回 (是否轮转过, 归档路径, 回填行数)。
+
+    ⚠️ 三条不可动摇的约束：
+      1. **历史零丢失** —— 原文件整体 move 进 archive/，不做任何裁剪。
+      2. **仍有用的行必须留下** —— 见 _failed_row_still_useful。这是本函数
+         最大的风险点：回填口径写窄了会静默掉成功率。
+      3. **error 原文逐字保留** —— `_NEEDS_REFETCH_MARKER` 是跨文件字符串契约，
+         改写任何一个字都会让闭环静默断开。故回填时原样 dump，不重构字段。
+
+    🔑 TV 侧为什么需要它（电影侧是为了 --refetch-failed 扫描快）：
+    `load_quality_dead_keys()` **每次启动都要全量顺扫 FAILED_LOG**。几十万集
+    规模下这个文件会持续增长，启动成本线性上升。
+
+    并发：进程内靠 log_lock；**跨进程**靠 is_main_running() 守卫。后者不可省——
+    本函数在 release_main_lock() 之后才调用，此刻另一个 downloader 已能启动并
+    往 failed.jsonl 追加。那个进程的 fd 指向旧 inode，我们 os.replace 之后
+    它写的每一条都进了 archive、新文件里没有 —— 那批记录就此蒸发。
+    """
+    if FAILED_LOG_MAX_BYTES <= 0 or not os.path.exists(FAILED_LOG):
+        return False, None, 0
+    # 本进程此刻已释放主锁，故锁在 = 别的进程在跑。让它去，文件大一点没关系。
+    if is_main_running():
+        return False, None, 0
+    try:
+        if os.path.getsize(FAILED_LOG) <= FAILED_LOG_MAX_BYTES:
+            return False, None, 0
+    except OSError:
+        return False, None, 0
+
+    # 放在锁外：这两个文件不由本函数改写，且读它们可能较慢。
+    done_keys = load_success_log_ids()
+    dead_keys = load_dead_keys()
+    keep = []
+
+    with log_lock:
+        # 锁内复查：拿锁期间别的线程可能已经轮转过了。
+        if not os.path.exists(FAILED_LOG):
+            return False, None, 0
+        try:
+            if os.path.getsize(FAILED_LOG) <= FAILED_LOG_MAX_BYTES:
+                return False, None, 0
+        except OSError:
+            return False, None, 0
+
+        archive_dir = os.path.join(str(_SCRIPT_DIR), "archive")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        archive_path = os.path.join(archive_dir, f"failed_{stamp}.jsonl")
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            # 先读出要回填的行，再移走原文件。顺序反过来的话，移动成功但读取
+            # 失败就会让这些记录彻底丢失。
+            with open(FAILED_LOG, "r", encoding="utf-8") as file:
+                for line in file:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        # 坏行不回填：原文件整体进了 archive/，一个字都没少；
+                        # 而坏行按定义解析不出 marker，回填它也没用。
+                        continue
+                    if _failed_row_still_useful(record, done_keys, dead_keys):
+                        keep.append(stripped)   # 原样保留，绝不重构字段
+            os.replace(FAILED_LOG, archive_path)
+            if keep:
+                tmp_path = FAILED_LOG + ".tmp"
+                with open(tmp_path, "w", encoding="utf-8") as file:
+                    file.write("\n".join(keep) + "\n")
+                os.replace(tmp_path, FAILED_LOG)
+        except OSError as exc:
+            # 轮转纯属维护动作，失败了只是文件继续变大，不影响任何业务结论。
+            print(f"⚠️ failed.jsonl 轮转失败（已忽略，不影响下载）: {exc}",
+                  flush=True)
+            return False, None, 0
+
+    return True, archive_path, len(keep)
 
 
 def update_success_log(key, new_record):
@@ -2108,6 +2591,13 @@ def _mp4_probe_total_size(url, headers, declared_size):
     由上层多轮/重新取流兜底）。返回 (total_size, range_ok)：range_ok 仅由
     状态码是否为 206 决定；206 但 Content-Range 总长为 * 时回退到条目声明的 size。
     """
+    # 该主机已被熔断（整机故障）：直接放弃，让上层立刻换下一个节点，不再浪费
+    # 一次必然 429 的请求。放在函数最前面——连 Session 与请求头都不必准备。
+    # 文案不进整集判死表，整集仍可进下一轮重投。
+    if _mp4_host_is_tripped(url):
+        raise RuntimeError(
+            f"{_MP4_HOST_BLOCKED_MARKER}（{_host_of(url)}），跳过该节点: {url}"
+        )
     session = get_session()
     request_headers = dict(HEADERS)
     request_headers.update(headers)
@@ -2124,6 +2614,9 @@ def _mp4_probe_total_size(url, headers, declared_size):
                 )
             if status in (429, 503):
                 record_block_status(status)
+            if status == 429:
+                # 只统计 mp4 直链层的 429，用于主机级熔断判定。
+                _mp4_host_record_429(url)
             response.raise_for_status()
             range_ok = status == 206
             if range_ok:
@@ -2186,6 +2679,17 @@ def _download_mp4_chunk(url, headers, start, end, index, abort_event=None):
                     raise RuntimeError(f"直链块不可用（HTTP {status}）: {url}")
                 if status in (429, 503):
                     record_block_status(status)
+                if status == 429:
+                    # mp4 直链的 429 实测是**整机故障**而非限流（电影侧 §12.21）：
+                    # 换 IP、换签名、冷却后都恒定 429。继续按限流退避重试
+                    # SEG_RETRY_MAX(20) 次纯属空耗，故记入主机熔断并立即上抛，
+                    # 让上层尽快换下一个节点。
+                    # ⚠️ 仅限 mp4 直链这一层；m3u8 分片层的 429 语义未变。
+                    _mp4_host_record_429(url)
+                    raise RuntimeError(
+                        f"{_MP4_HOST_BLOCKED_MARKER}（HTTP 429，"
+                        f"{_host_of(url)}）: {url}"
+                    )
                 response.raise_for_status()
                 if status != 206:
                     raise RuntimeError(f"服务器未按 Range 响应（HTTP {status}）")
@@ -2326,7 +2830,7 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
     headers = _mp4_request_headers(node.get("headers"))
     quality = node.get("quality")
     if quality and not meets_resolution_redline(quality):
-        raise RuntimeError(
+        raise QualityRejectedError(
             f"声明分辨率 {quality}p 低于红线 {MIN_RESOLUTION_HEIGHT}"
             f"（容差 {LENIENCY:.2f}），跳过"
         )
@@ -2360,13 +2864,13 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
         if probed is not None:
             pre_resolution, pre_height, pre_bitrate, pre_codec = probed
             if not meets_resolution_redline(pre_height):
-                raise RuntimeError(
+                raise QualityRejectedError(
                     f"分辨率 {pre_resolution} 低于红线 {MIN_RESOLUTION_HEIGHT}"
                     f"（容差 {LENIENCY:.2f}），跳过"
                 )
             pre_min_bitrate = bitrate_threshold(pre_height, pre_codec)
             if pre_bitrate < pre_min_bitrate:
-                raise RuntimeError(
+                raise QualityRejectedError(
                     f"分辨率 {pre_resolution} 流（{pre_codec or 'unknown'}）"
                     f"码率未达到门槛：{pre_bitrate:.0f} kbps"
                     f" < {pre_min_bitrate:.0f} kbps"
@@ -2450,7 +2954,7 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
     height = actual_size[1]
     print(f"  [{label}] 直链实测分辨率: {resolution}")
     if not meets_resolution_redline(height):
-        raise RuntimeError(
+        raise QualityRejectedError(
             f"分辨率 {resolution} 低于红线 {MIN_RESOLUTION_HEIGHT}"
             f"（容差 {LENIENCY:.2f}），跳过"
         )
@@ -2470,7 +2974,7 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
         f"码率 {bitrate:.0f} kbps，门槛 {min_bitrate:.0f} kbps"
     )
     if bitrate < min_bitrate:
-        raise RuntimeError(
+        raise QualityRejectedError(
             f"分辨率 {resolution} 流（{codec_label}）"
             f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
         )
@@ -2517,6 +3021,10 @@ def process_one_entry(entry, processed_ids):
     # 在 try 之外初始化：下面的 except 会读它，而异常可能在进入节点循环之前
     # 就抛出（磁盘闸门、建目录等），那时它若还没定义就是 NameError。
     any_needs_refetch = False
+    # 同理。逐节点失败归因，节点循环之外抛出的异常会让它保持为空列表。
+    node_failures = []
+    # 同理。因画质被确定性淘汰的节点数，供下方概率判死使用。
+    quality_rejected_nodes = 0
     cleanup_paths = set()
     final_ts = os.path.join(TEMP_DIR, f"temp_{safe_file_token(normalized_id)}.ts")
     temp_mp4 = os.path.join(TEMP_DIR, f"temp_{safe_file_token(normalized_id)}.mp4")
@@ -2586,7 +3094,7 @@ def process_one_entry(entry, processed_ids):
             if item[3] is None or meets_resolution_redline(item[3][1])
         ]
         if not candidates:
-            raise RuntimeError(
+            raise QualityRejectedError(
                 f"没有找到高度达标（≥ {MIN_RESOLUTION_HEIGHT}×{LENIENCY:.2f}）的流"
             )
 
@@ -2607,6 +3115,16 @@ def process_one_entry(entry, processed_ids):
         best_durations = None
         best_init_url = None
         best_selected = False
+        # 内层分流计数（对应 QualityRejectedError 的引入动因）：
+        #   quality_rejected_streams —— 确定性画质淘汰的流数
+        #   other_failed_streams     —— 瞬时异常（5xx/超时/采样探测失败等）的流数
+        # 两者决定"全流无一入选"时该抛确定性异常还是可重试异常。
+        # 混在一起就会把源站抽风误判成画质不达标，那是直接砍成功率。
+        quality_rejected_streams = 0
+        other_failed_streams = 0
+        # 签名过期要单独留痕：下面的汇总文案会覆盖掉本条异常原文，
+        # marker 不在这里记住就彻底丢失，重取闭环再也挑不到这一集。
+        stream_needs_refetch = False
 
         for resolution, playlist_url, _declared_bandwidth, size in candidates:
             # 候选已按声明高度降序排列。走到"声明高度严格低于已选中流"的候选时，
@@ -2684,7 +3202,7 @@ def process_one_entry(entry, processed_ids):
                 height = actual_size[1]
                 # 第 1 关 · 分辨率红线（带 LENIENCY 容差）。
                 if not meets_resolution_redline(height):
-                    raise RuntimeError(
+                    raise QualityRejectedError(
                         f"分辨率 {actual_resolution} 低于红线 "
                         f"{MIN_RESOLUTION_HEIGHT}（容差 {LENIENCY:.2f}），跳过"
                     )
@@ -2704,7 +3222,7 @@ def process_one_entry(entry, processed_ids):
                     f"码率门槛 {min_bitrate:.0f} kbps"
                 )
                 if bitrate < min_bitrate:
-                    raise RuntimeError(
+                    raise QualityRejectedError(
                         f"分辨率 {actual_resolution} 流（{codec_label}）"
                         f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
                     )
@@ -2731,17 +3249,45 @@ def process_one_entry(entry, processed_ids):
                 # 不落入下方"可重试"汇总，避免永久不支持的结构被白重试多轮。
                 remove_file(sample_path)
                 raise
+            except QualityRejectedError as exc:
+                # 画质淘汰：本流确定性出局，但**其余流可能达标**，故继续试而不外抛。
+                remove_file(sample_path)
+                quality_rejected_streams += 1
+                print(f"  处理流 {resolution} 失败: {exc}")
             except Exception as exc:
                 remove_file(sample_path)
+                other_failed_streams += 1
+                # 签名过期（401/403/410）要单独记住：下面的汇总文案会覆盖掉
+                # 本条异常的原文，marker 若不在这里留痕就会彻底丢失，
+                # 重取闭环也就挑不到这一集。
+                if needs_refetch(str(exc)):
+                    stream_needs_refetch = True
                 print(f"  处理流 {resolution} 失败: {exc}")
 
         if not best_selected:
-            # 此汇总文案不含任何确定性 marker（低于红线/码率未达到）——各流的真实
-            # 淘汰原因已在上方 except 逐条打印。全流本轮无一入选可能是"全部真不达标"
-            # 也可能是"瞬时采样抖动全挂"，无法在此区分；故落默认「可重试」，交由多轮
-            # 重采兜底，避免把可救回的片误判为确定性淘汰（契合"宁可多下不误杀"）。
+            # 🔑 两条路径必须分开（这正是引入 QualityRejectedError 的动因）：
+            #
+            # ① 全部候选流都是画质淘汰、且无一条瞬时异常 —— "重下会不会变好"
+            #    已有确定答案：不会。分辨率与码率是源站固有属性，下一轮重采
+            #    拿到的还是同样的流。抛确定性异常判死，不再白烧后续轮次。
+            #
+            #    注意 quality_rejected_streams > 0 这个合取项：candidates 非空时
+            #    它必成立，但若未来筛选逻辑演进出"零候选流且零失败"的路径，
+            #    没有它就会把空集误判成"全部画质淘汰"。
+            if quality_rejected_streams > 0 and other_failed_streams == 0:
+                raise QualityRejectedError(
+                    f"全部 {quality_rejected_streams} 条候选流均因画质不达标被淘汰"
+                    f"（各流原因见上方日志）"
+                )
+            # ② 混合情形（存在瞬时异常）：无法断定是"真不达标"还是"采样抖动全挂"，
+            #    落默认「可重试」交由多轮重采兜底，契合"宁可多下不误杀"。
+            #    TV 侧源站 5xx 频发，这条路径是常态，绝不能误判成画质判死。
+            refetch_note = (
+                f"；另有节点直链已失效，{_NEEDS_REFETCH_MARKER}"
+                if stream_needs_refetch else ""
+            )
             raise RuntimeError(
-                "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
+                f"本轮候选流无一入选（各流原因见上方日志），下一轮重采{refetch_note}"
             )
 
         print(
@@ -2848,6 +3394,17 @@ def process_one_entry(entry, processed_ids):
         conversion_job = None
         last_exc = None
         any_retriable = False  # 只要有任一节点是“可重试失败”，整集就值得下一轮重试
+        # 🔑 逐节点失败归因：每个节点失败都记一条，而不是只留末节点的 last_exc。
+        #
+        # 为什么必须逐节点记（没有它就永远查不清）：
+        #   - `error` 只保留**最后一个**节点的文案，前面节点的失败原因此前只
+        #     print 到 stdout、不落盘，跑完就没了；
+        #   - `classify_reject_reason(error_msg)` 是单参数签名，天然只能按整集
+        #     归一类，**无法区分同为 m3u8 的 vidup 与 vidfast**；
+        #   - 于是"某个源到底为什么失败、该不该摘"只能靠"直链类目 ≈ vidlink"
+        #     这种代理指标硬猜（§0.13 P0+ 记的正是这条）。
+        # 有了它，pipeline_report 就能直接按 provider 拆分失败原因。
+        # （列表本身在 try 之外初始化，见上方注释。）
         # 逐节点记录"是否有节点的直链已过期"（any_needs_refetch 在 try 外初始化）。
         # 必须独立于 error 文案统计——msg 取的是**最后一个**节点的错误，
         # 若过期节点排在前面（如「节点1 vidlink 403 过期 → 节点2 502」），
@@ -2876,11 +3433,28 @@ def process_one_entry(entry, processed_ids):
                 break
             except Exception as exc:
                 last_exc = exc
+                node_error = str(exc)
+                node_retriable = _classify_failure(node_error)
+                # 画质淘汰的节点单独计数（认**类型**不认文案，判据演进时零改动）。
+                # 供下方概率判死：画质是源站固有属性，不是随机变量。
+                if isinstance(exc, QualityRejectedError):
+                    quality_rejected_nodes += 1
+                # 每个节点一条：provider + 失败类目 + 可否重试。
+                # 只存归一化后的类目**和**原始文案：类目供统计聚合，
+                # 文案供人工排查（源站措辞变了时类目会落到"其他"，那时只能看原文）。
+                node_failures.append({
+                    "node_index": idx,
+                    "provider": node.get("provider"),
+                    "node_type": node.get("type"),
+                    "reason_class": classify_reject_reason(node_error),
+                    "retriable": node_retriable,
+                    "error": node_error,
+                })
                 # 记录本节点失败是否可重试：任一可重试即让整集进入外层多轮，
                 # 避免末节点恰为确定性失败时“连坐”误伤前面本可恢复的瞬时节点。
-                if _classify_failure(str(exc)):
+                if node_retriable:
                     any_retriable = True
-                if needs_refetch(str(exc)):
+                if needs_refetch(node_error):
                     any_needs_refetch = True
                 # 本节点失败：清掉本轮残留的 ts，避免污染下一个节点。
                 remove_file(final_ts)
@@ -2897,9 +3471,38 @@ def process_one_entry(entry, processed_ids):
         # 整集可否重试：全节点失败时以“任一节点可重试”为准（乐观，首要目标是下全）；
         # 其它异常路径（单次抛出）回退到按该异常本身分类。
         retriable = any_retriable or _classify_failure(msg)
-        # 过期节点排在非末位时，msg 里读不到过期 marker。补挂上去，让落盘的
-        # failed.jsonl 也能看出"这集有节点需要重新取流"——否则只有进程内的
-        # 标志知道，人工排查与事后统计都看不见。
+        # 【画质概率判死】达到阈值比例的节点都因画质确定性淘汰时，推翻上面的乐观口径。
+        #
+        # 依据：画质是源站**固有属性**而非随机变量——同一条 url 下一轮拿到的还是
+        # 480p。既然这些节点都不达标，就没有理由指望重投能变好。
+        #
+        # 🔴 TV 侧取 1.0（全部节点都画质淘汰才判死），比电影侧的 0.5 保守得多：
+        #   - TV 侧大量集**只有 1-2 个节点**（vidup 单源占多数）。阈值 0.5 时
+        #     单节点集只要画质淘汰一次就立刻判死 —— 那不是"概率判死"，
+        #     是"一次判死"，比电影侧激进得多；
+        #   - TV 侧集级有源率只有个位数，误杀一集的相对代价更高；
+        #   - 且 download_tv 至今未做过全量实测，没有数据支撑更激进的阈值。
+        # 等 §0.0 ③ 跑完、拿到 pipeline_report 的节点数分布与画质淘汰占比后，
+        # 再决定要不要调低。调低前务必先看"单节点集占比"。
+        #
+        # 只在"无一节点成功"的失败路径上生效（本就在 except 里），且要求
+        # quality_rejected_nodes > 0，避免 urls 为空等边界被 0/0 蒙混。
+        if (
+            urls
+            and quality_rejected_nodes > 0
+            and quality_rejected_nodes / len(urls) >= QUALITY_KILL_RATIO
+        ):
+            retriable = False
+            # 换成汇总文案：不换的话这里留的是**最后一个**节点的错误，会写出
+            # 「retriable=False 却写着 502」这类自相矛盾、且让收尾统计归错类的记录。
+            msg = (
+                f"{len(urls)} 个节点中 {quality_rejected_nodes} 个因画质不达标被"
+                f"确定性淘汰（≥ 阈值 {QUALITY_KILL_RATIO:.2f}），判定整集画质不达标；"
+                f"末节点错误：{msg}"
+            )
+        # 过期节点排在非末位时，msg 里读不到过期 marker（或被上面的画质汇总文案
+        # 改写掉）。补挂上去，让落盘的 failed.jsonl 也能看出"这集有节点需要重新
+        # 取流"——否则只有进程内的标志知道，人工排查与事后统计都看不见。
         if any_needs_refetch and _NEEDS_REFETCH_MARKER not in msg:
             msg = f"{msg}（另有节点{_NEEDS_REFETCH_MARKER}）"
         return label, False, {
@@ -2907,6 +3510,8 @@ def process_one_entry(entry, processed_ids):
             "retriable": retriable,
             # 与 error 文案解耦的显式结论，供 plan_retry_buckets 使用。
             "needs_refetch": any_needs_refetch,
+            # 逐节点归因（可能为空：节点循环之外抛出的异常没有节点上下文）。
+            "node_failures": node_failures,
         }
     finally:
         # 下载成功后临时文件和 ID 锁交给转封装阶段管理。
@@ -3500,6 +4105,29 @@ def main():
             monitor_thread.join(timeout=DISK_CHECK_INTERVAL + 1)
         release_main_lock()
 
+    # failed.jsonl 轮转：纯追加的它在全量跑时会涨到让每次启动的
+    # load_quality_dead_keys() 全量顺扫都变慢。
+    #
+    # ⚠️ 位置有三个讲究，都不能改：
+    #   ① 在 finally **之外** —— 被中断/异常退出时不做，此刻状态未知，
+    #      维护动作让位于尽快退出（与电影侧同口径）；
+    #   ② 在 release_main_lock() **之后** —— compact_failed_log 内部用
+    #      is_main_running() 做跨进程守卫，锁还在会把自己挡掉；
+    #   ③ 整段 try 住 —— 轮转纯属维护，失败了只是文件继续变大，
+    #      绝不能让它把一次成功的运行变成异常退出。
+    try:
+        rotated, archive_path, kept = compact_failed_log()
+        if rotated:
+            print(
+                f"\n[日志轮转] failed.jsonl 已超过 "
+                f"{FAILED_LOG_MAX_BYTES / 1024 / 1024:.0f}MB，"
+                f"完整历史已归档到 {archive_path}；"
+                f"回填 {kept} 条仍有用的记录（重取闭环与画质预检照常可用）。",
+                flush=True,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ failed.jsonl 轮转异常（已忽略）: {exc}", flush=True)
+
 
 def _run_pipeline():
     clean_temp_directory()
@@ -3507,10 +4135,14 @@ def _run_pipeline():
 
     logged_ids = load_success_log_ids()
     disk_ids, duplicate_files = scan_downloaded_mp4_ids()
-    processed_ids = logged_ids | disk_ids
+    # 画质判死账本：这些集"有源但流的画质不达标"，重下必然得到同样结论。
+    # --retry-dead 时按当前门槛逐条复判，够格的放回重试队列。
+    dead_ids = load_dead_keys(dead_record_passes_now if RETRY_DEAD_MODE else None)
+    processed_ids = logged_ids | disk_ids | dead_ids
     print(
         f"成功日志中有 {len(logged_ids)} 个 ID，"
-        f"目标目录中有 {len(disk_ids)} 个已下载 ID；"
+        f"目标目录中有 {len(disk_ids)} 个已下载 ID，"
+        f"画质判死 {len(dead_ids)} 个 ID；"
         f"合并去重后将跳过 {len(processed_ids)} 个 ID"
     )
 
@@ -3718,6 +4350,10 @@ def _run_pipeline():
                 # 没有它就无法区分"这条流画质不达标"与"今天源站挂了"，
                 # 而后者重取完全可能换到好流，绝不能一并跳过。
                 "retriable": retriable,
+                # 逐节点归因：error 只留末节点文案，这里保留每个节点各自的
+                # provider / 类目 / 可否重试，供 pipeline_report 按源拆分失败原因。
+                # 空列表表示异常抛在节点循环之外（磁盘闸门、建目录等）。
+                "node_failures": info.get("node_failures") or [],
             })
             # 下载态状态文件：本轮下载失败逐条记录（含可否重试）。
             write_log(DOWNLOAD_FAIL_LOG, {
@@ -3729,6 +4365,15 @@ def _run_pipeline():
                 f"下载失败: {label}: {error_msg}"
                 f"（{'可重试' if retriable else '确定性失败,不重试'}）"
             )
+            # 画质判死落账本：下次运行直接跳过，不再重新采样求证同一结论。
+            # 只记"源给了流但画质不达标"（is_quality_dead 已挡住瞬时失败），
+            # 门槛调松后可用 --retry-dead 按新门槛放回。
+            # 🔴 必须传 node_failures：判死要求**全部节点**都给出画质结论，
+            # 不传的话"某节点直链失效 + 末节点画质不达标"会被误判死（见其文档）。
+            if is_quality_dead(
+                retriable, error_msg, info.get("node_failures")
+            ):
+                record_quality_dead(entry, error_msg, entry.get("urls"))
             # 两条重投路径**不互斥**，判定集中在 plan_retry_buckets（见其文档）。
             # needs_refetch 优先取 info 里的显式标志（节点循环逐节点记录，不受
             # "error 只留末节点文案"的影响）；缺失时回退按文案判断，兼容
@@ -4230,4 +4875,27 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "reupload":
         reupload_pending()
     else:
+        # 沿用既有的裸 sys.argv 分派风格（本文件一直没有引入 argparse）。
+        # 两个开关可叠加：--retry-only --retry-dead。
+        _args = set(sys.argv[1:])
+        RETRY_ONLY_MODE = "--retry-only" in _args
+        RETRY_DEAD_MODE = "--retry-dead" in _args
+        _unknown = _args - {"--retry-only", "--retry-dead"}
+        if _unknown:
+            # 静默忽略拼错的开关最危险：会让人以为跳过逻辑已生效、实际在跑全量。
+            # 几十万集规模下这等于白跑一整轮。
+            print(f"错误: 无法识别的参数 {' '.join(sorted(_unknown))}")
+            print("用法: python download_tv.py [--retry-only] [--retry-dead]")
+            print("      python download_tv.py reupload")
+            raise SystemExit(2)
+        if RETRY_ONLY_MODE:
+            print(
+                "[重试模式] 只重试 results.jsonl 里尚未成功的集"
+                "（跳过 success.jsonl、磁盘已有成品、画质判死）"
+            )
+        if RETRY_DEAD_MODE:
+            print(
+                f"[判死复判] 将按当前门槛复判 {DOWNLOAD_DEAD_LOG} 里的集，"
+                f"余量系数 {DEAD_REVIVE_MARGIN:.2f}"
+            )
         main()

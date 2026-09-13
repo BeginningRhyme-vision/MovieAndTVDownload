@@ -1,6 +1,8 @@
 """Offline tests for tv_ids_to_links.py (no network, TMDB/vidup calls are faked)."""
 
 import json
+import os
+import threading
 from datetime import date
 from pathlib import Path
 
@@ -338,18 +340,33 @@ def test_expand_seasons_propagates_auth_error(tmp_path, monkeypatch):
 
 
 def test_expand_seasons_auth_error_cancels_remaining(tmp_path, monkeypatch):
-    """401 后剩余排队的剧不该继续打 TMDB（只会一路 401）；单线程下最多再漏跑 1 个已取走的。"""
+    """401 后剩余排队的剧不该继续打 TMDB（只会一路 401）；单线程下最多再漏跑 1 个已取走的。
+
+    第 2 个调用起阻塞在 gate 上，模拟真实 TMDB 请求的网络往返耗时。
+    不这样做的话 fake 是纯内存的瞬时函数，单 worker 会在主线程从 as_completed
+    醒来之前把 40 个 future 一口气跑完，断言就变成了在赌线程调度时序
+    （实测：同一份生产代码，仅因同批次其它用例改变了进程时序就能从 1 变成 30）。
+    """
     called = []
+    gate = threading.Event()
+    first_done = threading.Event()
 
     def fake_fetch(tid):
         called.append(tid)
+        if first_done.is_set():
+            # 第 2 个及以后：卡住，保证主线程有机会先收到第 1 个 401 并取消队列
+            gate.wait(5)
+        first_done.set()
         raise m.TmdbAuthError("401")
 
     monkeypatch.setattr(m, "fetch_seasons_from_tmdb", fake_fetch)
     monkeypatch.setattr(m, "TMDB_WORKERS", 1)
-    with pytest.raises(m.TmdbAuthError):
-        m.expand_seasons([str(i) for i in range(40)], tmp_path / "c.jsonl", tmp_path / "f.txt", set())
-    assert len(called) <= 2
+    try:
+        with pytest.raises(m.TmdbAuthError):
+            m.expand_seasons([str(i) for i in range(40)], tmp_path / "c.jsonl", tmp_path / "f.txt", set())
+        assert len(called) <= 2
+    finally:
+        gate.set()
 
 
 def test_load_dead_episodes(tmp_path):
@@ -1314,6 +1331,137 @@ def test_run_batch_recheck_does_not_rewrite_dead(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "process_episode", lambda tid, s, e: ("dead", None))
     assert m.run_batch([("1", 1, 1)], results, fail, max_workers=1, write_dead=False) == []
     assert fail.read_text(encoding="utf-8") == "1\t1\t1\n"
+
+
+# ------------------------------------------------------- 跨进程单实例锁
+@pytest.fixture
+def lock_path(tmp_path, monkeypatch):
+    """把锁文件指向 tmp_path，避免测试在真实工作目录留下 .lock。"""
+    path = tmp_path / "fetch.lock"
+    monkeypatch.setattr(m, "FETCH_LOCK_FILE", str(path))
+    return path
+
+
+def test_acquire_and_release_fetch_lock(lock_path):
+    m.acquire_fetch_lock()
+    assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+    m.release_fetch_lock()
+    assert not lock_path.exists()
+
+
+def test_acquire_fetch_lock_rejects_when_another_process_alive(lock_path, monkeypatch):
+    """🔒 别的活进程持锁时必须拒绝启动。
+
+    两个全量取流同时跑会重复写 results.jsonl / seasons_cache.jsonl，
+    并让熔断的 _rollback_fail_tail（假设"fail.txt 末尾 N 行是本进程写的"）失效。
+    """
+    lock_path.write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
+    with pytest.raises(SystemExit) as ei:
+        m.acquire_fetch_lock()
+    assert "已有取流进程在运行" in str(ei.value)
+    # 锁内容不能被覆盖，否则真正持锁的那个进程退出时就删不掉自己的锁了
+    assert lock_path.read_text(encoding="utf-8").strip() == "999999"
+
+
+def test_stale_lock_is_cleared(lock_path, monkeypatch):
+    """陈旧锁（上次 kill -9 留下、PID 已死）必须能自动清理，否则永远启动不了。"""
+    lock_path.write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: False)
+    assert m.is_fetch_running() is False
+    assert not lock_path.exists()
+    m.acquire_fetch_lock()          # 清理后应能正常抢到
+    assert lock_path.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+
+def test_release_fetch_lock_keeps_other_process_lock(lock_path, monkeypatch):
+    """🔒 只删属于自己的锁：绝不能把别的进程的锁误删掉。"""
+    lock_path.write_text("999999", encoding="utf-8")
+    m.release_fetch_lock()
+    assert lock_path.exists()
+
+
+def test_main_releases_lock_even_when_body_raises(lock_path, monkeypatch):
+    """main 的 finally 必须释放锁，否则一次异常退出会让后续运行永远被挡。
+
+    ⚠️ 这里必须**先真的抢到锁**再抛异常：若只桩掉 _main_impl 直接抛，
+    锁压根没被创建，`assert not exists()` 会平凡成立、测不出 finally 是否生效
+    （初版就是这么写的，把 finally 改成 pass 依然全绿）。
+    """
+    def boom(**kw):
+        m.acquire_fetch_lock()          # 模拟已进入主流程、锁已持有
+        assert lock_path.exists()
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(m, "_main_impl", boom)
+    with pytest.raises(RuntimeError):
+        m.main([])
+    assert not lock_path.exists()
+
+
+def test_main_releases_lock_on_keyboard_interrupt(lock_path, monkeypatch):
+    """Ctrl+C 同样要释放锁：这是最常见的退出方式，漏了就每次都要手工删锁。"""
+    def boom(**kw):
+        m.acquire_fetch_lock()
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(m, "_main_impl", boom)
+    with pytest.raises(KeyboardInterrupt):
+        m.main([])
+    assert not lock_path.exists()
+
+
+def test_main_acquires_lock_and_recheck_dead_also_locks(tmp_path, lock_path,
+                                                        monkeypatch):
+    """两种模式都要抢锁：--recheck-dead 同样写 results/cache 并依赖熔断回滚。"""
+    ids = tmp_path / "ids.txt"
+    ids.write_text("1\n", encoding="utf-8")
+    monkeypatch.setattr(m, "_CFG", {
+        "input": str(ids),
+        "output": str(tmp_path / "r.jsonl"),
+        "fail_file": str(tmp_path / "f.txt"),
+        "seasons_cache": str(tmp_path / "c.jsonl"),
+    })
+    monkeypatch.setattr(m, "expand_seasons", lambda *a, **kw: {})
+    monkeypatch.setattr(m, "run_batch", lambda *a, **kw: [])
+    monkeypatch.setattr(m, "_SERIES_META", {})
+    monkeypatch.setattr(m, "_TMDB_NAMES", {})
+
+    seen = []
+    real_acquire = m.acquire_fetch_lock
+
+    def spy():
+        seen.append(True)
+        real_acquire()
+
+    monkeypatch.setattr(m, "acquire_fetch_lock", spy)
+    for argv in ([], ["--recheck-dead"]):
+        seen.clear()
+        m.main(argv)
+        assert seen == [True], f"{argv} 未抢锁"
+        assert not lock_path.exists(), f"{argv} 未释放锁"
+
+
+def test_second_fetch_process_is_blocked_end_to_end(tmp_path, lock_path,
+                                                    monkeypatch):
+    """端到端：第一个进程持锁期间，第二次 main() 必须被挡下。"""
+    ids = tmp_path / "ids.txt"
+    ids.write_text("1\n", encoding="utf-8")
+    monkeypatch.setattr(m, "_CFG", {
+        "input": str(ids),
+        "output": str(tmp_path / "r.jsonl"),
+        "fail_file": str(tmp_path / "f.txt"),
+        "seasons_cache": str(tmp_path / "c.jsonl"),
+    })
+    # 模拟"另一个活着的取流进程"正持有锁
+    lock_path.write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(m, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(m, "expand_seasons",
+                        lambda *a, **kw: pytest.fail("不该走到季集展开"))
+    with pytest.raises(SystemExit):
+        m.main([])
+    # 对方的锁必须原封不动
+    assert lock_path.read_text(encoding="utf-8").strip() == "999999"
 
 
 def test_run_batch_cancels_pending_on_interrupt(tmp_path, monkeypatch):

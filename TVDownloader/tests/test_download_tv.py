@@ -55,6 +55,11 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "TEMP_DIR", str(temp))
     monkeypatch.setattr(d, "SUCCESS_LOG", str(tmp_path / "success.jsonl"))
     monkeypatch.setattr(d, "FAILED_LOG", str(tmp_path / "failed.jsonl"))
+    # 判死账本也必须指向 tmp_path：它由 handle_done_future 在画质判死时自动写入，
+    # 不隔离的话测试会把记录写进真实工作目录，而下一个用例启动时
+    # load_dead_keys() 会把这些集并进跳过集 —— 表现为"待处理条目莫名变 0"，
+    # 极难排查（本夹具漏掉它时确实让 5 个既有用例连锁失败过）。
+    monkeypatch.setattr(d, "DOWNLOAD_DEAD_LOG", str(tmp_path / "download_dead.jsonl"))
     monkeypatch.setattr(d, "UPLOAD_PENDING_LOG", str(tmp_path / "pending.jsonl"))
     monkeypatch.setattr(d, "MAIN_LOCK_FILE", str(tmp_path / "main.lock"))
     monkeypatch.setattr(d, "FOLDER_PREFIX", "tv")
@@ -1278,6 +1283,201 @@ def _install_range_session(monkeypatch, data, status=None):
     return session
 
 
+# ------------------------------------------------ CDN 主机级 429 熔断
+@pytest.fixture
+def circuit_env(monkeypatch):
+    """每个用例独立的熔断计数（模块级字典会跨用例污染）。"""
+    monkeypatch.setattr(d, "_mp4_host_429", {})
+    monkeypatch.setattr(d, "_mp4_host_tripped", set())
+    monkeypatch.setattr(d, "MP4_HOST_CIRCUIT_THRESHOLD", 3)
+    monkeypatch.setattr(d, "record_block_status", lambda s: None)
+
+
+@pytest.mark.parametrize("url,expected", [
+    ("https://bcdn.hakunaymatata.com/a/b.mp4", "bcdn.hakunaymatata.com"),
+    ("http://HOST.example.com/x", "host.example.com"),   # 归一小写
+    ("https://h.example.com", "h.example.com"),          # 无路径段
+    ("not-a-url", ""),
+    (None, ""),
+])
+def test_host_of(url, expected):
+    assert d._host_of(url) == expected
+
+
+def test_mp4_host_circuit_trips_at_threshold(circuit_env, capsys):
+    url = "https://bcdnxw.hakunaymatata.com/a.mp4"
+    for _ in range(2):
+        d._mp4_host_record_429(url)
+    assert d._mp4_host_is_tripped(url) is False   # 未达阈值不熔断
+    d._mp4_host_record_429(url)
+    assert d._mp4_host_is_tripped(url) is True
+    assert "主机熔断" in capsys.readouterr().out
+
+
+def test_mp4_host_circuit_is_per_host(circuit_env):
+    """🔒 只跳过同一台主机；同域其它主机与别家域名都不受影响。"""
+    bad = "https://bcdnxw.hakunaymatata.com/a.mp4"
+    for _ in range(3):
+        d._mp4_host_record_429(bad)
+    assert d._mp4_host_is_tripped(bad) is True
+    # 同域不同主机
+    assert d._mp4_host_is_tripped("https://bcdn.hakunaymatata.com/b.mp4") is False
+    # 完全不同的域
+    assert d._mp4_host_is_tripped("https://sun.peakstorm.top/c.m3u8") is False
+
+
+def test_probe_total_size_short_circuits_tripped_host(circuit_env, monkeypatch):
+    """熔断后连请求都不该发出去——这正是本功能省时间的地方。"""
+    url = "https://bad.cdn/a.mp4"
+    for _ in range(3):
+        d._mp4_host_record_429(url)
+
+    def boom(*a, **kw):
+        pytest.fail("熔断主机不应再发起请求")
+
+    monkeypatch.setattr(d, "get_session", boom)
+    with pytest.raises(RuntimeError, match=d._MP4_HOST_BLOCKED_MARKER):
+        d._mp4_probe_total_size(url, {}, None)
+
+
+def test_probe_total_size_records_429(circuit_env, monkeypatch):
+    """探测层的 429 要计入熔断（不只是块层）。"""
+    url = "https://slow.cdn/a.mp4"
+    _install_range_session(monkeypatch, b"", status=429)
+    for _ in range(3):
+        with pytest.raises(Exception):
+            d._mp4_probe_total_size(url, {}, None)
+    assert d._mp4_host_is_tripped(url) is True
+
+
+def test_mp4_chunk_429_trips_and_aborts_immediately(mp4_env, circuit_env,
+                                                    monkeypatch):
+    """🔒 块层 429 立即上抛 + 计入熔断，不走 SEG_RETRY_MAX 次退避。
+
+    实测该 429 是整机故障而非限流：换 IP/签名/冷却后恒定 429，
+    继续退避 20 次纯属空耗，必须立刻换节点。
+    """
+    monkeypatch.setattr(d, "SEG_RETRY_MAX", 20)
+    url = "https://bad2.cdn/a.mp4"
+    session = _install_range_session(monkeypatch, b"", status=429)
+    with pytest.raises(RuntimeError, match=d._MP4_HOST_BLOCKED_MARKER):
+        d._download_mp4_chunk(url, {}, 0, 3, 0)
+    # 关键：只发了一次请求，没有走 20 次退避重试
+    assert len(session.calls) == 1
+    # 单次 429 只计数不熔断（阈值 3）；凑满阈值后才跳过该主机
+    assert d._mp4_host_429[d._host_of(url)] == 1
+    assert d._mp4_host_is_tripped(url) is False
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            d._download_mp4_chunk(url, {}, 0, 3, 0)
+    assert d._mp4_host_is_tripped(url) is True
+
+
+def test_host_circuit_marker_is_not_a_permanent_failure():
+    """🔒 红线：熔断文案绝不能进整集判死表。
+
+    主机故障是临时的，判整集死会让本可救回的集永久丢失。
+    它只进块级短路表（不再退避、尽快换节点）。
+    """
+    msg = f"{d._MP4_HOST_BLOCKED_MARKER}（HTTP 429，bad.cdn）: https://bad.cdn/a.mp4"
+    assert d._MP4_HOST_BLOCKED_MARKER not in d._PERMANENT_FAILURE_MARKERS
+    assert d._classify_failure(msg) is True          # 仍可重试
+    assert d._MP4_HOST_BLOCKED_MARKER in d._MP4_CHUNK_NO_RETRY_MARKERS
+    assert d.classify_reject_reason(msg) == "直链主机熔断(429)"
+
+
+# ------------------------------------------------ 失败侧逐节点归因
+def test_node_failures_record_each_provider(sandbox, monkeypatch):
+    """🔒 每个失败节点各记一条：provider / 类目 / retriable / 原文。
+
+    没有它就只能看末节点的 error，**无法区分同为 m3u8 的 vidup 与 vidfast**。
+    """
+    monkeypatch.setattr(d, "processing_ids", set())
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+
+    # 节点 1（vidup / m3u8）瞬时 5xx；节点 2（vidlink / mp4）签名过期。
+    # 走真实的节点循环，只把两条下载路径的入口换成桩。
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("HTTP Error 502")),
+    )
+    monkeypatch.setattr(
+        d, "_download_mp4_direct",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            RuntimeError("直链已失效（HTTP 403），需重新取流")
+        ),
+    )
+
+    entry = {
+        "tmdbId": "10", "season": 1, "episode": 1,
+        "urls": [
+            {"url": "https://a/1.m3u8", "provider": "vidup", "type": "m3u8",
+             "headers": {}, "quality": None, "size": None},
+            {"url": "https://b/2.mp4", "provider": "vidlink", "type": "mp4",
+             "headers": {}, "quality": None, "size": None},
+        ],
+    }
+    label, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    nodes = info["node_failures"]
+    assert [n["provider"] for n in nodes] == ["vidup", "vidlink"]
+    assert [n["node_index"] for n in nodes] == [1, 2]
+    assert nodes[0]["reason_class"] == "源站5xx"
+    assert nodes[0]["retriable"] is True
+    assert nodes[1]["reason_class"] == "直链失效需重新取流"
+    # 整集结论仍由既有逻辑给出，不受影响
+    assert info["retriable"] is True
+    assert info["needs_refetch"] is True
+
+
+def test_node_failures_absent_on_early_return(sandbox, monkeypatch):
+    """缺字段的早退路径在拿 ID 锁之前就 return，本就没有节点上下文。
+
+    此时 info 里没有 node_failures 键是**正确的**——消费端统一用
+    `info.get("node_failures") or []` 兜底，落盘为空列表。
+    """
+    monkeypatch.setattr(d, "processing_ids", set())
+    label, ok, info = d.process_one_entry(
+        {"tmdbId": "11", "season": 1, "episode": 1, "urls": []}, set()
+    )
+    assert ok is False
+    assert info["error"] == "缺少 tmdbId/season/episode 或 urls"
+    assert (info.get("node_failures") or []) == []
+
+
+def test_node_failures_reach_failed_log(sandbox, monkeypatch):
+    """端到端：node_failures 必须落进 failed.jsonl，否则统计侧读不到。"""
+    line = {"tmdbId": "12", "season": 1, "episode": 1,
+            "urls": [{"url": "https://a/1.m3u8", "provider": "vidup",
+                      "type": "m3u8", "headers": {}, "quality": None,
+                      "size": None}]}
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, processed: ("12_S01E01", False, {
+            "error": "HTTP Error 502",
+            "retriable": True,
+            "node_failures": [
+                {"node_index": 1, "provider": "vidup", "node_type": "m3u8",
+                 "reason_class": "源站5xx", "retriable": True,
+                 "error": "HTTP Error 502"},
+            ],
+        }),
+    )
+    d._run_pipeline()
+    rows = [r for r in _read_jsonl(sandbox / "failed.jsonl")
+            if r.get("stage") == "download"]
+    assert rows and rows[0]["node_failures"][0]["provider"] == "vidup"
+
+
 def test_download_mp4_direct_chunks_and_headers(mp4_env, monkeypatch):
     data = b"abcdefghij"
     session = _install_range_session(monkeypatch, data)
@@ -2093,16 +2293,486 @@ def test_quality_dead_takes_the_latest_verdict(monkeypatch, sandbox):
     assert d.load_quality_dead_keys() == set()
 
 
+def test_load_quality_dead_keys_honors_node_failures(monkeypatch, sandbox):
+    """🔒 落盘重载同口径：failed.jsonl 里有节点没给出画质结论 → 不算判死。
+
+    这条路径决定"下次运行的启动预检要不要跳过这集重取"。若只看
+    retriable+文案而忽略 node_failures，进程内正确判为"可重试"的集会在
+    **重启后**被当成画质判死永久跳过 —— 判死结论凭空复活。
+    """
+    _stale_env(monkeypatch, sandbox)
+    d.write_log(d.FAILED_LOG, {
+        "tmdbId": "2", "season": 1, "episode": 2,
+        "error": "分辨率 640x360 低于红线 1080",
+        "stage": "download", "retriable": False,
+        "node_failures": [
+            {"reason_class": "直链失效需重新取流"},   # 从未给出画质结论
+            {"reason_class": "分辨率低于红线"},
+        ],
+    })
+    assert d.load_quality_dead_keys() == set()
+
+
+def test_load_quality_dead_keys_kills_when_all_nodes_report_quality(monkeypatch,
+                                                                     sandbox):
+    """对照组：全部节点都是画质结论 → 重载后仍判死（避免上条测试变成平凡通过）。"""
+    _stale_env(monkeypatch, sandbox)
+    d.write_log(d.FAILED_LOG, {
+        "tmdbId": "2", "season": 1, "episode": 2,
+        "error": "分辨率 640x360 低于红线 1080",
+        "stage": "download", "retriable": False,
+        "node_failures": [
+            {"reason_class": "分辨率低于红线"},
+            {"reason_class": "码率未达门槛"},
+        ],
+    })
+    assert d.load_quality_dead_keys() == {"2_S01E02"}
+
+
 def test_is_quality_dead_requires_non_retriable():
     """可重试的失败一律不算画质判死（多节点集里"画质淘汰+502"整集仍可重试）。"""
     assert d.is_quality_dead(False, "分辨率 640x360 低于红线 720") is True
     assert d.is_quality_dead(False, "码率未达到门槛") is True
-    assert d.is_quality_dead(False, "本轮候选流无一入选") is True
+    # 画质汇总判死（内层全流淘汰 / 外层概率判死）也算
+    assert d.is_quality_dead(
+        False, "全部 3 条候选流均因画质不达标被淘汰（各流原因见上方日志）"
+    ) is True
     # 同样的文案，retriable=True 就不算
     assert d.is_quality_dead(True, "分辨率 640x360 低于红线 720") is False
     # 非画质类的确定性失败也不算
     assert d.is_quality_dead(False, "直链块不可用（HTTP 404）") is False
     assert d.is_quality_dead(False, "HTTP Error 502") is False
+
+
+# --- 第 3 道闸门：必须**全部节点**都给出画质结论才判死 -----------------------
+# 业务红线（用户拍板）：判死必须确定"该集在所有存在资源的节点上都画质不达标"，
+# 其余情况一律可重试。有跨运行重试兜底时，误判死 = 永久丢一集，代价远高于多跑一轮。
+_QUALITY_NODE = {"reason_class": "分辨率低于红线"}
+_BITRATE_NODE = {"reason_class": "码率未达门槛"}
+_REFETCH_NODE = {"reason_class": "直链失效需重新取流"}
+_5XX_NODE = {"reason_class": "源站5xx"}
+_STRUCT_NODE = {"reason_class": "不支持的播放列表结构"}
+_CHUNK404_NODE = {"reason_class": "直链块不可用(404/416)"}
+
+
+def test_quality_dead_requires_every_node_to_report_quality():
+    """全部节点都是画质类结论 → 判死（这才是"所有节点都不达标"）。"""
+    msg = "分辨率 640x360 低于红线 1080"
+    assert d.is_quality_dead(False, msg, [_QUALITY_NODE]) is True
+    assert d.is_quality_dead(False, msg, [_QUALITY_NODE, _BITRATE_NODE]) is True
+
+
+@pytest.mark.parametrize("other_node, label", [
+    (_REFETCH_NODE, "直链失效（换新链接可能就是 1080p）"),
+    (_5XX_NODE, "源站 5xx（今天挂了、明天可能好）"),
+    (_STRUCT_NODE, "结构不支持（该节点从未给出画质结论）"),
+    (_CHUNK404_NODE, "直链块 404"),
+])
+def test_quality_dead_blocked_when_any_node_lacks_quality_verdict(other_node, label):
+    """🔒 红线：任一节点没给出画质结论 → 绝不判死，无论它排在第几位。
+
+    这是 2026-09-13 审查实测出的真实误杀（3/8 场景违背语义）。成因：
+    error_msg 只留**末节点**文案，而"需重新取流/结构不支持/直链块404"这类
+    **非画质的确定性失败**既不会让 any_retriable 变 True、也不计入
+    quality_rejected_nodes，于是画质失败恰好落在末位时前两道闸门双双失守。
+    """
+    msg = "分辨率 640x360 低于红线 1080"
+    # 画质在末位（原漏洞触发顺序）
+    assert d.is_quality_dead(False, msg, [other_node, _QUALITY_NODE]) is False, label
+    # 画质在首位
+    assert d.is_quality_dead(False, msg, [_QUALITY_NODE, other_node]) is False, label
+
+
+def test_quality_dead_without_node_failures_falls_back_to_two_conditions():
+    """无逐节点信息（旧记录 / 异常抛在节点循环之外）→ 退回两条件口径。
+
+    不是放水：那些路径本就没有"多节点"语义，单节点集结论与三条件版一致。
+    """
+    msg = "分辨率 640x360 低于红线 1080"
+    assert d.is_quality_dead(False, msg, None) is True
+    assert d.is_quality_dead(False, msg, []) is True
+
+
+def test_refetch_node_plus_quality_node_is_not_dead_end_to_end(quality_env,
+                                                               monkeypatch):
+    """🔒 端到端红线：节点1 直链失效 + 节点2 画质不达标 → **不判死**。
+
+    走真实的 process_one_entry，验证的是"整条链路"而不只是 is_quality_dead
+    的单元行为。这个组合正是审查实测出的误杀场景：两个节点都是确定性失败
+    （any_retriable 保持 False），末节点文案又是画质的，第 3 道闸门是唯一防线。
+
+    业务含义：那个直链失效的节点换条新 url 完全可能是 1080p，凭什么替它
+    断定"整集画质不达标"。
+    """
+    calls = []
+
+    def fake_master(url, *a, **kw):
+        calls.append(url)
+        if len(calls) == 1:
+            raise RuntimeError("直链签名已过期，需重新取流")
+        raise d.QualityRejectedError("分辨率 640x360 低于红线 1080")
+
+    monkeypatch.setattr(d, "parse_master_playlist", fake_master)
+    label, ok, info = d.process_one_entry(_quality_entry(2), set())
+    assert ok is False
+    # 两个节点都是确定性失败，整集 retriable 确实是 False
+    assert info["retriable"] is False
+    # 但**不是**画质判死：有节点从未给出画质结论
+    assert d.is_quality_dead(
+        info["retriable"], info["error"], info.get("node_failures")
+    ) is False
+    # 且仍会进重取桶——这才是这集真正的出路
+    assert info.get("needs_refetch") is True
+
+
+def test_quality_kill_dead_log_skips_when_a_node_lacks_verdict(quality_env,
+                                                                monkeypatch):
+    """🔒 端到端：上述场景**不能**落进 download_dead.jsonl（否则永久丢集）。"""
+    line = {"tmdbId": "70", "season": 1, "episode": 1,
+            "urls": _quality_entry(2)["urls"]}
+    input_path = quality_env / "results.jsonl"
+    input_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(quality_env / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(quality_env / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+
+    calls = []
+
+    def fake_master(url, *a, **kw):
+        calls.append(url)
+        if len(calls) == 1:
+            raise RuntimeError("直链签名已过期，需重新取流")
+        raise d.QualityRejectedError("分辨率 640x360 低于红线 1080")
+
+    monkeypatch.setattr(d, "parse_master_playlist", fake_master)
+    d._run_pipeline()
+    assert d.load_dead_keys() == set()     # 账本必须是空的
+
+
+def test_stream_outage_is_never_quality_dead():
+    """🔒 红线：「候选流无一入选」绝不能被当成画质判死。
+
+    那是内层的**兜底汇总文案**，语义混装——既可能是"全部流真不达标"，
+    也可能是"源站 5xx 导致采样全挂"。TV 侧源站 5xx 频发，后者是常态。
+
+    此前它被列在 _QUALITY_REJECT_CATEGORIES 里，只是靠 _classify_failure
+    判它可重试才没出事——那是**巧合性**的安全。现在内层已用
+    QualityRejectedError 把两条路径拆开，该文案只代表"混合/纯瞬时"。
+
+    ⚠️ 若哪天有人把它加回画质类目或判死表，源站抽风的集会被永久判死。
+    本用例就是那道护栏。
+    """
+    outage = "本轮候选流无一入选（各流原因见上方日志），下一轮重采"
+    # ① 不在画质判死类目里
+    assert d.classify_reject_reason(outage) == "候选流无一入选"
+    assert "候选流无一入选" not in d._QUALITY_REJECT_CATEGORIES
+    # ② 不在整集判死表里 → 仍可重试
+    assert d._classify_failure(outage) is True
+    # ③ 即便强行传 retriable=False，也不该算画质判死
+    assert d.is_quality_dead(False, outage) is False
+
+
+def test_quality_summary_takes_precedence_over_outage_category():
+    """🔒 汇总判死文案里嵌着末节点错误，归类必须优先命中"画质整体不达标"。
+
+    外层概率判死的文案形如「…判定整集画质不达标；末节点错误：本轮候选流无一入选」。
+    若"候选流无一入选"规则排在前面，判死集会全被记到那个类目下，
+    正好污染要用来评估本口径是否过激的那份数据。
+    """
+    msg = (
+        "2 个节点中 2 个因画质不达标被确定性淘汰（≥ 阈值 1.00），"
+        "判定整集画质不达标；末节点错误：本轮候选流无一入选"
+    )
+    assert d.classify_reject_reason(msg) == "画质整体不达标(判死)"
+    assert d._classify_failure(msg) is False      # 确定性失败
+    assert d.is_quality_dead(False, msg) is True
+
+
+# ------------------------------------------- 画质判死：内层分流 + 外层概率判死
+def _quality_entry(node_count):
+    """构造 node_count 个 m3u8 节点的 entry。"""
+    return {
+        "tmdbId": "70", "season": 1, "episode": 1,
+        "urls": [
+            {"url": f"https://s{i}/p.m3u8", "provider": f"p{i}",
+             "type": "m3u8", "headers": {}, "quality": None, "size": None}
+            for i in range(1, node_count + 1)
+        ],
+    }
+
+
+@pytest.fixture
+def quality_env(sandbox, monkeypatch):
+    monkeypatch.setattr(d, "processing_ids", set())
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 1.0)
+    return sandbox
+
+
+def test_all_nodes_quality_rejected_kills_episode(quality_env, monkeypatch):
+    """全部节点画质淘汰 → 概率判死：retriable=False，不再进下一轮。"""
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            d.QualityRejectedError("分辨率 640x360 低于红线 1080（容差 0.80），跳过")
+        ),
+    )
+    label, ok, info = d.process_one_entry(_quality_entry(2), set())
+    assert ok is False
+    assert info["retriable"] is False                    # 判死
+    assert "判定整集画质不达标" in info["error"]
+    assert d.is_quality_dead(info["retriable"], info["error"]) is True
+
+
+def test_partial_quality_rejection_does_not_kill_at_ratio_1(quality_env,
+                                                            monkeypatch):
+    """🔒 阈值 1.0 下，只有部分节点画质淘汰**绝不能**判死。
+
+    这正是 TV 侧取 1.0 的意义：另一个节点是源站 5xx（今天挂了、明天可能好），
+    整集必须留在重投队列里。
+    """
+    calls = []
+
+    def fake_master(url, *a, **kw):
+        calls.append(url)
+        if len(calls) == 1:
+            raise d.QualityRejectedError("分辨率 640x360 低于红线 1080")
+        raise RuntimeError("HTTP Error 502")
+
+    monkeypatch.setattr(d, "parse_master_playlist", fake_master)
+    label, ok, info = d.process_one_entry(_quality_entry(2), set())
+    assert ok is False
+    assert info["retriable"] is True                     # 仍可重试
+    assert "判定整集画质不达标" not in info["error"]
+    assert d.is_quality_dead(info["retriable"], info["error"]) is False
+
+
+def test_single_node_quality_rejection_kills_at_ratio_1(quality_env, monkeypatch):
+    """单节点集画质淘汰：1/1 = 1.0 >= 1.0 → 判死。
+
+    ⚠️ 这说明阈值 1.0 对**单节点集**仍等价于"一次判死"——TV 侧单节点集占多数，
+    这是该阈值下唯一激进的场景，调阈值前必须知道这一点。
+    但它是正确的：只有一个节点且该节点画质确定性不达标，确实没有别的指望。
+    """
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            d.QualityRejectedError("码率未达到门槛：300 kbps < 1480 kbps")
+        ),
+    )
+    label, ok, info = d.process_one_entry(_quality_entry(1), set())
+    assert info["retriable"] is False
+
+
+def test_transient_failures_never_trigger_quality_kill(quality_env, monkeypatch):
+    """🔒 红线：纯瞬时失败（源站 5xx）绝不触发画质判死。"""
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("HTTP Error 502")),
+    )
+    label, ok, info = d.process_one_entry(_quality_entry(2), set())
+    assert info["retriable"] is True
+    assert "判定整集画质不达标" not in info["error"]
+
+
+def test_quality_kill_ratio_above_one_only_disables_the_summary(quality_env,
+                                                                monkeypatch):
+    """>1.0 关掉的是**汇总改写**，不是"画质失败变可重试"。
+
+    ⚠️ 这里有个容易误解的点（写测试时踩过）：画质文案本身
+    （"低于红线"/"码率未达到"）**已经在 `_PERMANENT_FAILURE_MARKERS` 里**，
+    所以全节点画质淘汰时 `any_retriable` 本来就是 False —— 那是单节点文案
+    决定的，与概率判死无关。
+
+    概率判死真正做的两件事是：
+      ① 把 msg 换成汇总文案（否则留的是末节点错误，会出现
+         「retriable=False 却写着 502」这类自相矛盾的记录）；
+      ② 在**混合场景**下推翻乐观口径（部分画质+部分瞬时时才有区别）。
+    故调高阈值只是不再改写文案，判死与否仍由文案决定。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 1.5)
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            d.QualityRejectedError("分辨率 640x360 低于红线 1080")
+        ),
+    )
+    label, ok, info = d.process_one_entry(_quality_entry(2), set())
+    # 仍是确定性失败（文案决定），但**没有**汇总改写
+    assert info["retriable"] is False
+    assert "判定整集画质不达标" not in info["error"]
+
+
+def test_quality_kill_records_to_dead_log(quality_env, monkeypatch):
+    """端到端：概率判死的集要落进 download_dead.jsonl，下次运行直接跳过。"""
+    line = {"tmdbId": "70", "season": 1, "episode": 1,
+            "urls": _quality_entry(2)["urls"]}
+    input_path = quality_env / "results.jsonl"
+    input_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(quality_env / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(quality_env / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            d.QualityRejectedError("分辨率 640x360 低于红线 1080")
+        ),
+    )
+    d._run_pipeline()
+    assert d.load_dead_keys() == {"70_S01E01"}
+
+
+def test_inner_all_streams_quality_rejected_raises_typed_error(sandbox, monkeypatch):
+    """🔒 内层分流：全流画质淘汰 → QualityRejectedError（确定性）。
+
+    与"混合/纯瞬时"必须产生**不同的异常类型与文案**，否则源站抽风会被
+    误判成画质不达标。
+    """
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+    # 两条候选流都声明低于红线 → 候选预筛阶段就全被排除
+    monkeypatch.setattr(
+        d, "parse_master_playlist",
+        lambda *a, **kw: [("640x360", "https://a/1.m3u8", 100),
+                          ("854x480", "https://a/2.m3u8", 200)],
+    )
+    node = {"url": "https://a/m.m3u8", "provider": "vidup", "type": "m3u8",
+            "headers": {}, "quality": None, "size": None}
+    entry = {"tmdbId": "71", "season": 1, "episode": 1, "urls": [node]}
+    monkeypatch.setattr(d, "processing_ids", set())
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    label, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    # 候选预筛的"没有找到高度达标"本身就是 QualityRejectedError
+    assert info["retriable"] is False
+    assert d.is_quality_dead(info["retriable"], info["error"]) is True
+
+
+def _inner_loop_env(monkeypatch, stream_outcomes, node_count=1):
+    """驱动**内层候选流循环**的公共桩。
+
+    上面那批画质判死用例都是在 parse_master_playlist 上直接抛异常，内层
+    「全流画质淘汰 vs 混合失败」的分流代码其实一行都没跑到（反向验证实测：
+    把 `quality_rejected_streams > 0 and other_failed_streams == 0` 改成 `or`，
+    整个测试文件依旧全绿）。这里让流真的走完采样→红线→码率，才测得到分流。
+
+    stream_outcomes: [("quality" | "transient"), ...]，按候选流顺序生效。
+      quality   —— 采样码率远低于门槛 → 内层抛 QualityRejectedError
+      transient —— 采样下载抛 502 → 内层记 other_failed_streams
+    """
+    variants = [
+        ("1920x1080", f"https://cdn/v{i}.m3u8", 5000 - i)
+        for i in range(len(stream_outcomes))
+    ]
+    outcome_of = {v[1]: o for v, o in zip(variants, stream_outcomes)}
+    seg_urls = [f"https://cdn/s{i}.ts" for i in range(20)]
+
+    monkeypatch.setattr(d, "processing_ids", set())
+    monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
+    monkeypatch.setattr(d, "LENIENCY", 1.0)
+    monkeypatch.setattr(d, "SAMPLE_COUNT", 4)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 1000.0})
+    monkeypatch.setattr(d, "probe_codec", lambda p: "h264")
+    monkeypatch.setattr(
+        d, "parse_master_playlist", lambda *a, **kw: list(variants)
+    )
+
+    current = {"url": None}
+
+    def fake_media(url, headers=None):
+        current["url"] = url
+        return seg_urls, [4.0] * 20, None
+
+    monkeypatch.setattr(d, "parse_media_playlist", fake_media)
+
+    def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
+                      init_url=None, force_init=False, headers=None,
+                      retry_max=None):
+        if outcome_of[current["url"]] == "transient":
+            raise RuntimeError("HTTP Error 502")
+        with open(out, "wb") as fh:
+            fh.write(b"x")
+        # 16s 采样 / 100KB → 50 kbps，远低于 1000 门槛 → 确定性画质淘汰
+        return 100_000, [], 0
+
+    monkeypatch.setattr(d, "download_segments", fake_download)
+
+    return {
+        "tmdbId": "72", "season": 1, "episode": 1,
+        "urls": [
+            {"url": f"https://n{i}/m.m3u8", "provider": f"p{i}", "type": "m3u8",
+             "headers": {}, "quality": None, "size": None}
+            for i in range(1, node_count + 1)
+        ],
+    }
+
+
+def test_inner_all_streams_bitrate_rejected_kills_episode(sandbox, monkeypatch):
+    """🔒 内层全流因**码率**淘汰 → 抛 QualityRejectedError → 外层计入判死。
+
+    这是走完整条链路（采样→红线→码率→内层分流→外层概率判死）的用例。
+    断言 "判定整集画质不达标" 还兼做类型护栏：内层若退回普通 RuntimeError，
+    外层的 isinstance 计数就不会加，汇总文案随之消失。
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 1.0)
+    entry = _inner_loop_env(monkeypatch, ["quality", "quality"], node_count=1)
+    label, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert "均因画质不达标被淘汰" in info["error"]     # 内层汇总（确定性）
+    assert "判定整集画质不达标" in info["error"]       # 外层判死（依赖异常类型）
+    assert info["retriable"] is False
+    assert d.is_quality_dead(info["retriable"], info["error"]) is True
+
+
+def test_inner_mixed_failure_never_becomes_quality_kill(sandbox, monkeypatch):
+    """🔒 红线：一条流画质淘汰 + 一条流 502 → **绝不能**判死。
+
+    TV 侧源站 5xx 频发，这条混合路径是常态。把它误判成画质不达标等于
+    每次源站抽风就永久丢一集，是本功能最危险的失效模式。
+    （反向验证靶子：内层分流条件从 and 改成 or，本用例必须转红。）
+    """
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 1.0)
+    entry = _inner_loop_env(monkeypatch, ["quality", "transient"], node_count=1)
+    label, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert "候选流无一入选" in info["error"]           # 走可重试汇总
+    assert "均因画质不达标被淘汰" not in info["error"]
+    assert "判定整集画质不达标" not in info["error"]
+    assert info["retriable"] is True                   # 留在重投队列
+    assert d.is_quality_dead(info["retriable"], info["error"]) is False
+
+
+def test_inner_all_streams_transient_never_becomes_quality_kill(sandbox,
+                                                                 monkeypatch):
+    """🔒 红线：全部流都是 502（源站整体抽风）→ 可重试，不判死。"""
+    monkeypatch.setattr(d, "QUALITY_KILL_RATIO", 1.0)
+    entry = _inner_loop_env(monkeypatch, ["transient", "transient"], node_count=1)
+    label, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert "候选流无一入选" in info["error"]
+    assert info["retriable"] is True
+    assert d.is_quality_dead(info["retriable"], info["error"]) is False
+
+
+def test_permanent_markers_cover_quality_summary_after_reload():
+    """🔒 落盘后只剩字符串：汇总判死文案必须能被 _classify_failure 认出。
+
+    failed.jsonl 重载时拿不到异常类型，只有文案。类型与文案互为双保险，
+    缺了文案这一层，重载后的判死记录会被当成可重试。
+    """
+    inner = "全部 3 条候选流均因画质不达标被淘汰（各流原因见上方日志）"
+    outer = "2 个节点中 2 个因画质不达标被确定性淘汰（≥ 阈值 1.00），判定整集画质不达标"
+    assert d._classify_failure(inner) is False
+    assert d._classify_failure(outer) is False
 
 
 def test_plan_retry_buckets_are_not_mutually_exclusive(monkeypatch):
@@ -2718,6 +3388,283 @@ def test_run_pipeline_skips_processed_ids_at_read_time(sandbox, monkeypatch):
     monkeypatch.setattr(d, "process_one_entry", fake_process)
     d._run_pipeline()
     assert seen == ["2_S01E01"]
+
+
+# --------------------------------------------- 画质判死账本（download_dead.jsonl）
+def test_parse_dead_quality_evidence_extracts_numbers():
+    """从判死文案回抽码率/门槛/分辨率/编码，供门槛变更后离线复判。"""
+    msg = "分辨率 854x480 流（h264）码率未达到门槛：372 kbps < 1600 kbps"
+    evidence = d.parse_dead_quality_evidence(msg)
+    assert evidence == {
+        "bitrate_kbps": 372.0,
+        "threshold_kbps": 1600.0,
+        "resolution": "854x480",
+        "codec": "h264",
+    }
+
+
+@pytest.mark.parametrize("msg", [
+    "",
+    None,
+    "分辨率 640x360 低于红线 1080（容差 0.80），跳过",   # 无码率数值
+    "候选流无一入选",
+])
+def test_parse_dead_quality_evidence_returns_none_without_bitrate(msg):
+    """没有码率数值就没有可存的依据，--retry-dead 对这些只能整集放回。"""
+    assert d.parse_dead_quality_evidence(msg) is None
+
+
+def test_record_and_load_dead_keys_roundtrip(sandbox):
+    """写进账本的集，下次启动会被 load_dead_keys 认出来。"""
+    entry = {"tmdbId": "7", "season": 1, "episode": 2, "title": "T"}
+    msg = "分辨率 854x480 流（h264）码率未达到门槛：372 kbps < 1600 kbps"
+    d.record_quality_dead(entry, msg, urls=["u1", "u2"])
+
+    records = _read_jsonl(sandbox / "download_dead.jsonl")
+    assert len(records) == 1
+    assert records[0]["tmdbId"] == "7"
+    assert records[0]["reason_class"] == "quality"
+    assert records[0]["node_count"] == 2
+    assert records[0]["evidence"]["bitrate_kbps"] == 372.0
+
+    assert d.load_dead_keys() == {"7_S01E02"}
+
+
+def test_load_dead_keys_uses_conjunction_not_row_order(sandbox):
+    """🔒 同一集多行时用**合取**裁决，结论不随追加顺序漂移。
+
+    账本是纯追加的，同一集会有多行。若逐行 add/discard，最终结论取决于哪一行
+    排在最后——这里放一条"有依据且仍不达标"和一条"无依据"，无论顺序如何，
+    只要有任一条证明仍不达标就必须继续跳过。
+    """
+    # 第一条有依据且远低于门槛；第二条无依据（单看它会被放回）。
+    d.record_quality_dead(
+        {"tmdbId": "9", "season": 1, "episode": 1},
+        "分辨率 854x480 流（h264）码率未达到门槛：100 kbps < 1600 kbps",
+    )
+    d.record_quality_dead(
+        {"tmdbId": "9", "season": 1, "episode": 1},
+        "候选流无一入选",          # parse 不出依据
+    )
+    # 正常运行：全部判死集一律跳过。
+    assert d.load_dead_keys() == {"9_S01E01"}
+    # --retry-dead：合取语义下，那条"仍不达标"的记录把它按住。
+    assert d.load_dead_keys(d.dead_record_passes_now) == {"9_S01E01"}
+
+
+def test_dead_record_passes_now_respects_current_threshold(monkeypatch):
+    """门槛调松到实测码率之下（且留足余量）时才放回。"""
+    monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.05)
+    record = {"evidence": {"bitrate_kbps": 1000.0, "resolution": "1920x1080",
+                           "codec": "h264"}}
+    # 门槛 2000 → 远高于实测 1000，仍不达标。
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 2000.0)
+    assert d.dead_record_passes_now(record) is False
+    # 门槛降到 900：900 × 1.05 = 945 <= 1000 → 放回。
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 900.0)
+    assert d.dead_record_passes_now(record) is True
+    # 门槛 960：960 × 1.05 = 1008 > 1000 → 余量不足，不放回（防来回震荡）。
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 960.0)
+    assert d.dead_record_passes_now(record) is False
+
+
+def test_dead_record_passes_now_revives_when_no_evidence():
+    """没有依据就无法证明它现在仍不达标 → 放回（宁可多下不误杀）。"""
+    assert d.dead_record_passes_now({"evidence": {}}) is True
+    assert d.dead_record_passes_now({}) is True
+
+
+def test_dead_record_passes_now_blocks_missing_height(monkeypatch):
+    """🔒 height 抽不出来时一律不放回。
+
+    bitrate_threshold 按 (h/1080)² 缩放，height=0 会让门槛恒为 0，
+    `0 × 余量 <= 任何码率` 恒真 —— 这批记录会被无条件放回去白跑。
+    """
+    monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.05)
+    record = {"evidence": {"bitrate_kbps": 50.0, "resolution": "未知分辨率"}}
+    assert d.dead_record_passes_now(record) is False
+
+
+def test_quality_dead_is_recorded_and_skipped_next_run(sandbox, monkeypatch):
+    """端到端：画质判死的集落账本，下一次运行不再被投递。"""
+    line = {"tmdbId": "5", "season": 1, "episode": 1, "urls": ["u"]}
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+
+    seen = []
+
+    def fake_process(entry, processed_ids):
+        seen.append(d.record_episode_key(entry))
+        return "5_S01E01", False, {
+            "error": "分辨率 854x480 流（h264）码率未达到门槛：372 kbps < 1600 kbps",
+            "retriable": False,
+        }
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+
+    d._run_pipeline()
+    assert seen == ["5_S01E01"]                 # 第一轮确实跑了
+    assert d.load_dead_keys() == {"5_S01E01"}   # 判死已落账本
+
+    # 第二次运行：同样的输入，这次应被跳过（不再重新采样求证同一结论）。
+    seen.clear()
+    d._run_pipeline()
+    assert seen == []
+
+
+def test_transient_failure_is_not_recorded_as_dead(sandbox, monkeypatch):
+    """🔒 红线：瞬时失败绝不能进判死账本。
+
+    源站 5xx / 超时是"今天源站挂了"，重取完全可能换到好流；
+    把它们当画质判死会永久放弃可救回的集，直接违背"尽可能提高成功率"。
+    """
+    line = {"tmdbId": "6", "season": 1, "episode": 1, "urls": ["u"]}
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    monkeypatch.setattr(d, "scan_downloaded_mp4_ids", lambda: (set(), {}))
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda entry, processed: ("6_S01E01", False,
+                                  {"error": "HTTP Error 502", "retriable": True}),
+    )
+    d._run_pipeline()
+    assert d.load_dead_keys() == set()
+
+
+# ------------------------------------------------ failed.jsonl 轮转
+def test_compact_failed_log_keeps_useful_rows(sandbox, monkeypatch):
+    """轮转后：历史整体归档，两类仍有用的行原样回填。"""
+    monkeypatch.setattr(d, "FAILED_LOG_MAX_BYTES", 1)   # 任何非空文件都超限
+    monkeypatch.setattr(d, "_SCRIPT_DIR", sandbox)
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: {"3_S01E01"})
+
+    rows = [
+        # ① 待重取：必须回填，否则重取闭环断裂
+        {"tmdbId": "1", "season": 1, "episode": 1, "stage": "download",
+         "error": "直链失效，需重新取流", "retriable": False},
+        # ② 画质判死：必须回填，load_quality_dead_keys 要读
+        {"tmdbId": "2", "season": 1, "episode": 1, "stage": "download",
+         "error": "分辨率 854x480 流（h264）码率未达到门槛：372 kbps < 1600 kbps",
+         "retriable": False},
+        # ③ 已成功的集：不必再留
+        {"tmdbId": "3", "season": 1, "episode": 1, "stage": "download",
+         "error": "需重新取流", "retriable": False},
+        # ④ 普通瞬时失败：不必留（下次运行本来就会自动重投）
+        {"tmdbId": "4", "season": 1, "episode": 1, "stage": "download",
+         "error": "HTTP Error 502", "retriable": True},
+        # ⑤ 上传阶段失败：与重取/画质都无关
+        {"tmdbId": "5", "season": 1, "episode": 1, "stage": "upload",
+         "error": "R2 timeout", "retriable": True},
+    ]
+    with open(sandbox / "failed.jsonl", "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    rotated, archive_path, kept = d.compact_failed_log()
+    assert rotated is True and kept == 2
+    # 历史零丢失：归档里是完整的 5 行
+    assert len(_read_jsonl(archive_path)) == 5
+    # 新文件只剩 ①②
+    remaining = {r["tmdbId"] for r in _read_jsonl(sandbox / "failed.jsonl")}
+    assert remaining == {"1", "2"}
+
+
+def test_compact_keeps_non_dead_quality_row_via_refetch_marker(sandbox,
+                                                                monkeypatch):
+    """🔒 轮转口径与判死口径一致：有节点没给出画质结论的行**不是**判死行。
+
+    它靠"需重新取流"这条规则回填（那才是这集真正的出路）。若轮转时忽略
+    node_failures，它会被当成判死行回填——回填结果碰巧一样，但 reason 全错，
+    且下游 load_quality_dead_keys 会据此永久跳过它。
+    """
+    monkeypatch.setattr(d, "FAILED_LOG_MAX_BYTES", 1)
+    monkeypatch.setattr(d, "_SCRIPT_DIR", sandbox)
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+
+    row = {
+        "tmdbId": "7", "season": 1, "episode": 1, "stage": "download",
+        # 末节点文案是画质的，但节点1 从未给出画质结论
+        "error": "分辨率 640x360 低于红线 1080",
+        "retriable": False,
+        "node_failures": [
+            {"reason_class": "源站5xx"},
+            {"reason_class": "分辨率低于红线"},
+        ],
+    }
+    with open(sandbox / "failed.jsonl", "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    d.compact_failed_log()
+    # 不被判死：重载时不进画质判死集合
+    monkeypatch.setattr(d, "FAILED_LOG", str(sandbox / "failed.jsonl"))
+    monkeypatch.setattr(d, "AUTO_REFETCH_SKIP_QUALITY_DEAD", True)
+    assert d.load_quality_dead_keys() == set()
+
+
+def test_failed_row_useful_honors_node_failures(sandbox, monkeypatch):
+    """🔒 轮转口径必须与判死口径一致（`_failed_row_still_useful`）。
+
+    一行"末节点画质不达标、但另有节点只报 5xx"的记录**不是**判死行：
+    它整集仍可重试，下次运行本来就会自动重投，无须占用回填名额。
+    忽略 node_failures 的话它会被误当判死行长期回填，且下游
+    load_quality_dead_keys 会据此永久跳过它。
+    """
+    monkeypatch.setattr(d, "load_success_log_ids", lambda: set())
+    row = {
+        "tmdbId": "7", "season": 1, "episode": 1, "stage": "download",
+        "error": "分辨率 640x360 低于红线 1080",   # 末节点文案是画质的
+        "retriable": False,
+        "node_failures": [
+            {"reason_class": "源站5xx"},          # 从未给出画质结论
+            {"reason_class": "分辨率低于红线"},
+        ],
+    }
+    assert d._failed_row_still_useful(row, set(), set()) is False
+
+    # 对照组：全部节点都是画质结论 → 真判死行，必须回填
+    dead_row = dict(row, node_failures=[
+        {"reason_class": "分辨率低于红线"},
+        {"reason_class": "码率未达门槛"},
+    ])
+    assert d._failed_row_still_useful(dead_row, set(), set()) is True
+
+
+def test_compact_failed_log_skips_when_another_process_runs(sandbox, monkeypatch):
+    """🔒 跨进程守卫：别的 downloader 在跑时绝不轮转。
+
+    否则那个进程的 fd 指向旧 inode，os.replace 之后它写的每一条都进了
+    archive、新文件里没有 —— 那批待重取记录就此蒸发。
+    """
+    monkeypatch.setattr(d, "FAILED_LOG_MAX_BYTES", 1)
+    monkeypatch.setattr(d, "_SCRIPT_DIR", sandbox)
+    monkeypatch.setattr(d, "is_main_running", lambda: True)
+    (sandbox / "failed.jsonl").write_text('{"tmdbId":"1"}\n', encoding="utf-8")
+
+    assert d.compact_failed_log() == (False, None, 0)
+    # 原文件原封不动
+    assert (sandbox / "failed.jsonl").read_text(encoding="utf-8")
+
+
+def test_compact_failed_log_disabled_by_zero(sandbox, monkeypatch):
+    monkeypatch.setattr(d, "FAILED_LOG_MAX_BYTES", 0)
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    (sandbox / "failed.jsonl").write_text('{"tmdbId":"1"}\n', encoding="utf-8")
+    assert d.compact_failed_log() == (False, None, 0)
 
 
 # ---------------------------------------------------------------- reupload

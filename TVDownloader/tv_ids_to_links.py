@@ -181,6 +181,82 @@ def _resolve(p):
     return p if p.is_absolute() else Path(__file__).with_name(str(p))
 
 
+# ---------- 跨进程单实例锁 ----------
+# 下载侧一直有 download_tv.main.lock、字幕侧有 fetch_subtitles.lock，取流侧此前没有。
+# 两个全量取流同时跑的后果（TV 侧比电影侧更严重）：
+#   ① 重复写 results.jsonl —— 双方的 load_processed 都是**启动时读一次快照**，
+#      拦不住对方后续新增的行，几百万集规模下等于白烧一倍代理流量；
+#   ② seasons_cache.jsonl 重复展开，多打一倍 TMDB 请求；
+#   ③ 🔴 **熔断保护失效** —— `_rollback_fail_tail` 的前提是"fail.txt 末尾 N 行
+#      必然是本进程写的"，两个进程交错追加会让该假设不成立。它只在尾部不匹配时
+#      放弃回滚（不会损坏文件），但批量误杀就此没人兜底。
+#
+# 与下载侧完全同构（PID 文件 + 陈旧锁自动清理），刻意**不共用**一把锁：
+# "只跑取流"和"只跑下载"本就该能同机并行，那是既有的使用方式。
+FETCH_LOCK_FILE = str(_resolve("tv_ids_to_links.main.lock").resolve())
+
+
+def _pid_alive(pid):
+    """判断给定 PID 的进程是否存活（不发送真正的信号）。"""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 进程存在但无权限——仍视为存活。
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_lock_pid():
+    try:
+        with open(FETCH_LOCK_FILE, "r", encoding="utf-8") as f:
+            return int((f.read() or "0").strip() or 0)
+    except (OSError, ValueError):
+        return 0
+
+
+def is_fetch_running():
+    """取流主流程是否已在运行；陈旧锁（PID 已死）会被就地清理并返回 False。"""
+    if not os.path.exists(FETCH_LOCK_FILE):
+        return False
+    pid = _read_lock_pid()
+    if pid == os.getpid():
+        return True
+    if pid > 0 and _pid_alive(pid):
+        return True
+    # 陈旧锁：上次异常退出（含 kill -9）留下的，清掉。
+    try:
+        os.remove(FETCH_LOCK_FILE)
+    except OSError:
+        pass
+    return False
+
+
+def acquire_fetch_lock():
+    """抢取流单实例锁；已被别的活进程持有时抛 SystemExit。"""
+    if is_fetch_running():
+        raise SystemExit(
+            f"已有取流进程在运行（PID {_read_lock_pid()}）。\n"
+            f"两个全量取流同时跑会重复写 results.jsonl / seasons_cache.jsonl，"
+            f"白烧一倍代理与 TMDB 配额，并让熔断的尾部回滚失效。\n"
+            f"若确认那个进程已死，删掉 {FETCH_LOCK_FILE} 再试。"
+        )
+    with open(FETCH_LOCK_FILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+
+def release_fetch_lock():
+    """退出时清理锁文件（仅当锁属于本进程时才删）。"""
+    if _read_lock_pid() == os.getpid():
+        try:
+            os.remove(FETCH_LOCK_FILE)
+        except OSError:
+            pass
+
+
 # ---------- 元数据补全 ----------
 # 从 tv_series.jsonl 预加载 tmdb_id -> 静态元数据，供取流成功时一并写进 results.jsonl
 # （下游 download_tv 据此拼 R2 路径 {year}/{tmdbId}/S..）。
@@ -1127,7 +1203,17 @@ def main(argv=None, on_result=None, stop_event=None):
     stop_event（可选）：pipeline 模式下的协作式停止信号，让取流能在下载侧
     收工 / 用户 Ctrl+C 后及时停下，而不是把整批几百万集跑完才罢休。
     置位后：不开新一轮、不发起新请求、季集展开与轮间退避立即醒来。
+
+    单实例锁在 _main_impl 内按模式条件获取，这里统一释放：release 只在锁属于
+    本进程时才删文件，故没抢锁的路径走到这里也是安全的空操作。
     """
+    try:
+        return _main_impl(argv=argv, on_result=on_result, stop_event=stop_event)
+    finally:
+        release_fetch_lock()
+
+
+def _main_impl(argv=None, on_result=None, stop_event=None):
     global ACTIVE_PROVIDERS
     args = _parse_args([] if argv is None else argv)
     if args.providers:
@@ -1137,6 +1223,15 @@ def main(argv=None, on_result=None, stop_event=None):
     results_file = _resolve(_CFG.get("output", "results.jsonl"))
     fail_file = _resolve(_CFG.get("fail_file", "fail.txt"))
     cache_file = _resolve(_CFG.get("seasons_cache", "seasons_cache.jsonl"))
+
+    # 单实例锁：两个全量取流同时跑会重复写 results.jsonl / seasons_cache.jsonl，
+    # 并让熔断的尾部回滚失效（见 FETCH_LOCK_FILE 注释）。
+    #
+    # ⚠️ --recheck-dead **同样要抢锁**（与电影侧的 --refetch-failed 不同）：
+    # 它走的是同一套 expand_seasons + run_batch，会写 results.jsonl 与
+    # seasons_cache.jsonl，且熔断的 _rollback_fail_tail 同样依赖"fail.txt 末尾
+    # N 行是本进程写的"。电影侧那个入口只按 id 列表重取、不展开不熔断，才敢不抢。
+    acquire_fetch_lock()
 
     if not ids_file.exists():
         print(f"{ids_file} not found!")

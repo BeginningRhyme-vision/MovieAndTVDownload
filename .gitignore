@@ -25,6 +25,7 @@ MovieDownloader/tmdb_ids_to_links.main.lock
 MovieDownloader/fetch_subtitles.lock
 MovieDownloader/upload_pending.jsonl
 TVDownloader/download_tv.main.lock
+TVDownloader/tv_ids_to_links.main.lock
 TVDownloader/upload_pending.jsonl
 # 离线测试会在 import 时触发脚本建日志/数据目录，避免误提交
 MovieDownloader/imdb_data/
@@ -44,6 +45,8 @@ TVDownloader/*.jsonl
 TVDownloader/progress.txt
 TVDownloader/fail.txt
 TVDownloader/ids.txt
+# failed.jsonl 轮转产生的归档。上面的 *.jsonl 只匹配顶层，挡不住子目录里的。
+TVDownloader/archive/
 # 服务器运行时文件与旁路产物
 TVDownloader/*.tsv
 TVDownloader/*.part
