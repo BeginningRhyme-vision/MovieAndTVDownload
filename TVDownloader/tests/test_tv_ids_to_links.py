@@ -584,6 +584,26 @@ def test_process_episode_meta_cannot_override_identity(monkeypatch):
     assert result["year"] == 2011 and result["runtime_minutes"] == 45
 
 
+def test_load_series_metadata_first_wins_on_duplicate_tmdb_id(monkeypatch, tmp_path):
+    """🔴 同一 tmdb_id 多行时必须 first-wins，与 filter_to_ids 的 seen 去重口径一致。
+
+    ids.txt 里这条 id 是因**第一行**入选的；若这里 last-wins，R2 路径的 {year}
+    与 results.jsonl 的 imdb_id 会取自第二行，和筛选依据对不上。
+    """
+    meta = tmp_path / "tv_series.jsonl"
+    meta.write_text(
+        json.dumps({"tmdb_id": 42, "imdb_id": "ttA", "start_year": 2001, "genres": ["Drama"]}) + "\n"
+        + json.dumps({"tmdb_id": 42, "imdb_id": "ttB", "start_year": 2015, "genres": []}) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(m, "_CFG", {"metadata": str(meta)})
+    table = m.load_series_metadata()
+    assert table == {"42": {
+        "year": 2001, "original_title": None, "runtime_minutes": None,
+        "genres": ["Drama"], "title_type": None, "imdb_id": "ttA",
+    }}
+
+
 def test_process_episode_stamps_fetched_at(monkeypatch):
     """每条结果必须带取流时刻，且不可被剧级元数据覆盖。
 

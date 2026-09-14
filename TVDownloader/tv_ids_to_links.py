@@ -280,14 +280,18 @@ def load_series_metadata():
             tid = m.get("tmdb_id")
             if tid is None:
                 continue
-            table[str(tid)] = {
+            # 同一 tmdb_id 出现多行（多个 IMDB 条目映射到同一部 TMDB 剧）时 **first-wins**，
+            # 与 filter_to_ids 的 seen 去重口径一致：ids.txt 里这条 id 是因第一行入选的，
+            # 这里取的 year/imdb_id 就必须也来自第一行，否则 R2 路径的 {year} 与
+            # results.jsonl 里的 imdb_id 会和筛选依据对不上。
+            table.setdefault(str(tid), {
                 "year": m.get("start_year"),
                 "original_title": m.get("original_title"),
                 "runtime_minutes": m.get("runtime_minutes"),
                 "genres": m.get("genres", []),
                 "title_type": m.get("title_type"),
                 "imdb_id": m.get("imdb_id"),
-            }
+            })
     print(f"[metadata] 已加载 {len(table)} 条剧集元数据")
     return table
 

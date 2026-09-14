@@ -164,6 +164,38 @@ _lock = threading.Lock()
 _IMDB_ID_RE = re.compile(r'"imdb_id":\s*"(tt\d+)"')
 
 
+def _truncate_trailing_partial_line(path: Path) -> bool:
+    """若文件末尾不是换行（上次进程死在 write 与 close 之间留下的半行），
+    把文件截断到最后一个换行处并 warning。返回是否做了截断。
+    只从尾部倒着找换行，不读整个文件（tv_series.jsonl 会有数 GB）。"""
+    with open(path, "r+b") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        if size == 0:
+            return False
+        f.seek(size - 1)
+        if f.read(1) == b"\n":
+            return False
+        # 倒着按块找最后一个换行
+        chunk = 1 << 16
+        pos = size
+        cut = 0
+        while pos > 0:
+            start = max(0, pos - chunk)
+            f.seek(start)
+            buf = f.read(pos - start)
+            idx = buf.rfind(b"\n")
+            if idx != -1:
+                cut = start + idx + 1
+                break
+            pos = start
+        f.truncate(cut)
+    log.warning(
+        f"{path.name} 尾部有 {size - cut:,} 字节半行（上次进程异常退出），已截断到最后一个完整行"
+    )
+    return True
+
+
 def load_done() -> set:
     """已处理的 imdb_id 集合。
 
@@ -176,22 +208,40 @@ def load_done() -> set:
       - 真实代价是重跑时对这条 id **再查一次 TMDB**（配额 + 时间），
         并在 tv_series.jsonl 里留下一行重复记录让文件虚胖。
     量级不大但完全可以避免，且与电影侧保持同一套语义。
+
+    🔴 只认**完整行**（以 \\n 结尾且 json.loads 成功）。一条 record 常常超过
+    文件缓冲区（8KB），进程若死在 write 与 close 之间，jsonl 尾部会留下半行。
+    半行里的 imdb_id 正则照样能抠出来 —— 若把它当已完成补进 progress，
+    下游 filter_to_ids 会把这行按 bad_json 跳过，这部剧就**静默丢失**且永不重试。
+    发现尾部半行时把文件截断到最后一个换行并 warning，让它下次正常重跑。
+    不截断的话下一条 record 会紧接在半行后面，把**新记录也一起拖成坏行**。
+    progress.txt 与 tv_as_movie.tsv 同理。截断只在启动时做，此时没有并发写入者。
     """
     done = set()
     if PROGRESS.exists():
+        _truncate_trailing_partial_line(PROGRESS)
         done.update(PROGRESS.read_text(encoding="utf-8").splitlines())
 
     backfill = []
     if OUTPUT.exists():
+        _truncate_trailing_partial_line(OUTPUT)
         with open(OUTPUT, encoding="utf-8") as f:
             for line in f:
                 match = _IMDB_ID_RE.search(line)
-                if match and match.group(1) not in done:
-                    done.add(match.group(1))
-                    backfill.append(match.group(1))
+                if not match or match.group(1) in done:
+                    continue
+                try:
+                    json.loads(line)
+                except ValueError:
+                    # 中间出现坏行（历史遗留 / 手工编辑），不认作已完成，下次重跑覆盖。
+                    log.warning(f"progress 对账: {match.group(1)} 所在行不是合法 JSON，不补记")
+                    continue
+                done.add(match.group(1))
+                backfill.append(match.group(1))
     # 旁路文件同样要对账：它与 progress 也是两次独立 write。
     # 无表头 TSV，第一列就是 imdb_id。
     if AS_MOVIE_OUTPUT.exists():
+        _truncate_trailing_partial_line(AS_MOVIE_OUTPUT)
         with open(AS_MOVIE_OUTPUT, encoding="utf-8") as f:
             for line in f:
                 iid = line.split("\t", 1)[0].strip()
@@ -255,16 +305,34 @@ def commit_record(record: dict, imdb_id: str):
 
 
 # ========== 下载（已存在则跳过）==========
+def _content_length(resp):
+    """返回可用于校验 r.raw 字节数的 Content-Length；不可用时返回 None。
+    r.raw 是未经 Content-Encoding 解码的原始字节，只有在没有传输层编码时
+    Content-Length 才与写入字节数一一对应。"""
+    headers = resp.headers
+    if headers.get("Content-Encoding", "identity").lower() != "identity":
+        return None
+    raw = headers.get("Content-Length")
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def ensure_dataset(key: str) -> Path:
     """下载并解压 IMDB 数据集。
     半成品保护：下载/解压都先写到 .part 临时文件，完成后原子 rename 到最终名。
     这样中途被杀（Ctrl-C/OOM）只会留下 .part，不会留下被截断却被 exists() 误判为完整的 .tsv。
 
     🔴 gz 一律在 finally 里删，**不做"已存在就复用"**：网络中途断开时
-    `shutil.copyfileobj` 不报错（服务端没给 Content-Length 校验），半截数据
-    会被 rename 成看似正常的 .gz。下次运行若复用它，gzip 解压必抛 EOFError，
-    而 gz 又没人清理 —— 每次运行都在同一处失败，人工不介入就再也跑不起来。
-    宁可重下几百 MB，也不能留下这种死循环。"""
+    `shutil.copyfileobj` 不报错，半截数据会被 rename 成看似正常的 .gz。
+    下次运行若复用它，gzip 解压必抛 EOFError，而 gz 又没人清理 —— 每次运行
+    都在同一处失败，人工不介入就再也跑不起来。宁可重下几百 MB，也不能留下这种死循环。
+
+    🔴 Content-Length 校验：IMDB 服务端会给 Content-Length。若截断恰好落在
+    gzip 成员边界，解压不会报错，只会得到**少一截**的 tsv，并被永久"已存在跳过"。
+    所以写入字节数与 Content-Length 不等时直接抛错（由 finally 清场）。
+    服务端没给时（或走代理被剥掉）退化为不校验。"""
     filename = DATASETS[key]
     tsv_path = DATA_DIR / filename.replace(".gz", "")
     if tsv_path.exists():
@@ -277,8 +345,14 @@ def ensure_dataset(key: str) -> Path:
         log.info(f"下载 {filename} ...")
         with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
             r.raise_for_status()
+            expected = _content_length(r)
             with open(gz_part, "wb") as f:
                 shutil.copyfileobj(r.raw, f)
+                written = f.tell()
+        if expected is not None and written != expected:
+            raise IOError(
+                f"{filename} 下载不完整: Content-Length={expected:,} 实际写入={written:,}"
+            )
         gz_part.replace(gz_path)
         log.info(f"解压 {filename} ...")
         with gzip.open(gz_path, "rb") as gz, open(tsv_part, "wb") as out:
@@ -429,8 +503,11 @@ def query_akas(imdb_id: str) -> list:
 
 
 def query_principals(imdb_id: str, names_dict: dict) -> list:
+    # ordering 列建表时是 TEXT，直接 ORDER BY 是字典序（"10" < "2"），
+    # 主演会被排到第 10 位之后；CAST 成整数才是 IMDB 的真实次序。
     rows = get_conn().execute(
-        "SELECT ordering,nconst,category,job,characters FROM principals WHERE tconst=? ORDER BY ordering",
+        "SELECT ordering,nconst,category,job,characters FROM principals "
+        "WHERE tconst=? ORDER BY CAST(ordering AS INTEGER)",
         (imdb_id,)
     ).fetchall()
     result = []
@@ -585,10 +662,11 @@ def load_names_dict() -> dict:
     """
     conn = sqlite3.connect(INDEX_DB)
     try:
-        rows = conn.execute("SELECT nconst, primaryName FROM names").fetchall()
+        # 直接迭代 cursor 构建 dict：fetchall() 会先把全部 tuple 列表放在内存里，
+        # 与最终 dict 并存，峰值内存翻倍（names 表 1400 万行，≈ 多占 1–1.5GB）。
+        return {r[0]: r[1] for r in conn.execute("SELECT nconst, primaryName FROM names")}
     finally:
         conn.close()
-    return {r[0]: r[1] for r in rows}
 
 
 # ========== TMDB ID（查 tv_results）==========
@@ -635,7 +713,10 @@ def get_tmdb_id(imdb_id: str, retry: int = 3):
       不能当作独立剧集下载，带回母剧 show_id 供统计/排查。
     这里把三个桶一并带回，由 process 决定去向，不多耗一次 API。
     429 限速不消耗重试次数（限速是外部节奏问题，不是本条目的问题），
-    但设有上限防止 TMDB 长时间限速时线程无限空转。"""
+    但设有上限防止 TMDB 长时间限速时线程无限空转。
+    404 是 TMDB 对该 imdb_id **确定性**的"查无"（Find 接口偶尔以 404 而非
+    空结果表达），重试没意义；按三桶皆空返回，由 process 走 skip 并 mark_done，
+    否则每次续跑都会对同一批 id 白打 3 次。"""
     last_err = None
     rate_limit_hits = 0
     attempt = 0
@@ -653,6 +734,9 @@ def get_tmdb_id(imdb_id: str, retry: int = 3):
             status = _http_status(e)
             if status in (401, 403):
                 raise TMDBAuthError(f"TMDB 拒绝访问（HTTP {status}），请检查 TMDB_API_KEY") from None
+            if status == 404:
+                log.info(f"{imdb_id} TMDB 返回 404，按查无处理")
+                return (None, None, None)
             if status == 429:
                 rate_limit_hits += 1
                 if rate_limit_hits > 6:

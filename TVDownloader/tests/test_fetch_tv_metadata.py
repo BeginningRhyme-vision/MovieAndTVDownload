@@ -43,6 +43,29 @@ def test_to_int_or_none(value, expected):
     assert m._to_int_or_none(value) == expected
 
 
+# ---------------------------------------------------------------- query_principals ordering
+def test_query_principals_orders_numerically_not_lexically(monkeypatch):
+    """ordering 列是 TEXT，裸 ORDER BY 是字典序（"10" < "2"），会把第 10 位排到第 2 位前。"""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.execute(
+        "CREATE TABLE principals (tconst TEXT, ordering TEXT, nconst TEXT, "
+        "category TEXT, job TEXT, characters TEXT)"
+    )
+    conn.executemany(
+        "INSERT INTO principals VALUES (?,?,?,?,?,?)",
+        [("tt1", "10", "nm10", "actor", "\\N", "\\N"),
+         ("tt1", "2", "nm2", "actor", "\\N", "\\N"),
+         ("tt1", "1", "nm1", "actor", "\\N", "\\N")],
+    )
+    monkeypatch.setattr(m, "get_conn", lambda: conn)
+    try:
+        got = m.query_principals("tt1", {"nm1": "A", "nm2": "B", "nm10": "C"})
+    finally:
+        conn.close()
+    assert [p["ordering"] for p in got] == ["1", "2", "10"]
+    assert [p["name"] for p in got] == ["A", "B", "C"]
+
+
 # ---------------------------------------------------------------- query_episodes
 def test_query_episodes_empty(episode_db):
     """🔴 无分集数据时 total_episodes 必须是 None，不是 0。
@@ -280,6 +303,14 @@ def test_get_tmdb_id_episode_bucket_returns_show_id(fake_find):
 def test_get_tmdb_id_nothing_found(fake_find):
     fake_find.script = [{"tv_results": [], "movie_results": []}]
     assert m.get_tmdb_id("tt1") == (None, None, None)
+
+
+def test_get_tmdb_id_404_is_not_found_not_retried(fake_find):
+    """404 是 TMDB 对该 id 确定性的"查无"，必须按三桶皆空返回（process 会 mark_done），
+    而不是消耗 3 次重试后抛 TMDBLookupError —— 后者会让每次续跑都对同一批 id 白打 3 次。"""
+    fake_find.script = [_http_err(404)] * 3
+    assert m.get_tmdb_id("tt1", retry=3) == (None, None, None)
+    assert fake_find.calls == 1
 
 
 def test_get_tmdb_id_transient_error_then_success(fake_find):
@@ -758,6 +789,71 @@ def test_load_done_handles_missing_files(monkeypatch, tmp_path):
     assert not prog.exists()
 
 
+def test_load_done_does_not_backfill_trailing_partial_line(monkeypatch, tmp_path):
+    """🔴 jsonl 尾部半行（进程死在 write 与 close 之间）绝不能被当成已完成。
+
+    半行里的 imdb_id 正则照样抠得出来；若补进 progress，下游 filter_to_ids 会把
+    这行按 bad_json 跳过，这部剧就**静默丢失**且永不重试。正确做法是把半行截掉
+    （否则下一条 record 会紧接其后，一起变成坏行）并让它下次重跑。
+    """
+    import json
+    out, side, prog = _done_env(monkeypatch, tmp_path)
+    good = json.dumps({"imdb_id": "tt1", "tmdb_id": 1}) + "\n"
+    partial = '{"imdb_id": "tt2", "tmdb_id": 2, "episodes": [{"episode_imdb'
+    out.write_text(good + partial, encoding="utf-8")
+
+    assert m.load_done() == {"tt1"}
+    assert prog.read_text(encoding="utf-8").splitlines() == ["tt1"]
+    # 半行必须被截掉，文件只剩完整行
+    assert out.read_text(encoding="utf-8") == good
+
+
+def test_load_done_truncates_partial_line_in_progress_and_side_output(monkeypatch, tmp_path):
+    """progress.txt / tv_as_movie.tsv 同样是 append 写，尾部半行一样要截掉。
+    progress 里的半个 id（如 "tt12" 实际是 "tt123456" 的前缀）若被当成已完成，
+    会让一个**不存在**的 id 进入 done 集——无害但脏；真正的 tt123456 仍会重跑。"""
+    out, side, prog = _done_env(monkeypatch, tmp_path)
+    prog.write_text("tt1\ntt12", encoding="utf-8")
+    side.write_text("tt7\t123\ttvSpecial\ntt8\t45", encoding="utf-8")
+
+    assert m.load_done() == {"tt1", "tt7"}
+    assert prog.read_text(encoding="utf-8").splitlines() == ["tt1", "tt7"]
+    assert side.read_text(encoding="utf-8") == "tt7\t123\ttvSpecial\n"
+
+
+def test_load_done_skips_non_json_line_in_the_middle(monkeypatch, tmp_path):
+    """中间的坏行（以 \\n 结尾但不是合法 JSON）不补记：下游会跳过它，
+    不认作已完成才能让这条 id 下次重跑覆盖。"""
+    import json
+    out, side, prog = _done_env(monkeypatch, tmp_path)
+    out.write_text(
+        '{"imdb_id": "tt1", "broken\n'
+        + json.dumps({"imdb_id": "tt2"}) + "\n",
+        encoding="utf-8",
+    )
+    assert m.load_done() == {"tt2"}
+    assert prog.read_text(encoding="utf-8").splitlines() == ["tt2"]
+
+
+def test_truncate_trailing_partial_line_finds_newline_across_chunks(tmp_path):
+    """半行超过一个回退块（64KB）时也要能找到最后一个换行。"""
+    p = tmp_path / "x.jsonl"
+    good = b'{"imdb_id": "tt1"}\n'
+    p.write_bytes(good + b"x" * (200_000))
+    assert m._truncate_trailing_partial_line(p) is True
+    assert p.read_bytes() == good
+    assert m._truncate_trailing_partial_line(p) is False
+
+
+def test_truncate_trailing_partial_line_whole_file_is_partial(tmp_path):
+    """整个文件都是半行（首条记录就没写完）：截成空文件，不报错。"""
+    p = tmp_path / "x.jsonl"
+    p.write_bytes(b'{"imdb_id": "tt1"')
+    assert m._truncate_trailing_partial_line(p) is True
+    assert p.read_bytes() == b""
+    assert m._truncate_trailing_partial_line(p) is False
+
+
 # ---------------------------------------------------------------- _ensure_dirs (nested paths)
 def test_ensure_dirs_creates_nested_parents(monkeypatch, tmp_path):
     monkeypatch.setattr(m, "DATA_DIR", tmp_path / "a" / "b" / "imdb_data")
@@ -821,9 +917,10 @@ def _gz_bytes(text: str) -> bytes:
 
 
 class _FakeResp:
-    def __init__(self, payload):
+    def __init__(self, payload, headers=None):
         import io
         self.raw = io.BytesIO(payload)
+        self.headers = dict(headers or {})
 
     def raise_for_status(self):
         pass
@@ -902,6 +999,55 @@ def test_ensure_dataset_cleans_gz_even_when_decompress_fails(monkeypatch, tmp_pa
         m.ensure_dataset("ratings")
     # 目录必须是干净的：没有 gz、没有 .part、没有半截 tsv
     assert list(tmp_path.iterdir()) == []
+
+
+def test_ensure_dataset_rejects_short_download_by_content_length(monkeypatch, tmp_path):
+    """🔴 写入字节数 < Content-Length 必须报错并清场。
+
+    截断恰好落在 gzip 成员边界时解压**不会**报错，只会得到少一截的 tsv，
+    然后被永久"已存在跳过"。这里用两个 gzip 成员拼接、只回传第一个来模拟。
+    """
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    full = _gz_bytes("a\tb\n1\t2\n") + _gz_bytes("3\t4\n")
+    first_member = _gz_bytes("a\tb\n1\t2\n")
+    monkeypatch.setattr(
+        m.requests, "get",
+        lambda *a, **k: _FakeResp(first_member, {"Content-Length": str(len(full))}),
+    )
+    with pytest.raises(IOError, match="下载不完整"):
+        m.ensure_dataset("ratings")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_ensure_dataset_accepts_matching_content_length(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    payload = _gz_bytes("a\tb\n1\t2\n")
+    monkeypatch.setattr(
+        m.requests, "get",
+        lambda *a, **k: _FakeResp(payload, {"Content-Length": str(len(payload))}),
+    )
+    assert m.ensure_dataset("ratings").read_text() == "a\tb\n1\t2\n"
+
+
+def test_ensure_dataset_ignores_content_length_when_transfer_encoded(monkeypatch, tmp_path):
+    """Content-Encoding 非 identity 时 r.raw 的字节数与 Content-Length 无关，不能校验。"""
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    payload = _gz_bytes("a\tb\n1\t2\n")
+    monkeypatch.setattr(
+        m.requests, "get",
+        lambda *a, **k: _FakeResp(payload, {"Content-Length": "1", "Content-Encoding": "gzip"}),
+    )
+    assert m.ensure_dataset("ratings").read_text() == "a\tb\n1\t2\n"
+
+
+def test_ensure_dataset_ignores_garbage_content_length(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    payload = _gz_bytes("a\tb\n1\t2\n")
+    monkeypatch.setattr(
+        m.requests, "get",
+        lambda *a, **k: _FakeResp(payload, {"Content-Length": "abc"}),
+    )
+    assert m.ensure_dataset("ratings").read_text() == "a\tb\n1\t2\n"
 
 
 # ---------------------------------------------------------------- 资源释放
