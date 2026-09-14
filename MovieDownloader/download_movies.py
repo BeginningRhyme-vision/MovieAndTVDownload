@@ -283,9 +283,12 @@ SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 5)))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
-# playlist（master/media）解析阶段的请求重试：源站临时 5xx 抽风时，这一层
-# 若过早放弃会直接判整部影片失败。故给足重试次数与退避上限，扛过几十秒级故障。
-PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 10))
+# playlist（master/media）解析阶段的请求重试。
+# 🔴 2026-09-13 由 10 降到 4（§12.37 E-2）：退避指数增长、第 7 次起封顶 60s，
+# 跑满 10 次约 4 分钟，而实跑中这些 400/500/502 全部来自 CDN 回源故障
+# （§I 实测：换 IP 无效、恢复是小时级），第 3~4 次就能定论，后面纯空耗。
+# 保留 4 次是为了仍能跨过源站几秒级的真抖动（退避 1+2+4 ≈ 7 秒）。
+PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 4))
 PLAYLIST_RETRY_BACKOFF = float(_CFG.get("playlist_retry_backoff", 1.0))
 PLAYLIST_RETRY_BACKOFF_MAX = float(_CFG.get("playlist_retry_backoff_max", 60.0))
 # 方案C 分阶重试：多节点 fallback 时，非末节点用更小的 playlist 重试次数，
