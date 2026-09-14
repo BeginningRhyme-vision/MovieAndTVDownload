@@ -113,6 +113,18 @@ tmdb.REQUESTS_TIMEOUT = (10, 30)
 # 所有 IMDB 文件读取统一使用 QUOTE_NONE。
 _IMDB_QUOTING = csv.QUOTE_NONE
 
+# pandas 读 IMDB TSV 的统一参数。三处 read_csv 必须共用，各写各的必然漂移。
+#
+# 🔴 keep_default_na=False 不可省：IMDB **只用 `\N`** 表示缺失，而 pandas 默认
+# 还会把 "NA"、"N/A"、"None"、"nan"、"null" 等字符串一并当成缺失——这些都是
+# 真实存在的剧名。读成 NaN 后 primary_title 会写出 null，下游 filter_to_ids 的
+# `show.get("primary_title") or ""` 拿到空串，**按标题筛选的规则对这些剧全部
+# 静默失效**（日志上毫无痕迹）。
+# 数值列不受影响：仍由 pd.to_numeric(errors="coerce") 把非数字转 NaN。
+_TSV_KW = dict(
+    sep="\t", na_values="\\N", keep_default_na=False, quoting=_IMDB_QUOTING
+)
+
 BASE_URL = "https://datasets.imdbws.com/"
 DATASETS = {
     "basics": "title.basics.tsv.gz",
@@ -146,10 +158,54 @@ _lock = threading.Lock()
 
 
 # ========== 进度 ==========
+# 从 jsonl 行里抠剧集自身的 imdb_id 用于对账。
+# 模式里的**开引号**已经构成边界：episodes[] 用的键是 episode_imdb_id，
+# 其 imdb_id 前面紧挨的是 `_` 而不是 `"`，天然匹配不上，无需额外的 lookbehind。
+_IMDB_ID_RE = re.compile(r'"imdb_id":\s*"(tt\d+)"')
+
+
 def load_done() -> set:
-    if not PROGRESS.exists():
-        return set()
-    return set(PROGRESS.read_text(encoding="utf-8").splitlines())
+    """已处理的 imdb_id 集合。
+
+    以 progress.txt 为主，再用 tv_series.jsonl 与 tv_as_movie.tsv **对账**：
+    commit_record / commit_as_movie 虽然把两次落盘放进同一把锁，但它们仍是两次
+    独立的 write，进程若恰好死在中间，这条记录已进产出文件、progress 却没有。
+
+    不对账的代价（已实测确认，不要凭想象放大）：
+      - ids.txt **不会**出现重复：filter_to_ids 有 seen 集合按 tmdb_id 去重；
+      - 真实代价是重跑时对这条 id **再查一次 TMDB**（配额 + 时间），
+        并在 tv_series.jsonl 里留下一行重复记录让文件虚胖。
+    量级不大但完全可以避免，且与电影侧保持同一套语义。
+    """
+    done = set()
+    if PROGRESS.exists():
+        done.update(PROGRESS.read_text(encoding="utf-8").splitlines())
+
+    backfill = []
+    if OUTPUT.exists():
+        with open(OUTPUT, encoding="utf-8") as f:
+            for line in f:
+                match = _IMDB_ID_RE.search(line)
+                if match and match.group(1) not in done:
+                    done.add(match.group(1))
+                    backfill.append(match.group(1))
+    # 旁路文件同样要对账：它与 progress 也是两次独立 write。
+    # 无表头 TSV，第一列就是 imdb_id。
+    if AS_MOVIE_OUTPUT.exists():
+        with open(AS_MOVIE_OUTPUT, encoding="utf-8") as f:
+            for line in f:
+                iid = line.split("\t", 1)[0].strip()
+                if iid.startswith("tt") and iid not in done:
+                    done.add(iid)
+                    backfill.append(iid)
+
+    if backfill:
+        log.warning(
+            f"progress 对账: {len(backfill):,} 条已写入产出文件但未标记，已补记"
+        )
+        with open(PROGRESS, "a", encoding="utf-8") as f:
+            f.write("".join(i + "\n" for i in backfill))
+    return done
 
 
 def mark_done(imdb_id: str):
@@ -181,9 +237,16 @@ def commit_record(record: dict, imdb_id: str):
     """一次加锁内先写 jsonl 再写 progress：
     - 先序列化再打开文件，序列化失败不会留下半行；
     - 两个文件各自 flush 后才释放锁，其他线程不会交错写入；
-    - 若在写完 jsonl、写 progress 之前崩溃，下次重跑会重复写同一行（下游按 tmdb_id dict 覆盖，无害），
-      但绝不会出现"progress 已标记而 jsonl 没数据"的丢数据情况。"""
-    line = json.dumps(record, ensure_ascii=False, cls=_Encoder) + "\n"
+    - 若在写完 jsonl、写 progress 之前崩溃，下次重跑由 load_done 扫 jsonl 对账补记，
+      绝不会出现"progress 已标记而 jsonl 没数据"的丢数据情况。
+
+    allow_nan=False 是**兜底防线**：上游虽已逐字段用 _text/pd.isna 守卫，但那是
+    白名单式防御，新增字段时漏一个就会写出裸 `NaN` —— 那不是合法 JSON，下游
+    json.loads 解析整行失败后按 bad_json 静默跳过，等于丢掉这条剧集。
+    在这里抛 ValueError 则会被 job 层记为 error 并在下次运行重试，错误可见。"""
+    line = json.dumps(
+        record, ensure_ascii=False, cls=_Encoder, allow_nan=False
+    ) + "\n"
     with _lock:
         with open(OUTPUT, "a", encoding="utf-8") as f:
             f.write(line)
@@ -433,7 +496,7 @@ def query_episodes(imdb_id: str, ratings) -> dict:
 # ========== 加载小文件（全量，内存够用）==========
 def load_basics() -> pd.DataFrame:
     path = ensure_dataset("basics")
-    df = pd.read_csv(path, sep="\t", na_values="\\N", low_memory=False, quoting=_IMDB_QUOTING)
+    df = pd.read_csv(path, low_memory=False, **_TSV_KW)
     df = df[df["titleType"].isin(KEEP_TYPES)].copy()
     df["startYear"] = pd.to_numeric(df["startYear"], errors="coerce")
     df["endYear"] = pd.to_numeric(df["endYear"], errors="coerce")
@@ -459,7 +522,7 @@ def load_basics() -> pd.DataFrame:
 
 def load_ratings() -> pd.DataFrame:
     path = ensure_dataset("ratings")
-    df = pd.read_csv(path, sep="\t", na_values="\\N", quoting=_IMDB_QUOTING)
+    df = pd.read_csv(path, **_TSV_KW)
     df["averageRating"] = pd.to_numeric(df["averageRating"], errors="coerce")
     df["numVotes"] = pd.to_numeric(df["numVotes"], errors="coerce")
     df = df.set_index("tconst")
@@ -475,7 +538,7 @@ def load_crew(keep_ids=None) -> pd.DataFrame:
     """title.crew 约 1100 万行（含全部 tvEpisode），而 process() 只按剧集 tconst 点查。
     传入 basics.index 后先裁剪再做 split，避免对 1000 万行做 Python 级 apply 和常驻内存。"""
     path = ensure_dataset("crew")
-    df = pd.read_csv(path, sep="\t", na_values="\\N", quoting=_IMDB_QUOTING)
+    df = pd.read_csv(path, **_TSV_KW)
     if keep_ids is not None:
         df = df[df["tconst"].isin(keep_ids)].copy()  # copy：后续列赋值不触发 SettingWithCopyWarning
     df["directors"] = df["directors"].apply(lambda x: x.split(",") if isinstance(x, str) else [])

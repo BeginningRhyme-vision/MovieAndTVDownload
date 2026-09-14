@@ -132,6 +132,44 @@ def test_load_basics_filters_by_keep_types(monkeypatch, tmp_path):
     assert pd.isna(df.loc["tt3", "startYear"]) and int(df.loc["tt3", "endYear"]) == 2010
 
 
+@pytest.mark.parametrize("title", ["NA", "N/A", "None", "nan", "null", "NULL"])
+def test_load_basics_keeps_na_like_titles_as_text(monkeypatch, tmp_path, title):
+    """🔴 IMDB **只用 `\\N`** 表示缺失，"NA"/"None"/"null" 都是真实剧名。
+
+    pandas 默认会把这批字符串一并当缺失（keep_default_na=True）。读成 NaN 后
+    primary_title 写出 null，下游 filter_to_ids 的 `show.get("primary_title") or ""`
+    拿到空串，**按标题筛选的规则对这些剧全部静默失效**——日志上毫无痕迹。
+    """
+    tsv = tmp_path / "title.basics.tsv"
+    tsv.write_text(
+        "tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear"
+        "\tendYear\truntimeMinutes\tgenres\n"
+        f"tt1\ttvSeries\t{title}\t{title}\t0\t2001\t\\N\t45\tDrama\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(m, "ensure_dataset", lambda key: tsv)
+    monkeypatch.setattr(m, "KEEP_TYPES", {"tvSeries"})
+
+    df = m.load_basics()
+    assert df.loc["tt1", "primaryTitle"] == title
+    assert df.loc["tt1", "originalTitle"] == title
+    # 真正的缺失标记仍必须变成 NaN，别把 \N 也一起当文本留下
+    assert pd.isna(df.loc["tt1", "endYear"])
+
+
+def test_tsv_kw_is_shared_by_every_reader():
+    """三处 read_csv 必须共用同一份参数——各写各的必然漂移。"""
+    assert m._TSV_KW["keep_default_na"] is False
+    assert m._TSV_KW["na_values"] == "\\N"
+    assert m._TSV_KW["quoting"] == m._IMDB_QUOTING
+
+    import inspect
+    source = inspect.getsource(m)
+    # 除 _TSV_KW 定义本身外，不应再有手写 na_values 的 read_csv
+    assert source.count("pd.read_csv") == source.count("**_TSV_KW"), \
+        "所有 read_csv 都必须走 _TSV_KW"
+
+
 # ---------------------------------------------------------------- load_crew (pruned to basics)
 def test_load_crew_prunes_to_keep_ids(monkeypatch, tmp_path):
     tsv = tmp_path / "title.crew.tsv"
@@ -583,6 +621,121 @@ def test_commit_record_is_thread_safe(monkeypatch, tmp_path):
     # no interleaved/corrupted lines, same order in both files
     assert sorted(out_ids) == sorted(ids)
     assert out_ids == prog_ids
+
+
+def test_commit_record_rejects_nan(monkeypatch, tmp_path):
+    """🔴 兜底防线：裸 NaN 不是合法 JSON，绝不能落盘。
+
+    上游逐字段的 _text/pd.isna 守卫是白名单式的，新增字段漏一个就会写出
+    `{"x": NaN}`。下游 filter_to_ids 解析失败后按 bad_json **静默跳过**，
+    等于丢掉这条剧集。在这里抛错才能被 job 层记为 error、下次重试。
+    """
+    out, prog = tmp_path / "out.jsonl", tmp_path / "progress.txt"
+    monkeypatch.setattr(m, "OUTPUT", out)
+    monkeypatch.setattr(m, "PROGRESS", prog)
+    with pytest.raises(ValueError):
+        m.commit_record({"imdb_id": "tt1", "rating": float("nan")}, "tt1")
+    # 序列化先于开文件：失败时两个文件都不该出现
+    assert not out.exists() and not prog.exists()
+
+
+# ---------------------------------------------------------------- load_done 对账
+def _done_env(monkeypatch, tmp_path):
+    out = tmp_path / "tv_series.jsonl"
+    side = tmp_path / "tv_as_movie.tsv"
+    prog = tmp_path / "progress.txt"
+    monkeypatch.setattr(m, "OUTPUT", out)
+    monkeypatch.setattr(m, "AS_MOVIE_OUTPUT", side)
+    monkeypatch.setattr(m, "PROGRESS", prog)
+    return out, side, prog
+
+
+def test_load_done_backfills_ids_written_but_not_marked(monkeypatch, tmp_path):
+    """🔴 进程死在"写完 jsonl、未写 progress"之间时，必须以产出文件为准补记。
+
+    不补记的代价：重跑时对这条 id 再查一次 TMDB（配额 + 时间），并在
+    tv_series.jsonl 里留下重复记录。
+    （ids.txt 本身不会重复——filter_to_ids 有 seen 集合兜底，已实测确认。）
+    """
+    import json
+    out, side, prog = _done_env(monkeypatch, tmp_path)
+    out.write_text(
+        json.dumps({"imdb_id": "tt1", "tmdb_id": 1}) + "\n"
+        + json.dumps({"imdb_id": "tt2", "tmdb_id": 2}) + "\n",
+        encoding="utf-8",
+    )
+    prog.write_text("tt1\n", encoding="utf-8")   # tt2 漏标
+
+    assert m.load_done() == {"tt1", "tt2"}
+    # 补记必须落盘，否则下次运行还要再对账一遍
+    assert prog.read_text(encoding="utf-8").splitlines() == ["tt1", "tt2"]
+
+
+def test_load_done_backfills_side_output_too(monkeypatch, tmp_path):
+    """旁路 TSV 与 progress 同样是两次独立 write，一样要对账。"""
+    out, side, prog = _done_env(monkeypatch, tmp_path)
+    side.write_text("tt7\t123\ttvSpecial\ntt8\t456\t\n", encoding="utf-8")
+    prog.write_text("tt7\n", encoding="utf-8")
+
+    assert m.load_done() == {"tt7", "tt8"}
+    assert prog.read_text(encoding="utf-8").splitlines() == ["tt7", "tt8"]
+
+
+def test_load_done_ignores_episode_imdb_ids(monkeypatch, tmp_path):
+    """🔴 episodes[] 里的 episode_imdb_id 绝不能被当成剧集 id 补记。
+
+    一部长寿剧有上万集，误匹配会把这些分集 id 全写进 progress，让它膨胀几个
+    数量级，且 load_done 的返回值不再表达"已处理的剧集"这个语义。
+
+    ⚠️ 把 episodes 摆在 imdb_id **之前**：正常 record 里 imdb_id 是第一个字段，
+    `search` 天然先命中它，那样测等于什么也没验证（不依赖字段顺序才是要点）。
+    真正提供保护的是模式里的**开引号** —— episode_imdb_id 的 imdb_id 前面紧挨
+    的是 `_` 而非 `"`。
+    """
+    import json
+    out, side, prog = _done_env(monkeypatch, tmp_path)
+    out.write_text(json.dumps({
+        "episodes": [{"episode_imdb_id": "tt9001"},
+                     {"episode_imdb_id": "tt9002"}],
+        "imdb_id": "tt1",
+    }) + "\n", encoding="utf-8")
+
+    assert m.load_done() == {"tt1"}
+    assert prog.read_text(encoding="utf-8").splitlines() == ["tt1"]
+
+
+def test_imdb_id_regex_requires_the_opening_quote():
+    """直接锁死那个边界：去掉开引号就会吃进 episode_imdb_id。
+
+    上一条用例走的是 load_done 整条链路，而链路里 imdb_id 恰好也在行内出现，
+    单看结果分不清"是边界起了作用"还是"碰巧只匹配到一个"。这里直接对正则
+    断言，把保护点本身钉住。
+    """
+    line = ('{"episodes": [{"episode_imdb_id": "tt9001"}], '
+            '"imdb_id": "tt1"}')
+    assert m._IMDB_ID_RE.findall(line) == ["tt1"]
+    # 反证：没有开引号约束时分集 id 会被一并吃进来
+    import re
+    loose = re.compile(r'imdb_id":\s*"(tt\d+)"')
+    assert loose.findall(line) == ["tt9001", "tt1"]
+
+
+def test_load_done_no_backfill_leaves_progress_untouched(monkeypatch, tmp_path):
+    """两边一致时不该重写 progress（避免每次启动都追加一遍）。"""
+    import json
+    out, side, prog = _done_env(monkeypatch, tmp_path)
+    out.write_text(json.dumps({"imdb_id": "tt1"}) + "\n", encoding="utf-8")
+    prog.write_text("tt1\n", encoding="utf-8")
+
+    assert m.load_done() == {"tt1"}
+    assert prog.read_text(encoding="utf-8") == "tt1\n"
+
+
+def test_load_done_handles_missing_files(monkeypatch, tmp_path):
+    """首跑：三个文件都不存在，返回空集且不建文件。"""
+    out, side, prog = _done_env(monkeypatch, tmp_path)
+    assert m.load_done() == set()
+    assert not prog.exists()
 
 
 # ---------------------------------------------------------------- _ensure_dirs (nested paths)
