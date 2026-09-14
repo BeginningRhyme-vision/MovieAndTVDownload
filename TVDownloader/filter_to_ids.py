@@ -27,6 +27,11 @@ from typing import Optional
 
 import yaml
 
+# ids.txt 里合法的 tmdb_id 形态：正整数，无前导零。
+# 不用 str.isdigit()：它对全角数字 "１２３" 与阿拉伯文数字也返回 True，
+# 那些字符拼进 TMDB URL 同样是废请求。
+_TMDB_ID_RE = re.compile(r"[1-9]\d*")
+
 # ========== 路径配置（来自 config.yaml 的 filter_to_ids 段；相对脚本目录，与其余脚本一致）==========
 _SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = _SCRIPT_DIR / "config.yaml"
@@ -346,6 +351,30 @@ def passes_all(show: dict, config: dict) -> bool:
     return True
 
 
+def _normalize_tmdb_id(value):
+    """把 tmdb_id 规整成能安全写进 ids.txt 的字符串；形态非法时返回 None。
+
+    ids.txt 是「一行一个 id」的纯文本契约，而原来的 `str(tmdb_id)` 对任何类型
+    都不报错：dict/list 会被写成 `{'id': 5}`、`[1, 2]` —— **字符串里带空格**，
+    任何按空白切分的读法都会把一行裂成多个假 id（已实测）。即便下游
+    tv_ids_to_links 是按行读、不会裂，这些垃圾 id 仍会被拿去拼 /tv/{id} 请求，
+    白烧 TMDB 配额。产出契约的边界必须在生产端守住。
+
+    合法形态只有两种：正整数，或它的纯数字字符串形式（JSON 里两种都可能出现）。
+    - bool 是 int 子类，但 True 出现在 id 字段只能是脏数据，单独拦掉；
+    - float 一律拒绝：TMDB id 是整数，3.7 是脏数据，而 3.0 写成 "3.0" 同样不合法；
+    - 用 [1-9]\\d* 而非 str.isdigit()：后者对全角/阿拉伯文数字也返回 True，
+      那些字符拼进 URL 同样是废请求。
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value > 0 else None
+    if isinstance(value, str) and _TMDB_ID_RE.fullmatch(value.strip()):
+        return value.strip()
+    return None
+
+
 # ========== 主流程 ==========
 def main():
     if not SERIES.exists():
@@ -364,7 +393,7 @@ def main():
     if kw_rule is not None:
         _compile_keywords(kw_rule)
 
-    total = kept = no_id = duplicate = bad_json = 0
+    total = kept = no_id = bad_id = duplicate = bad_json = 0
     seen = set()
 
     # 先写临时文件，全部成功后再原子替换，避免中途异常留下截断的 ids.txt 被下游误用
@@ -392,10 +421,16 @@ def main():
                     no_id += 1
                     continue
 
+                # 形态非法的 id 与"没有 id"分开计数：前者是数据异常，要能看见；
+                # 混进 no_id 会被当成"这部剧 TMDB 查无"这种正常情况而忽略。
+                tid = _normalize_tmdb_id(tmdb_id)
+                if tid is None:
+                    bad_id += 1
+                    continue
+
                 if not passes_all(show, config):
                     continue
 
-                tid = str(tmdb_id)
                 if tid in seen:  # 去重
                     duplicate += 1
                     continue
@@ -420,6 +455,11 @@ def main():
         f"读取 {total} 条 | 无 tmdb_id 跳过 {no_id} | 重复跳过 {duplicate} | "
         f"最终选中 {kept}"
     )
+    if bad_id:
+        # 单独一行告警而不是塞进上面那串：这不是正常流失，是上游写出了畸形 id，
+        # 混在统计里会被当成背景噪音划过去。
+        print(f"警告: 有 {bad_id} 条 tmdb_id 形态非法（非正整数）已跳过，"
+              f"请检查 {SERIES.name} 是否被手工改动或上游写入异常")
     if bad_json:
         print(f"警告: 有 {bad_json} 行无法解析为 JSON 已跳过，请检查 {SERIES.name} 是否有截断/损坏行")
     print(f"已写入 {OUTPUT_IDS}（{kept} 个 id）和 {OUTPUT_DETAIL}（明细）")

@@ -147,6 +147,128 @@ def test_main_survives_a_dirty_row(tmp_path, monkeypatch):
     assert (tmp_path / "ids.txt").read_text().split() == ["100", "400"]
 
 
+# ---------------------------------------------------------------- tmdb_id 形态守卫
+@pytest.mark.parametrize("raw, expect", [
+    (12345, "12345"),            # 正常 int
+    ("12345", "12345"),          # JSON 里也可能是字符串
+    ("  12345  ", "12345"),      # 两端空白容忍
+    (1, "1"),
+    (0, None),                   # TMDB id 从 1 开始
+    (-5, None),
+    (True, None),                # bool 是 int 子类，但只可能是脏数据
+    (False, None),
+    (3.7, None),                 # float 一律拒绝
+    (3.0, None),                 # 即便是整数值的 float，"3.0" 也不是合法 id
+    ("abc", None),
+    ("12a", None),
+    ("0123", None),              # 前导零：拼出的 URL 与 123 不是同一个资源
+    ("", None),
+    ("１２３", None),              # 全角数字：str.isdigit() 会放过，正则不会
+    ({"id": 5}, None),
+    ([1, 2], None),
+    (None, None),
+])
+def test_normalize_tmdb_id(raw, expect):
+    assert f._normalize_tmdb_id(raw) == expect
+
+
+def test_normalized_ids_never_contain_whitespace():
+    """🔴 这是本守卫存在的根本原因：dict/list 经 str() 后**字符串里带空格**。
+
+    实测 `str({"id": 5})` == "{'id': 5}"，写进 ids.txt 后任何按空白切分的
+    读法都会把一行裂成多个假 id。即便下游 tv_ids_to_links 是按行读、不会裂，
+    这些垃圾 id 仍会被拿去拼 /tv/{id}，白烧 TMDB 配额。
+    """
+    # 先坐实"不守卫会发生什么"，避免以后有人觉得这道校验多余
+    assert " " in str({"id": 5}) and " " in str([1, 2])
+
+    for junk in ({"id": 5}, [1, 2], "a b", "1 2"):
+        assert f._normalize_tmdb_id(junk) is None
+
+    # 放行的结果必然是可安全逐行写入的纯数字
+    for good in (12345, "12345", "  7  "):
+        out = f._normalize_tmdb_id(good)
+        assert out is not None and out.isascii() and out.isdigit()
+        assert out == out.strip() and " " not in out
+
+
+def test_main_skips_malformed_ids_and_reports_them(tmp_path, monkeypatch, capsys):
+    """端到端：畸形 id 不进 ids.txt，且必须有**可见**的告警。
+
+    静默跳过比写进去更糟 —— 用户会以为这批剧是正常筛掉的。
+    """
+    rows = [
+        {"tmdb_id": 100, "rating": 9.0},
+        {"tmdb_id": {"id": 5}, "rating": 9.0},     # dict
+        {"tmdb_id": [1, 2], "rating": 9.0},        # list
+        {"tmdb_id": 3.7, "rating": 9.0},           # float
+        {"tmdb_id": True, "rating": 9.0},          # bool
+        {"tmdb_id": "abc", "rating": 9.0},         # 非数字字符串
+        {"tmdb_id": "400", "rating": 9.0},         # 字符串形式的合法 id
+    ]
+    series = tmp_path / "tv.jsonl"
+    series.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    monkeypatch.setattr(f, "SERIES", series)
+    monkeypatch.setattr(f, "CONFIG", tmp_path / "missing.yaml")
+    monkeypatch.setattr(f, "OUTPUT_IDS", tmp_path / "ids.txt")
+    monkeypatch.setattr(f, "OUTPUT_DETAIL", tmp_path / "filtered.jsonl")
+
+    f.main()
+
+    text = (tmp_path / "ids.txt").read_text()
+    assert text.split() == ["100", "400"]
+    # 逐行读与按空白切分必须得到同一结果 —— 这正是畸形 id 会破坏的性质
+    assert text.split() == [ln for ln in text.splitlines() if ln]
+
+    out = capsys.readouterr().out
+    assert "5 条 tmdb_id 形态非法" in out
+    # 不能混进 no_id：那代表"TMDB 查无"这种正常流失，会被当成背景噪音
+    assert "无 tmdb_id 跳过 0" in out
+
+
+def test_malformed_id_is_counted_even_when_filters_would_reject_it(tmp_path, monkeypatch, capsys):
+    """畸形 id 的检查排在 passes_all 之前：这类剧无论能否通过筛选都下载不了，
+    且计数不该被筛选结果掩盖 —— 否则开了严格筛选时告警会凭空消失。
+    """
+    series = tmp_path / "tv.jsonl"
+    series.write_text(json.dumps({"tmdb_id": [1, 2], "rating": 1.0}) + "\n",
+                      encoding="utf-8")
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(yaml.safe_dump({"rating": {"enabled": True, "min": 9.0}}),
+                   encoding="utf-8")
+    monkeypatch.setattr(f, "SERIES", series)
+    monkeypatch.setattr(f, "CONFIG", cfg)
+    monkeypatch.setattr(f, "OUTPUT_IDS", tmp_path / "ids.txt")
+    monkeypatch.setattr(f, "OUTPUT_DETAIL", tmp_path / "filtered.jsonl")
+
+    f.main()
+
+    # rating 1.0 本来就会被 min:9.0 淘汰，但畸形 id 仍要被单独报出来
+    assert "1 条 tmdb_id 形态非法" in capsys.readouterr().out
+
+
+def test_string_and_int_ids_dedupe_together(tmp_path, monkeypatch):
+    """归一化的副作用（正面的）：tmdb_id 写成 100 与 "100" 现在会被判为同一部剧。
+
+    改之前 str(100) 与 str("100") 恰好也都得到 "100"，行为一致；
+    这条用例把它钉住，防止以后改归一化实现时意外破坏去重。
+    """
+    series = tmp_path / "tv.jsonl"
+    series.write_text(
+        json.dumps({"tmdb_id": 100}) + "\n"
+        + json.dumps({"tmdb_id": "100"}) + "\n"
+        + json.dumps({"tmdb_id": " 100 "}) + "\n",
+        encoding="utf-8")
+    monkeypatch.setattr(f, "SERIES", series)
+    monkeypatch.setattr(f, "CONFIG", tmp_path / "missing.yaml")
+    monkeypatch.setattr(f, "OUTPUT_IDS", tmp_path / "ids.txt")
+    monkeypatch.setattr(f, "OUTPUT_DETAIL", tmp_path / "filtered.jsonl")
+
+    f.main()
+
+    assert (tmp_path / "ids.txt").read_text().split() == ["100"]
+
+
 # ---------------------------------------------------------------- title_type / is_adult
 def test_title_type_allow():
     rule = {"allow": ["tvSeries", "tvMiniSeries"]}
