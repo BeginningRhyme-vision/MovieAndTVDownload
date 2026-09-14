@@ -45,8 +45,28 @@ def test_to_int_or_none(value, expected):
 
 # ---------------------------------------------------------------- query_episodes
 def test_query_episodes_empty(episode_db):
+    """🔴 无分集数据时 total_episodes 必须是 None，不是 0。
+
+    与 total_seasons 用同一套缺失语义。下游 _check_numeric 只对 None 走
+    keep_if_missing，给 0 会让它去比 min/max —— 同一部剧被两个字段判出相反结论。
+    """
     out = m.query_episodes("tt0000000", _make_ratings([]))
-    assert out == {"total_seasons": None, "total_episodes": 0, "episodes": []}
+    assert out == {"total_seasons": None, "total_episodes": None, "episodes": []}
+
+
+def test_query_episodes_never_returns_zero_total(episode_db):
+    """锁死不变量：total_episodes 要么是 None，要么 >= 1，永远不会是 0。
+
+    这是"用 None 不丢信息"的前提 —— 有分集数据时 len(episodes) 至少为 1，
+    所以 0 只可能来自"查不到"，与 None 表达同一件事。
+    """
+    # 查不到 -> None
+    assert m.query_episodes("tt_nothing", _make_ratings([]))["total_episodes"] is None
+    # 有一条 -> 1
+    episode_db.execute("INSERT INTO episode VALUES (?,?,?,?)",
+                       ("tt1", "ttQ", "1", "1"))
+    episode_db.commit()
+    assert m.query_episodes("ttQ", _make_ratings([]))["total_episodes"] == 1
 
 
 def test_query_episodes_sorting_and_none_last(episode_db):

@@ -149,6 +149,8 @@ total_seasons:
 # total_episodes: 按总集数筛选（对应 "total_episodes" 字段，整数，来自 IMDB episode 表）
 #   注意：同上，仅用于粗筛，控制总下载量；实际下载以 TMDB 季集结构为准。
 #   开启后：只保留 min <= total_episodes <= max 的剧。
+#   IMDB 无该剧分集数据时本字段为 null（与 total_seasons 同一套缺失语义），
+#   走下面的 keep_if_missing；不会出现 0（"确实有 0 集"的剧不存在）。
 # ----------------------------------------------------------------------------
 total_episodes:
   # 是否启用本项筛选：true=启用，false=不筛选（默认）
@@ -157,7 +159,7 @@ total_episodes:
   min: null
   # 最多集数（含）；null 表示不限。例：200 可避开上千集的日播剧
   max: 200
-  # 集数为 0 时不算缺失；只有整个字段为 null 才走这里：true=保留，false=排除
+  # 集数为 null（IMDB 无分集数据）时：true=保留，false=排除
   keep_if_missing: true
 
 

@@ -467,13 +467,22 @@ def query_episodes(imdb_id: str, ratings) -> dict:
     season/episode 为 IMDB 编号（可能为 None，IMDB 中存在未归季的集）。
     total_seasons 不计 season 0（特辑），与 TMDB number_of_seasons 及日常语义一致；
     episodes / total_episodes 仍包含 S0，因为下游 include_specials=true 时特辑会实际下载，
-    总集数需要如实反映下载量。"""
+    总集数需要如实反映下载量。
+
+    🔑 IMDB 没有该剧分集数据时，total_seasons 与 total_episodes **都返回 None**
+    （不是 0）。两者必须用同一套缺失语义，否则同一部剧会在下游得到相反结论：
+    `_check_numeric` 只对 None 走 keep_if_missing，0 则去比 min/max ——
+    启用 total_episodes 且设了 min>=1 时，这批"IMDB 无分集数据但 TMDB 有"的剧
+    会被静默排除，而它们恰恰是能正常下载的。
+    用 None 也不会丢信息："这部剧确实有 0 集"在现实与本函数里都不存在：
+    有 rows 时 total_episodes = len(episodes) >= 1，0 只可能来自"查不到"。
+    """
     rows = get_conn().execute(
         "SELECT tconst,seasonNumber,episodeNumber FROM episode WHERE parentTconst=?",
         (imdb_id,)
     ).fetchall()
     if not rows:
-        return {"total_seasons": None, "total_episodes": 0, "episodes": []}
+        return {"total_seasons": None, "total_episodes": None, "episodes": []}
 
     # Batch-fetch ratings with a single reindex: long-running shows (daily soaps)
     # can have 10k+ episodes, and per-episode `.loc` is ~100x slower than one reindex.

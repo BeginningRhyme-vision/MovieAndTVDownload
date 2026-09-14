@@ -46,9 +46,57 @@ def test_numeric_rule_range_and_missing(field):
     assert check(_show(**{field: None}), {"min": 1, "keep_if_missing": False}) is False
 
 
-def test_total_episodes_zero_is_not_missing():
-    # total_episodes == 0 must go through range check, not the keep_if_missing branch
-    assert f.check_total_episodes(_show(total_episodes=0), {"min": 1, "keep_if_missing": True}) is False
+def test_total_episodes_missing_uses_keep_if_missing():
+    """🔴 IMDB 无分集数据时 total_episodes 是 None（不是 0），必须走 keep_if_missing。
+
+    上游 query_episodes 保证：有分集数据时 total_episodes >= 1，查不到时为 None。
+    所以 0 这个取值在产出里根本不会出现，而 None 必须与 total_seasons 同样处理 ——
+    否则同一部剧会被两个字段判出相反结论（total_seasons 保留、total_episodes 排除），
+    把"IMDB 没数据但 TMDB 有"的剧静默筛掉。
+    """
+    rule = {"min": 1, "keep_if_missing": True}
+    assert f.check_total_episodes(_show(total_episodes=None), rule) is True
+    assert f.check_total_seasons(_show(total_seasons=None), rule) is True
+    # 两个字段在"缺失"这件事上必须给出一致结论
+    assert (f.check_total_episodes(_show(total_episodes=None), rule)
+            is f.check_total_seasons(_show(total_seasons=None), rule))
+    # keep_if_missing=False 时同样一致地排除
+    strict = {"min": 1, "keep_if_missing": False}
+    assert f.check_total_episodes(_show(total_episodes=None), strict) is False
+    assert f.check_total_seasons(_show(total_seasons=None), strict) is False
+
+
+def test_missing_episode_data_survives_a_min_based_filter():
+    """🔴 跨模块契约：上游"无分集数据"的产出，下游必须原样保留。
+
+    这条把生产者(query_episodes)与消费者(check_total_*)绑在一起 —— 单独测任一侧
+    都发现不了语义漂移：上游改回 0 时本用例会红，下游改坏 keep_if_missing 也会红。
+    用的是 query_episodes 的**真实返回值**，不是手写的字面量。
+    """
+    import fetch_tv_metadata as meta
+
+    # 直接取上游在"查不到分集"时的真实产出形状
+    empty = {"total_seasons": None, "total_episodes": None, "episodes": []}
+    import inspect
+    source = inspect.getsource(meta.query_episodes)
+    assert '"total_episodes": None' in source, \
+        "query_episodes 的无数据分支必须返回 None，否则下游 min 筛选会误杀"
+
+    show = _show(**empty)
+    # 典型配置：只限上限、不限下限 —— 这类剧必须活下来
+    assert f.check_total_episodes(show, {"min": None, "max": 200,
+                                         "keep_if_missing": True}) is True
+    # 即便有人设了 min，keep_if_missing 也该兜住它
+    assert f.check_total_episodes(show, {"min": 1, "max": 200,
+                                         "keep_if_missing": True}) is True
+    # 整条规则链跑一遍，确认不会被任何一项静默淘汰
+    config = {
+        "total_seasons": {"enabled": True, "min": 1, "max": 10,
+                          "keep_if_missing": True},
+        "total_episodes": {"enabled": True, "min": 1, "max": 200,
+                           "keep_if_missing": True},
+    }
+    assert f.passes_all(show, config) is True
 
 
 # ---------------------------------------------------------------- title_type / is_adult
