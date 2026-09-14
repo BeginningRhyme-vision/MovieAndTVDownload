@@ -21,6 +21,7 @@
 import json
 import os
 import re
+from numbers import Real
 from pathlib import Path
 from typing import Optional
 
@@ -72,15 +73,32 @@ def load_config(path: Path) -> dict:
 def warn_unknown_rules(config: dict) -> list:
     """检查配置里的可疑写法并打印警告，返回问题描述列表。
     - 顶层键不在 CHECKS 中（多为拼写错误，如 vote），会被 rule_enabled 静默当作“未启用”；
-    - 筛选项缺少 enabled 键（如写成 enable），同样静默按未启用处理。
+    - 筛选项缺少 enabled 键（如写成 enable），同样静默按未启用处理；
+    - 项内子键不在该项的白名单中（如 min 写成 mim），check_* 取到 None 后
+      当作“该侧不设限”，筛选**静默放宽**——日志照常打印“已启用 rating”，
+      实际一部都没筛掉，等发现时垃圾已经下了一堆。这是三者里最危险的一种。
     若不提示，用户会误以为筛选已生效。"""
     problems = []
     # YAML 允许非字符串顶层键（如 2000:），混合类型直接 sorted 会 TypeError，按 str 排序
     for key in sorted(config, key=str):
         if key not in CHECKS:
             problems.append(f"未知筛选项 {key!r}（将被忽略）")
-        elif isinstance(config[key], dict) and "enabled" not in config[key]:
+            continue
+        rule = config[key]
+        if not isinstance(rule, dict):
+            continue
+        if "enabled" not in rule:
             problems.append(f"筛选项 {key!r} 缺少 enabled 键（按未启用处理）")
+        allowed = RULE_KEYS[key]
+        for sub in sorted(rule, key=str):
+            # 下划线开头的是运行时缓存（如 _include_re），不是用户配置
+            if sub == "enabled" or str(sub).startswith("_"):
+                continue
+            if sub not in allowed:
+                problems.append(
+                    f"筛选项 {key!r} 的子键 {sub!r} 无效（本项可用: "
+                    f"{', '.join(sorted(allowed))}），该项将按未配置处理"
+                )
     for msg in problems:
         print(f"警告: {msg}，请检查 filter_config.yaml 拼写")
     return problems
@@ -111,6 +129,11 @@ def _in_range(value, low, high) -> bool:
 
 def check_title_type(show: dict, rule: dict) -> bool:
     allow = rule.get("allow") or []
+    if not allow:
+        # 与 genres.include / directors.include 的"留空即不设限"语义一致。
+        # 否则误删 allow 列表会让所有剧被淘汰、ids.txt 变空文件，而下游
+        # tv_ids_to_links 拿到零个 id 会正常退出，整条链路一声不吭。
+        return True
     return show.get("title_type") in allow
 
 
@@ -122,7 +145,10 @@ def check_is_adult(show: dict, rule: dict) -> bool:
 
 def _check_numeric(show: dict, rule: dict, field: str) -> bool:
     value = show.get(field)
-    if value is None:
+    # bool 是 int 子类，但 True/False 出现在数值字段里只能是脏数据，同样按缺失处理；
+    # 字符串等非数值类型若直接与 min/max 比较会 TypeError —— main 的 except 只删临时
+    # 文件就 raise，于是读到第几行崩就死在第几行，ids.txt 一个字节都产不出来。
+    if value is None or isinstance(value, bool) or not isinstance(value, Real):
         return bool(rule.get("keep_if_missing", True))
     return _in_range(value, rule.get("min"), rule.get("max"))
 
@@ -206,30 +232,60 @@ def check_writers(show: dict, rule: dict) -> bool:
     return _check_person(show, rule, "writers")
 
 
+def _compile_keywords(rule: dict) -> None:
+    """use_regex 时在启动阶段预编译 include/exclude，写错的正则立即报错退出，
+    而不是跑到第一部剧才抛 re.error（那时临时输出文件已经建好了）。
+    编译结果缓存在 rule["_include_re"] / rule["_exclude_re"]。"""
+    if not rule.get("use_regex", False):
+        return
+    flags = re.IGNORECASE if rule.get("case_insensitive", True) else 0
+    for key in ("include", "exclude"):
+        compiled = []
+        for kw in rule.get(key) or []:
+            # YAML 里写 `include: [2024]` 会解析成 int，直接丢给 re 会 TypeError
+            if not isinstance(kw, str):
+                continue
+            try:
+                compiled.append(re.compile(kw, flags))
+            except re.error as e:
+                raise SystemExit(
+                    f"错误: title_keywords.{key} 中的正则 {kw!r} 无效: {e}"
+                )
+        rule[f"_{key}_re"] = compiled
+
+
 def check_title_keywords(show: dict, rule: dict) -> bool:
     ci = rule.get("case_insensitive", True)
     use_regex = rule.get("use_regex", False)
-    include = rule.get("include") or []
-    exclude = rule.get("exclude") or []
 
     titles = [
         show.get("primary_title") or "",
         show.get("original_title") or "",
     ]
 
-    def hit(keyword: str) -> bool:
+    def hit(keyword) -> bool:
         for title in titles:
             if not title:
                 continue
             if use_regex:
-                flags = re.IGNORECASE if ci else 0
-                if re.search(keyword, title, flags):
+                if keyword.search(title):
                     return True
             else:
                 a, b = (title.lower(), keyword.lower()) if ci else (title, keyword)
                 if b in a:
                     return True
         return False
+
+    if use_regex:
+        # main 已在启动阶段预编译；直接调 check_* 的调用方（如测试）走这条懒编译
+        if "_include_re" not in rule:
+            _compile_keywords(rule)
+        include = rule["_include_re"]
+        exclude = rule["_exclude_re"]
+    else:
+        # 非字符串关键词在子串匹配里会 .lower() 崩掉，同样过滤
+        include = [k for k in (rule.get("include") or []) if isinstance(k, str)]
+        exclude = [k for k in (rule.get("exclude") or []) if isinstance(k, str)]
 
     if include and not any(hit(k) for k in include):
         return False
@@ -253,6 +309,29 @@ CHECKS = {
     "directors": check_directors,
     "writers": check_writers,
     "title_keywords": check_title_keywords,
+}
+
+# 每个筛选项允许出现的子键（不含 enabled，它对所有项通用）。
+# 供 warn_unknown_rules 拦拼写错误：子键拼错不会报错，只会让对应的
+# rule.get(...) 返回 None，于是该约束静默失效 —— 必须靠这张表兜住。
+# ⚠️ 改动任何 check_* 里读的 rule.get(key) 时，务必同步这里，
+# tests/test_filter_to_ids.py 有用例扫源码比对，漏改会转红。
+_RANGE_KEYS = frozenset({"min", "max", "keep_if_missing"})
+_LIST_KEYS = frozenset({"case_insensitive", "include", "keep_if_missing"})
+RULE_KEYS = {
+    "title_type": frozenset({"allow"}),
+    "is_adult": frozenset({"exclude_adult"}),
+    "start_year": _RANGE_KEYS,
+    "end_year": _RANGE_KEYS,
+    "runtime_minutes": _RANGE_KEYS,
+    "rating": _RANGE_KEYS,
+    "votes": _RANGE_KEYS,
+    "total_seasons": _RANGE_KEYS,
+    "total_episodes": _RANGE_KEYS,
+    "genres": _LIST_KEYS | {"exclude"},
+    "directors": _LIST_KEYS,
+    "writers": _LIST_KEYS,
+    "title_keywords": frozenset({"case_insensitive", "include", "exclude", "use_regex"}),
 }
 
 
@@ -279,6 +358,11 @@ def main():
         print(f"已启用的筛选项: {', '.join(active)}")
     else:
         print("未启用任何筛选项：将选中全部带 tmdb_id 的电视剧")
+
+    # 正则在启动阶段就编译，配置写错立即退出，不会留下半截输出文件
+    kw_rule = rule_enabled(config, "title_keywords")
+    if kw_rule is not None:
+        _compile_keywords(kw_rule)
 
     total = kept = no_id = duplicate = bad_json = 0
     seen = set()
