@@ -258,7 +258,13 @@ def commit_record(record: dict, imdb_id: str):
 def ensure_dataset(key: str) -> Path:
     """下载并解压 IMDB 数据集。
     半成品保护：下载/解压都先写到 .part 临时文件，完成后原子 rename 到最终名。
-    这样中途被杀（Ctrl-C/OOM）只会留下 .part，不会留下被截断却被 exists() 误判为完整的 .tsv。"""
+    这样中途被杀（Ctrl-C/OOM）只会留下 .part，不会留下被截断却被 exists() 误判为完整的 .tsv。
+
+    🔴 gz 一律在 finally 里删，**不做"已存在就复用"**：网络中途断开时
+    `shutil.copyfileobj` 不报错（服务端没给 Content-Length 校验），半截数据
+    会被 rename 成看似正常的 .gz。下次运行若复用它，gzip 解压必抛 EOFError，
+    而 gz 又没人清理 —— 每次运行都在同一处失败，人工不介入就再也跑不起来。
+    宁可重下几百 MB，也不能留下这种死循环。"""
     filename = DATASETS[key]
     tsv_path = DATA_DIR / filename.replace(".gz", "")
     if tsv_path.exists():
@@ -268,22 +274,21 @@ def ensure_dataset(key: str) -> Path:
     gz_part = gz_path.with_name(gz_path.name + ".part")
     tsv_part = tsv_path.with_name(tsv_path.name + ".part")
     try:
-        if not gz_path.exists():
-            log.info(f"下载 {filename} ...")
-            with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
-                r.raise_for_status()
-                with open(gz_part, "wb") as f:
-                    shutil.copyfileobj(r.raw, f)
-            gz_part.replace(gz_path)
+        log.info(f"下载 {filename} ...")
+        with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(gz_part, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+        gz_part.replace(gz_path)
         log.info(f"解压 {filename} ...")
         with gzip.open(gz_path, "rb") as gz, open(tsv_part, "wb") as out:
             shutil.copyfileobj(gz, out)
         tsv_part.replace(tsv_path)
     finally:
-        # 无论成功失败都清掉临时文件；成功时它们已被 rename 走，unlink 为 no-op
-        gz_part.unlink(missing_ok=True)
-        tsv_part.unlink(missing_ok=True)
-    gz_path.unlink()
+        # 三个都清：.part 是半成品；gz 成功后已无用、失败后不可信。
+        # 成功路径上 gz_part/tsv_part 已被 rename 走，unlink 为 no-op。
+        for tmp in (gz_part, tsv_part, gz_path):
+            tmp.unlink(missing_ok=True)
     return tsv_path
 
 
@@ -292,6 +297,17 @@ def build_index():
     """把 akas / principals / names / episode 导入 SQLite，后续按 imdb_id 点查，无需全量加载"""
     csv.field_size_limit(min(sys.maxsize, 10_000_000))  # 解除字段长度限制
     conn = sqlite3.connect(INDEX_DB)
+    # 整个函数体包在 try/finally 里：任一张表建失败（含下载异常、Ctrl+C）都会
+    # 向上抛，没有 finally 就会把连接连同其写锁一起泄漏。虽然进程通常随即退出，
+    # 但测试与将来可能的调用方会因此拿不到干净的库。
+    try:
+        _build_all_tables(conn)
+    finally:
+        conn.close()
+    log.info("SQLite 索引全部就绪")
+
+
+def _build_all_tables(conn):
     cur = conn.cursor()
 
     def _index_ready(table: str) -> bool:
@@ -390,9 +406,6 @@ def build_index():
         "episode",
         lambda row: tuple(row.get(c, "") for c in _episode_cols),
     )
-
-    conn.close()
-    log.info("SQLite 索引全部就绪")
 
 
 # ========== 按需查询索引 ==========
@@ -562,8 +575,10 @@ def load_names_dict() -> dict:
     要求运行机器有 >= 4GB 可用内存（与 keep_types 无关，names 表始终全量装载）。
     """
     conn = sqlite3.connect(INDEX_DB)
-    rows = conn.execute("SELECT nconst, primaryName FROM names").fetchall()
-    conn.close()
+    try:
+        rows = conn.execute("SELECT nconst, primaryName FROM names").fetchall()
+    finally:
+        conn.close()
     return {r[0]: r[1] for r in rows}
 
 
@@ -649,8 +664,12 @@ def process(imdb_id: str, basics, ratings, crew, names_dict) -> str:
     """返回状态字符串：ok（写入主输出）/ as_movie（写入旁路）/
     episode_of_show（TMDB 视为某剧的一集，标记完成不写文件）/ skip（TMDB 查无）。
     TMDB 请求持续失败时抛 TMDBLookupError，由调用方决定不标记完成。"""
-    tmdb_id, movie_id, show_id = get_tmdb_id(imdb_id)
-    time.sleep(SLEEP)
+    try:
+        tmdb_id, movie_id, show_id = get_tmdb_id(imdb_id)
+    finally:
+        # 成功与失败路径都节流：失败时不 sleep 会让重试更密集地打 TMDB，
+        # 而失败往往正是限速/过载引起的 —— 不节流等于火上浇油。
+        time.sleep(SLEEP)
     if tmdb_id is None:
         if movie_id is not None:
             commit_as_movie(imdb_id, movie_id, basics.loc[imdb_id].get("titleType"))

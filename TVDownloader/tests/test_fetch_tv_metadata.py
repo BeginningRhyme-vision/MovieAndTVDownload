@@ -847,6 +847,121 @@ def test_ensure_dataset_skips_when_tsv_exists(monkeypatch, tmp_path):
     assert m.ensure_dataset("ratings") == tmp_path / "title.ratings.tsv"
 
 
+def test_ensure_dataset_never_reuses_a_leftover_gz(monkeypatch, tmp_path):
+    """🔴 半截 gz 绝不能被复用，否则形成**永久死循环**。
+
+    网络中途断开时 copyfileobj 不报错（无 Content-Length 校验），半截数据会被
+    rename 成看似正常的 .gz。若下次运行复用它，gzip 必抛 EOFError，而 gz 又没人
+    清理 —— 每次运行都在同一处失败，人工不介入就再也跑不起来。
+    """
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    # 上次运行遗留的半截 gz
+    (tmp_path / "title.ratings.tsv.gz").write_bytes(_gz_bytes("a\tb\n1\t2\n")[:40])
+
+    downloaded = []
+
+    def fake_get(*a, **k):
+        downloaded.append(1)
+        return _FakeResp(_gz_bytes("a\tb\n1\t2\n"))
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    out = m.ensure_dataset("ratings")
+
+    assert downloaded == [1], "必须重新下载，不能复用遗留的 gz"
+    assert out.read_text() == "a\tb\n1\t2\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["title.ratings.tsv"]
+
+
+def test_ensure_dataset_cleans_gz_even_when_decompress_fails(monkeypatch, tmp_path):
+    """解压失败也要把 gz 删干净，否则下次运行会带着同一个坏文件再失败一次。"""
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        m.requests, "get", lambda *a, **k: _FakeResp(b"not gzip at all")
+    )
+    with pytest.raises(Exception):
+        m.ensure_dataset("ratings")
+    # 目录必须是干净的：没有 gz、没有 .part、没有半截 tsv
+    assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------- 资源释放
+def test_build_index_closes_connection_on_failure(monkeypatch, tmp_path):
+    """🔴 建索引中途失败也要关连接，否则连同**写锁**一起泄漏。
+
+    检测手段用"另开一个连接能否拿到写锁"，而不是数 gc 里的 Connection 对象：
+    后者会被 GC 回收掉，改坏生产代码后照样全绿（第一版就是这么写的）。
+    这里先让 _build_all_tables 在**持有写事务**时抛错 —— 连接没关的话那个
+    写事务一直挂着，第二个连接会拿不到锁。
+    """
+    import sqlite3
+    db = tmp_path / "index.db"
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(m, "INDEX_DB", db)
+
+    def start_write_then_boom(conn):
+        # 开一个未提交的写事务，模拟"插到一半炸了"
+        conn.execute("CREATE TABLE half (x TEXT)")
+        conn.execute("INSERT INTO half VALUES ('uncommitted')")
+        raise RuntimeError("数据集下载失败")
+
+    monkeypatch.setattr(m, "_build_all_tables", start_write_then_boom)
+    with pytest.raises(RuntimeError):
+        m.build_index()
+
+    # 连接若没关，这个写操作会因拿不到锁而超时报 "database is locked"
+    probe = sqlite3.connect(db, timeout=0.5)
+    try:
+        probe.execute("CREATE TABLE probe (x TEXT)")
+        probe.commit()
+    finally:
+        probe.close()
+
+
+def test_load_names_dict_closes_connection_on_failure(monkeypatch, tmp_path):
+    """查询失败（如表不存在）也要关连接。"""
+    db = tmp_path / "index.db"
+    import sqlite3
+    sqlite3.connect(db).close()          # 空库：没有 names 表
+    monkeypatch.setattr(m, "INDEX_DB", db)
+    with pytest.raises(sqlite3.OperationalError):
+        m.load_names_dict()
+    # 连接已关则库文件可被立即删除/重建（Windows 上尤其明显，POSIX 下退而验证可重连）
+    conn = sqlite3.connect(db)
+    conn.close()
+
+
+# ---------------------------------------------------------------- TMDB 节流
+def test_process_throttles_even_when_lookup_fails(monkeypatch):
+    """🔴 失败路径也必须 sleep：失败往往正是限速引起的，不节流等于火上浇油。
+
+    get_tmdb_id 内部已对 429 退避，但**非 429 的失败**（超时、5xx、连接重置）
+    走的是 `2 ** attempt` 那条路，重试耗尽后直接抛出。此时若 process 不节流，
+    几十万条里连续失败的那一段会以最快速度反复冲击 TMDB。
+    """
+    slept = []
+    monkeypatch.setattr(m.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(m, "SLEEP", 0.25)
+
+    def boom(iid):
+        raise m.TMDBLookupError("TMDB 查询失败（已重试）")
+
+    monkeypatch.setattr(m, "get_tmdb_id", boom)
+    with pytest.raises(m.TMDBLookupError):
+        m.process("tt1", None, None, None, {})
+    assert slept == [0.25], "失败路径漏掉了节流"
+
+
+def test_process_throttles_on_success_path(monkeypatch):
+    """成功路径当然也要节流（这条原本就有，一并锁住防回归）。"""
+    slept = []
+    monkeypatch.setattr(m.time, "sleep", lambda s: slept.append(s))
+    monkeypatch.setattr(m, "SLEEP", 0.25)
+    monkeypatch.setattr(m, "get_tmdb_id", lambda iid: (None, None, None))
+    monkeypatch.setattr(m, "mark_done", lambda iid: None)
+    assert m.process("tt1", None, None, None, {}) == "skip"
+    assert slept == [0.25]
+
+
 # ---------------------------------------------------------------- QUOTE_NONE on IMDB tsv
 def test_load_basics_does_not_choke_on_leading_double_quote(monkeypatch, tmp_path):
     # IMDB TSV is unquoted; a title starting with `"` must not swallow following rows.
