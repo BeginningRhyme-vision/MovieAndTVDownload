@@ -518,6 +518,8 @@ def test_parse_resolution():
 
 
 def test_bitrate_threshold_scaling(monkeypatch):
+    """模式 A：门槛按 (h/1080)² 随流高度缩放。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
     monkeypatch.setattr(d, "LENIENCY", 1.0)
     monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 2000.0, "hevc": 1000.0})
     assert d.bitrate_threshold(1080, "h264") == pytest.approx(2000.0)
@@ -527,11 +529,73 @@ def test_bitrate_threshold_scaling(monkeypatch):
     assert d.bitrate_threshold(1080, None) == pytest.approx(2000.0)
 
 
+def test_bitrate_threshold_is_absolute_when_resolution_check_disabled(monkeypatch):
+    """模式 B（默认）：绝对码率线，**不乘 (h/1080)²**。
+
+    🔴 这是模式 B 的核心不变量。若保留缩放，480p 的门槛会被缩到约五分之一，
+    低分辨率流反而更容易过关——等于把分辨率以更隐蔽的方式又请了回来，
+    与"只按码率判断"的业务意图正好相反。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+    monkeypatch.setattr(d, "BITRATE_BASELINE", {"h264": 2000.0, "hevc": 1189.0})
+    # 任何高度都是同一条线：2000 × 0.8 = 1600。
+    for height in (2160, 1080, 720, 480, 0):
+        assert d.bitrate_threshold(height, "h264") == pytest.approx(1600.0)
+    # 编码分档仍然生效（只是不再随高度缩放）。
+    assert d.bitrate_threshold(480, "hevc") == pytest.approx(1189.0 * 0.8)
+    # 探测不到编码回退 H.264 基准（最严）。
+    assert d.bitrate_threshold(480, None) == pytest.approx(1600.0)
+
+
 def test_meets_resolution_redline(monkeypatch):
+    """模式 A：红线带 LENIENCY 容差。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
     monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
     monkeypatch.setattr(d, "LENIENCY", 0.8)
     assert d.meets_resolution_redline(864)
     assert not d.meets_resolution_redline(863)
+
+
+def test_meets_resolution_redline_always_passes_when_check_disabled(monkeypatch):
+    """模式 B（默认）：红线整关放行。
+
+    开关刻意收敛在这一个函数里——四处红线关卡（mp4 声明预检 / mp4 样本预检 /
+    mp4 实测复检 / m3u8 流层）与 master 候选过滤都靠它自动放行，
+    不必在每个调用点各写一次 if，也就不会漏掉某一处。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
+    monkeypatch.setattr(d, "LENIENCY", 0.8)
+    for height in (0, 1, 240, 480, 863, 864, 2160):
+        assert d.meets_resolution_redline(height)
+
+
+def test_bitrate_reject_message_wording_per_mode(monkeypatch):
+    """两种模式的淘汰文案不同，但都必须保留 `码率未达到门槛` 这段。
+
+    那段是 `_PERMANENT_FAILURE_MARKERS` / `_REJECT_REASON_RULES` /
+    `_DEAD_BITRATE_RE` 三处的共同锚点，改掉会同时打断判死、归类与复判。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    mode_a = d.bitrate_reject_message("854x480", "h264", 372, 1600)
+    assert mode_a.startswith("分辨率 854x480 流（h264）")
+    assert "码率未达到门槛" in mode_a
+
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    mode_b = d.bitrate_reject_message("854x480", "h264", 372, 1600)
+    # 模式 B 下分辨率没参与判定，不能写在开头误导排查。
+    assert not mode_b.startswith("分辨率")
+    assert mode_b.startswith("码率未达到门槛")
+    assert "实测 854x480" in mode_b
+    # 两种文案都要能被判死类目与证据解析识别。
+    for msg in (mode_a, mode_b):
+        assert d.classify_reject_reason(msg) == "码率未达门槛"
+        evidence = d.parse_dead_quality_evidence(msg)
+        assert evidence["bitrate_kbps"] == pytest.approx(372.0)
+        assert evidence["threshold_kbps"] == pytest.approx(1600.0)
+        assert evidence["resolution"] == "854x480"
+        assert evidence["codec"] == "h264"
 
 
 def test_validate_segment_content():
@@ -644,7 +708,8 @@ def test_process_one_entry_happy_path_builds_job(sandbox, monkeypatch):
     monkeypatch.setattr(d, "download_segments", fake_download)
 
     entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"],
-             "title": "Show", "year": 2010}
+             "title": "Show", "year": 2010,
+             "captions": [{"language": "en", "url": "http://s/en.vtt"}]}
     label, ok, job = d.process_one_entry(entry, set())
     assert ok is True
     assert label == "55_S01E02"
@@ -654,16 +719,24 @@ def test_process_one_entry_happy_path_builds_job(sandbox, monkeypatch):
     assert job["missing_segment_indices"] == [3]
     assert job["final_ts"].endswith("temp_55_S01E02.ts")
     assert job["temp_mp4"].endswith("temp_55_S01E02.mp4")
+    # 内嵌字幕要一路带到转封装阶段，否则 finalize 拿不到、字幕静默丢失。
+    assert job["captions"] == [{"language": "en", "url": "http://s/en.vtt"}]
     # Sample file removed, ID lock retained for the conversion stage.
     assert not any(n.startswith("sample_") for n in os.listdir(d.TEMP_DIR))
     assert "55_S01E02" in d.processing_ids
 
 
-def _z1_env(monkeypatch, variants):
-    """多 variant 采样场景的公共桩：返回记录被采样流 url 的 list。"""
+def _z1_env(monkeypatch, variants, resolution_check=True):
+    """多 variant 采样场景的公共桩：返回记录被采样流 url 的 list。
+
+    resolution_check 默认 True（模式 A）——Z1 提前终止采样、按声明高度排序、
+    高度优先择优这一整套都**只在模式 A 下成立**，故这些用例必须显式声明模式，
+    不能依赖 config 的当前默认值（默认已是模式 B）。
+    """
     sampled = []
     seg_urls = [f"https://cdn/s{i}.ts" for i in range(20)]
 
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", resolution_check)
     monkeypatch.setattr(d, "wait_for_disk_gate", lambda: None)
     monkeypatch.setattr(
         d, "parse_master_playlist",
@@ -811,6 +884,107 @@ def test_variant_sampling_continues_after_failure(sandbox, monkeypatch):
     assert job["resolution"] == "1280x720"
 
 
+def test_mode_b_samples_every_stream_without_height_pruning(sandbox, monkeypatch):
+    """模式 B：Z1 提前终止采样必须**自动关闭**，所有候选流都要采样。
+
+    🔴 该剪枝的正确性完全建立在"择优按高度绝对优先"之上：模式 A 下声明高度更低
+    的流必然落选，跳过它纯属省钱。而模式 B 择优改成纯比码率，**声明高度低不代表
+    实测码率低**——一条 720p 高码率流完全可能胜过 1080p 糊流。此时按高度剪枝
+    会真的把更优的流丢掉，直接违背"只按码率判断"的业务意图。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    sampled = _z1_env(monkeypatch, [
+        ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        ("1280x720", "https://cdn/720.m3u8", 3000.0),
+        ("854x480", "https://cdn/480.m3u8", 1500.0),
+    ], resolution_check=False)
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, _job = d.process_one_entry(entry, set())
+    assert ok is True
+    # 模式 A 下只会采样 1080 这一条（见上面的 Z1 用例）；模式 B 下三条都要采。
+    assert sampled == [
+        "https://cdn/1080.m3u8",
+        "https://cdn/720.m3u8",
+        "https://cdn/480.m3u8",
+    ]
+
+
+def test_mode_b_picks_highest_bitrate_not_highest_resolution(sandbox, monkeypatch):
+    """模式 B：择优纯比采样码率，低分辨率的高码率流应当胜出。
+
+    这是业务语义"不再考虑分辨率"最直接的体现。若择优仍按高度优先，
+    分辨率就还在暗中主导结果，开关等于没生效。
+    """
+    seg_urls = [f"https://cdn/s{i}.ts" for i in range(20)]
+    # 1080 那条码率低（每段 0.5MB），720 那条码率高（每段 2MB）。
+    per_stream_bytes = {"1080": 500_000, "720": 2_000_000}
+    current = {"name": None}
+
+    sampled = _z1_env(monkeypatch, [
+        ("1920x1080", "https://cdn/1080.m3u8", 5000.0),
+        ("1280x720", "https://cdn/720.m3u8", 3000.0),
+    ], resolution_check=False)
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+
+    def fake_media(url, headers=None):
+        sampled.append(url)
+        current["name"] = "1080" if "1080" in url else "720"
+        return seg_urls, [4.0] * 20, None
+
+    def fake_download(urls, out, start_idx=0, end_idx=None, concurrency=1,
+                      init_url=None, force_init=False, headers=None,
+                      retry_max=None):
+        if end_idx is None:
+            end_idx = len(urls)
+        n = end_idx - start_idx
+        with open(out, "wb") as fh:
+            fh.write(b"x" * n)
+        return n * per_stream_bytes[current["name"]], [], 0
+
+    monkeypatch.setattr(d, "parse_media_playlist", fake_media)
+    monkeypatch.setattr(d, "download_segments", fake_download)
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    # 720p 的采样码率 4000 kbps > 1080p 的 1000 kbps，故应选中 720p。
+    assert job["resolution"] == "1280x720"
+
+
+def test_mode_b_keeps_stream_when_resolution_probe_fails(sandbox, monkeypatch):
+    """模式 B：未声明分辨率且 ffprobe 探测失败时**不再判失败**。
+
+    分辨率既然不参与判定，就不该因为探不到它而丢掉一条采样已经下好、
+    码率完全算得出来的流。模式 A 下这里必须判可重试（分辨率是判定标准）。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    _z1_env(monkeypatch, [
+        (None, "https://cdn/unknown.m3u8", 4000.0),
+    ], resolution_check=False)
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, job = d.process_one_entry(entry, set())
+    assert ok is True
+    assert job["resolution"] == d.UNKNOWN_RESOLUTION
+
+
+def test_mode_a_still_fails_when_resolution_probe_fails(sandbox, monkeypatch):
+    """对照组：模式 A 下探不到分辨率仍判**可重试**失败（分辨率是判定标准）。
+
+    没有这个对照，上一条用例无法证明差异来自模式开关。
+    """
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    _z1_env(monkeypatch, [
+        (None, "https://cdn/unknown.m3u8", 4000.0),
+    ], resolution_check=True)
+
+    entry = {"tmdbId": "55", "season": 1, "episode": 2, "urls": ["u"]}
+    _, ok, info = d.process_one_entry(entry, set())
+    assert ok is False
+    assert info["retriable"] is True
+
+
 # ---------------------------------------------------------------- multi-source: url entries / mp4 direct
 def test_normalize_url_entry_str_and_dict():
     assert d._normalize_url_entry("  https://a/m.m3u8 ") == {
@@ -885,7 +1059,8 @@ def test_process_one_entry_mp4_branch_builds_job(sandbox, monkeypatch):
     node = {"url": "https://cdn/f.mp4", "provider": "vidlink", "type": "mp4",
             "headers": {"User-Agent": "okhttp/4.9.3"}, "quality": 1080, "size": 1}
     entry = {"tmdbId": "9", "season": 1, "episode": 1, "urls": [node],
-             "title": "Show", "year": 2011, "runtime_minutes": 45}
+             "title": "Show", "year": 2011, "runtime_minutes": 45,
+             "captions": [{"language": "zh", "url": "http://s/zh.srt"}]}
     label, ok, job = d.process_one_entry(entry, set())
     assert ok is True and label == "9_S01E01"
     assert seen["node"]["url"] == node["url"] and seen["runtime"] == 45
@@ -893,6 +1068,8 @@ def test_process_one_entry_mp4_branch_builds_job(sandbox, monkeypatch):
     assert job["resolution"] == "1920x1080" and job["bitrate_kbps"] == 4321
     assert job["missing_segment_count"] == 0 and job["missing_segment_indices"] == []
     assert job["final_ts"].endswith("temp_9_S01E01.ts")
+    # 内嵌字幕要一路带到转封装阶段（直链分支与分片分支各构造一次 job，别漏）。
+    assert job["captions"] == [{"language": "zh", "url": "http://s/zh.srt"}]
     assert "9_S01E01" in d.processing_ids
 
 
@@ -1641,12 +1818,33 @@ def test_download_mp4_direct_expired_link_needs_refetch(mp4_env, monkeypatch):
 
 
 def test_download_mp4_direct_quality_prefilter(mp4_env, monkeypatch):
+    """模式 A：声明 quality 低于红线时一个字节都不下。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
     session = _install_range_session(monkeypatch, b"abc")
     node = {"url": "u", "type": "mp4", "headers": {}, "quality": 480, "size": None}
     with pytest.raises(RuntimeError, match="低于红线") as exc:
         d._download_mp4_direct(node, os.path.join(d.TEMP_DIR, "t.ts"), "x")
     assert d._classify_failure(str(exc.value)) is False
     assert session.calls == []  # 声明画质不达标：一个字节都不下
+
+
+def test_mode_b_mp4_declared_quality_does_not_prefilter(mp4_env, monkeypatch):
+    """模式 B：声明 quality=480 **不再**被红线拦下，继续按码率判定。
+
+    业务语义是"不再考虑分辨率"：一条 480p 的高码率直链完全可能合格，
+    在这里按声明高度提前淘汰等于分辨率仍在把关。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    session = _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "probe_resolution", lambda p: (854, 480))
+    # 同上：桩数据码率为 0，把门槛压到 0，本例只验"声明 480p 不被红线拦下"。
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 0.0)
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": 480, "size": None}
+    resolution, _bitrate = d._download_mp4_direct(
+        node, os.path.join(d.TEMP_DIR, "t.ts"), "x", runtime_minutes=45
+    )
+    assert resolution == "854x480"
+    assert session.calls  # 确实下载了，不是被提前拦下
 
 
 def test_download_mp4_direct_bitrate_gate(mp4_env, monkeypatch):
@@ -1664,7 +1862,8 @@ def test_download_mp4_direct_bitrate_gate(mp4_env, monkeypatch):
 
 
 def test_mp4_sample_prefilter_rejects_low_resolution(mp4_env, monkeypatch):
-    """预检判分辨率不达标：整片一个分块都不下，省下 GB 级流量。"""
+    """模式 A：样本预检判分辨率不达标，整片一个分块都不下，省下 GB 级流量。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
     session = _install_range_session(monkeypatch, b"abcdefghij")
     monkeypatch.setattr(d, "probe_resolution", lambda p: (640, 480))
     node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
@@ -1674,6 +1873,39 @@ def test_mp4_sample_prefilter_rejects_low_resolution(mp4_env, monkeypatch):
         )
     assert d._classify_failure(str(exc.value)) is False
     assert sorted(r for _, r, _ in session.calls) == ["bytes=0-0", "bytes=0-3"]
+
+
+def test_mode_b_mp4_keeps_going_when_resolution_probe_fails(mp4_env, monkeypatch):
+    """模式 B：整片下完后探不到分辨率**不再判失败**，按 UNKNOWN 如实标注。
+
+    片子已经完整下完了，此刻仅因探不到一个不参与判定的属性就丢弃它，
+    是纯粹的误杀——白白浪费了整集的下载流量。
+    """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    # 桩数据只有 10 字节 / 45 分钟，码率必然是 0；本例要验的是"探不到分辨率
+    # 也不判失败"，不是码率关，故把门槛压到 0 让它过关。
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 0.0)
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
+    resolution, _bitrate = d._download_mp4_direct(
+        node, os.path.join(d.TEMP_DIR, "t.ts"), "x", runtime_minutes=45
+    )
+    assert resolution == d.UNKNOWN_RESOLUTION
+
+
+def test_mode_a_mp4_fails_when_resolution_probe_fails(mp4_env, monkeypatch):
+    """对照组：模式 A 下整片探不到分辨率仍判可重试失败。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    _install_range_session(monkeypatch, b"abcdefghij")
+    monkeypatch.setattr(d, "probe_resolution", lambda p: None)
+    node = {"url": "u", "type": "mp4", "headers": {}, "quality": None, "size": None}
+    with pytest.raises(RuntimeError, match="采样探测分辨率失败") as exc:
+        d._download_mp4_direct(
+            node, os.path.join(d.TEMP_DIR, "t.ts"), "x", runtime_minutes=45
+        )
+    # 可重试：不带确定性 marker。
+    assert d._classify_failure(str(exc.value)) is True
 
 
 def test_mp4_sample_unprobeable_falls_through_to_full_download(mp4_env, monkeypatch):
@@ -2635,7 +2867,11 @@ def test_inner_all_streams_quality_rejected_raises_typed_error(sandbox, monkeypa
 
     与"混合/纯瞬时"必须产生**不同的异常类型与文案**，否则源站抽风会被
     误判成画质不达标。
+
+    ⚠️ 走的是**模式 A 的候选预筛**路径（声明高度低于红线 → 全被排除），
+    故必须显式开启红线判定：模式 B 下候选一条不筛，根本走不到这里。
     """
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
     monkeypatch.setattr(d, "MIN_RESOLUTION_HEIGHT", 1080)
     monkeypatch.setattr(d, "LENIENCY", 0.8)
     # 两条候选流都声明低于红线 → 候选预筛阶段就全被排除
@@ -2847,12 +3083,17 @@ def test_merge_next_batch_dedupes_per_episode(sandbox):
     assert by_key["7_S01E02"]["urls"] == ["old"]
 
 
-def test_startup_precheck_runs_only_in_non_streaming_mode(monkeypatch, sandbox):
-    """pipeline（流式）模式刻意不做同步预检。
+def test_startup_precheck_dispatches_async_in_streaming_mode(monkeypatch, sandbox):
+    """启动预检按运行模式分流，**两种模式都不会被跳过**。
 
-    它的前提是主循环一步都不阻塞，而 refetch_entries 是同步的、最长堵住
-    AUTO_REFETCH_TIMEOUT。此时取流线程已在灌队列，堵住主循环反而会让队列里的
-    新鲜直链继续变旧——与预检目的正相反。
+    - 非流式：同步 refresh_stale_entries（换完新链接再开跑）；
+    - pipeline：异步 dispatch_stale_entries_async（只投递、立即返回）。
+      同步那条路会堵住主事件循环最长 AUTO_REFETCH_TIMEOUT，而 pipeline 的
+      前提是主循环一步都不阻塞。
+
+    🔴 2026-09-14 之前流式模式**完全不做预检**，那会造成死闭环：取流侧
+    load_processed 跳过已成功的集、不换链接，backlog 里的旧 url 每次运行
+    原样重投，永久卡死（§0.20）。
     """
     entries = [_entry("2", fetched_at=1)]
     input_path = sandbox / "results.jsonl"
@@ -2870,21 +3111,72 @@ def test_startup_precheck_runs_only_in_non_streaming_mode(monkeypatch, sandbox):
             "x", False, {"error": "没有找到媒体播放列表", "retriable": False}
         ),
     )
-    seen = []
+    sync_seen = []
+    async_seen = []
     monkeypatch.setattr(
         d, "refresh_stale_entries",
-        lambda batch, counts: seen.append(len(batch)) or batch,
+        lambda batch, counts: sync_seen.append(len(batch)) or batch,
+    )
+    monkeypatch.setattr(
+        d, "dispatch_stale_entries_async",
+        lambda batch, counts: async_seen.append(len(batch)) or 0,
     )
 
     # ① 流式模式：pipeline.py 会把 ListEntrySource 换成自己的工厂
     monkeypatch.setattr(d, "ListEntrySource", lambda es: d._ListEntrySource(es))
     d._run_pipeline()
-    assert seen == []            # 预检没被调用
+    assert sync_seen == []        # 同步预检不能跑（会堵住主循环）
+    assert async_seen == [1]      # 但异步预检必须跑
 
-    # ② 非流式（单独跑 download_tv.py）：预检必须执行
+    # ② 非流式（单独跑 download_tv.py）：走同步预检
     monkeypatch.setattr(d, "ListEntrySource", d._ListEntrySource)
     d._run_pipeline()
-    assert seen == [1]
+    assert sync_seen == [1]
+    assert async_seen == [1]      # 未再增加
+
+
+def test_async_dispatch_respects_quality_dead_and_cap(monkeypatch, sandbox):
+    """异步预检与同步预检**共用同一套筛选口径**（_select_stale_entries）。
+
+    两条路径若各写一遍筛选，早晚会漏掉画质判死跳过或限额其中一条，
+    而那两条恰恰是 TV 规模下最省代理配额的部分。
+    """
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 10)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_RUN", 2)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_EPISODE", 2)
+    # 第 2 集画质判死 → 必须被跳过
+    monkeypatch.setattr(d, "load_quality_dead_keys", lambda: {"2_S01E02"})
+
+    dispatched = []
+
+    class _Hook:
+        def dispatch(self, entries):
+            dispatched.extend(entries)
+            return len(entries)
+
+    monkeypatch.setattr(d, "async_refetch_hook", _Hook())
+    # fetched_at 越小越旧；限额 2 时应留下最旧的两集（1 与 3，2 已被判死剔除）
+    entries = [
+        _entry("1", fetched_at=100),
+        _entry("2", fetched_at=50),
+        _entry("3", fetched_at=200),
+        _entry("4", fetched_at=900),
+    ]
+    counts = {}
+    sent = d.dispatch_stale_entries_async(entries, counts)
+    assert sent == 2
+    keys = sorted(d.record_episode_key(e) for e in dispatched)
+    assert keys == ["1_S01E02", "3_S01E02"]   # 判死的 2 不在；最旧优先
+    # 投递即计数，防"预检投一次、下载失败又投一次"超过每集上限
+    assert counts["1_S01E02"] == 1
+
+
+def test_async_dispatch_is_noop_without_hook(monkeypatch):
+    """没装钩子（单独跑 download_tv.py）时异步预检是空操作，绝不报错。"""
+    monkeypatch.setattr(d, "async_refetch_hook", None)
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 10)
+    assert d.dispatch_stale_entries_async([_entry("1", fetched_at=1)], {}) == 0
 
 
 # ------------------------------------------------ 流式来源（pipeline 模式）
@@ -3455,8 +3747,11 @@ def test_load_dead_keys_uses_conjunction_not_row_order(sandbox):
 def test_dead_record_passes_now_respects_current_threshold(monkeypatch):
     """门槛调松到实测码率之下（且留足余量）时才放回。"""
     monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.05)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
     record = {"evidence": {"bitrate_kbps": 1000.0, "resolution": "1920x1080",
-                           "codec": "h264"}}
+                           "codec": "h264"},
+              # 判死当时的模式必须与当前一致，否则门槛口径不可比、一律不放回。
+              "resolution_check_enabled": False}
     # 门槛 2000 → 远高于实测 1000，仍不达标。
     monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 2000.0)
     assert d.dead_record_passes_now(record) is False
@@ -3468,6 +3763,31 @@ def test_dead_record_passes_now_respects_current_threshold(monkeypatch):
     assert d.dead_record_passes_now(record) is False
 
 
+def test_dead_record_passes_now_blocks_cross_mode_records(monkeypatch):
+    """🔒 判死当时的模式与当前不一致 → 一律不放回。
+
+    两种模式的门槛能差 5 倍（模式 A 的 480p 门槛约 316 kbps，模式 B 是
+    1600 kbps）。拿当前模式的门槛去复判另一个模式下判死的记录，结论毫无意义：
+    切到模式 B 后，一批模式 A 下判死的低清集会因为"旧门槛低"而被误放回去白跑。
+    老记录没有该字段 → 视为未知 → 同样不放回。
+    """
+    monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.0)
+    # 门槛远低于实测码率：若不是模式守卫拦着，下面三条都会放回。
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 1.0)
+    evidence = {"bitrate_kbps": 1000.0, "resolution": "1920x1080",
+                "codec": "h264"}
+
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    # 模式一致 → 正常复判，放回。
+    assert d.dead_record_passes_now(
+        {"evidence": evidence, "resolution_check_enabled": False}) is True
+    # 模式不一致 → 不放回。
+    assert d.dead_record_passes_now(
+        {"evidence": evidence, "resolution_check_enabled": True}) is False
+    # 老记录缺字段 → 视为未知 → 不放回。
+    assert d.dead_record_passes_now({"evidence": evidence}) is False
+
+
 def test_dead_record_passes_now_revives_when_no_evidence():
     """没有依据就无法证明它现在仍不达标 → 放回（宁可多下不误杀）。"""
     assert d.dead_record_passes_now({"evidence": {}}) is True
@@ -3475,14 +3795,51 @@ def test_dead_record_passes_now_revives_when_no_evidence():
 
 
 def test_dead_record_passes_now_blocks_missing_height(monkeypatch):
-    """🔒 height 抽不出来时一律不放回。
+    """🔒 模式 A 下 height 抽不出来时一律不放回。
 
-    bitrate_threshold 按 (h/1080)² 缩放，height=0 会让门槛恒为 0，
+    模式 A 的 bitrate_threshold 按 (h/1080)² 缩放，height=0 会让门槛恒为 0，
     `0 × 余量 <= 任何码率` 恒真 —— 这批记录会被无条件放回去白跑。
+
+    ⚠️ 该守卫**只在模式 A 下需要**：模式 B 的门槛是绝对线、height 根本不参与
+    计算，此时挡住反而会把"未知分辨率"那批本该正常复判的记录永久关在门外。
     """
     monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.05)
-    record = {"evidence": {"bitrate_kbps": 50.0, "resolution": "未知分辨率"}}
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", True)
+    record = {"evidence": {"bitrate_kbps": 50.0, "resolution": "未知分辨率"},
+              "resolution_check_enabled": True}
     assert d.dead_record_passes_now(record) is False
+
+
+def test_dead_record_missing_height_still_judged_in_mode_b(monkeypatch):
+    """对照组：模式 B 下 height 缺失不该挡住复判（门槛与 height 无关）。"""
+    monkeypatch.setattr(d, "DEAD_REVIVE_MARGIN", 1.0)
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    record = {"evidence": {"bitrate_kbps": 1000.0,
+                           "resolution": d.UNKNOWN_RESOLUTION,
+                           "codec": "h264"},
+              "resolution_check_enabled": False}
+    # 门槛降到 500 → 500 <= 1000 → 正常放回，不因 height 缺失被一刀切。
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 500.0)
+    assert d.dead_record_passes_now(record) is True
+    # 门槛仍高 → 照常挡住。
+    monkeypatch.setattr(d, "bitrate_threshold", lambda h, c: 1600.0)
+    assert d.dead_record_passes_now(record) is False
+
+
+def test_record_quality_dead_stores_current_mode(sandbox, monkeypatch):
+    """🔒 判死落盘必须带上当时的模式，否则跨模式守卫无从判断。"""
+    monkeypatch.setattr(d, "RESOLUTION_CHECK_ENABLED", False)
+    entry = {"tmdbId": "9", "season": 1, "episode": 3, "title": "t"}
+    d.record_quality_dead(entry, "码率未达到门槛：372 kbps < 1600 kbps（h264，实测 854x480）")
+    rows = [
+        json.loads(line)
+        for line in open(d.DOWNLOAD_DEAD_LOG, encoding="utf-8").read().splitlines()
+        if line.strip()
+    ]
+    assert rows[-1]["resolution_check_enabled"] is False
+    # 模式 B 的文案也要能抽出证据（分辨率/编码写在尾部括号里）。
+    assert rows[-1]["evidence"]["resolution"] == "854x480"
+    assert rows[-1]["evidence"]["codec"] == "h264"
 
 
 def test_quality_dead_is_recorded_and_skipped_next_run(sandbox, monkeypatch):
@@ -3765,3 +4122,365 @@ def test_resolve_file_and_dir_anchor_to_script_dir():
     assert d.resolve_dir("/abs/dir", "x") == "/abs/dir"
     assert d.BASE_DIR.startswith(root)
     assert d.MAIN_LOCK_FILE == os.path.join(root, "download_tv.main.lock")
+
+
+# ------------------------------------------------ 收尾自动补传（auto_reupload）
+def _main_env(monkeypatch, sandbox):
+    """把 main() 的重活全部桩掉，只留收尾段的接线可观测。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DISK_GUARD_ENABLED", False)
+    monkeypatch.setattr(d, "install_interrupt_handler", lambda: None)
+    monkeypatch.setattr(d, "preflight_check_ffmpeg", lambda: None)
+    monkeypatch.setattr(d, "preflight_check_s3", lambda: None)
+    monkeypatch.setattr(d, "_run_pipeline", lambda: None)
+    monkeypatch.setattr(d, "compact_failed_log", lambda: (False, None, 0))
+
+
+def test_auto_reupload_runs_after_lock_release(sandbox, monkeypatch):
+    """🔴 自动补传必须在 release_main_lock() **之后**。
+
+    reupload_pending 内部有 is_main_running() 跨进程守卫：锁还没释放时它会
+    认为"主流程正在跑"而直接返回，静默什么也不做 —— 功能等于没接上，
+    且不会有任何报错提示。
+    """
+    _main_env(monkeypatch, sandbox)
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", True)
+    seen = {}
+    monkeypatch.setattr(
+        d, "reupload_pending",
+        lambda: seen.update(main_running=d.is_main_running()),
+    )
+    d.main()
+    # 被调用了，且调用时锁已释放（否则内部守卫会把它挡掉）
+    assert seen == {"main_running": False}
+
+
+def test_auto_reupload_runs_before_log_rotation(sandbox, monkeypatch):
+    """🔴 补传必须在 compact_failed_log() **之前**。
+
+    补传成功会删掉 stage=="upload" 的失败行；先轮转再补传的话，
+    归档下来的就不是最终态（那些行本该已被消解）。
+    """
+    _main_env(monkeypatch, sandbox)
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", True)
+    order = []
+    monkeypatch.setattr(d, "reupload_pending", lambda: order.append("reupload"))
+    monkeypatch.setattr(
+        d, "compact_failed_log",
+        lambda: order.append("rotate") or (False, None, 0),
+    )
+    d.main()
+    assert order == ["reupload", "rotate"]
+
+
+def test_auto_reupload_skipped_when_pipeline_raises(sandbox, monkeypatch):
+    """🔴 主流程异常/中断时**不补传**：状态未知，且用户正想让它停下。
+
+    这也是它必须放在 finally **之外**（正常路径上）的原因。
+    """
+    _main_env(monkeypatch, sandbox)
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", True)
+    called = []
+    monkeypatch.setattr(d, "reupload_pending", lambda: called.append(1))
+
+    def boom():
+        raise RuntimeError("下载流水线炸了")
+
+    monkeypatch.setattr(d, "_run_pipeline", boom)
+    with pytest.raises(RuntimeError):
+        d.main()
+    assert called == []
+    # 锁仍必须被释放（finally 里）
+    assert not os.path.exists(d.MAIN_LOCK_FILE)
+
+    # Ctrl+C 同理
+    called.clear()
+
+    def interrupted():
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(d, "_run_pipeline", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        d.main()
+    assert called == []
+
+
+def test_auto_reupload_failure_does_not_fail_the_run(sandbox, monkeypatch):
+    """补传是收尾动作，它失败不该把一次已跑完的运行变成异常退出。
+
+    ⚠️ 必须连 SystemExit 一起兜住（reupload 内部可能因配置问题抛它），
+    但 KeyboardInterrupt 要放过 —— Ctrl+C 该中止整个进程。
+    """
+    _main_env(monkeypatch, sandbox)
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", True)
+    rotated = []
+    monkeypatch.setattr(
+        d, "compact_failed_log",
+        lambda: rotated.append(1) or (False, None, 0),
+    )
+
+    for exc in (RuntimeError("R2 挂了"), SystemExit(2)):
+        rotated.clear()
+
+        def boom():
+            raise exc
+
+        monkeypatch.setattr(d, "reupload_pending", boom)
+        d.main()                 # 不应抛出
+        assert rotated == [1]    # 后续收尾照常执行
+
+    # KeyboardInterrupt 必须逃逸
+    def ctrl_c():
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(d, "reupload_pending", ctrl_c)
+    with pytest.raises(KeyboardInterrupt):
+        d.main()
+
+
+def test_auto_reupload_respects_switches(sandbox, monkeypatch):
+    """开关关掉、或未开启 R2 上传时都不补传（纯本地模式没有 pending 可言）。"""
+    _main_env(monkeypatch, sandbox)
+    called = []
+    monkeypatch.setattr(d, "reupload_pending", lambda: called.append(1))
+
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", False)
+    d.main()
+    assert called == []
+
+    monkeypatch.setattr(d, "AUTO_REUPLOAD_ENABLED", True)
+    monkeypatch.setattr(d, "S3_ENABLED", False)
+    d.main()
+    assert called == []
+
+
+# ---------------------------------------------------------------- 内嵌字幕
+
+
+class _FakeSubResp:
+    """字幕下载用的假响应：iter_content 按 chunk 吐出 body。"""
+
+    def __init__(self, body, status=200):
+        self.body = body
+        self.status_code = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise d.requests.HTTPError(f"HTTP {self.status_code}")
+
+    def iter_content(self, chunk_size=1):
+        for i in range(0, len(self.body), chunk_size):
+            yield self.body[i:i + chunk_size]
+
+
+class _FakeSubSession:
+    def __init__(self, mapping):
+        self.mapping = mapping
+        self.calls = []
+
+    def get(self, url, timeout=None, headers=None, stream=None):
+        self.calls.append((url, headers))
+        body = self.mapping[url]
+        if isinstance(body, Exception):
+            raise body
+        return _FakeSubResp(body)
+
+
+def _sub_env(monkeypatch, mapping):
+    session = _FakeSubSession(mapping)
+    monkeypatch.setattr(d, "get_session", lambda: session)
+    monkeypatch.setattr(d, "SUBTITLES_ENABLED", True)
+    monkeypatch.setattr(d, "SUBTITLE_LANGUAGES", ["en", "zh"])
+    monkeypatch.setattr(d, "SUBTITLE_FORMATS", ["vtt", "srt"])
+    return session
+
+
+def test_save_subtitles_writes_both_formats(sandbox, monkeypatch):
+    """srt 源必须同时落 srt 与 vtt 两份，路径相对集目录。"""
+    srt = "1\n00:00:01,000 --> 00:00:02,000\nhi\n"
+    _sub_env(monkeypatch, {"http://s/en.srt": srt.encode()})
+
+    saved = d.save_subtitles(7, 1, 3, 2020, [
+        {"language": "en", "url": "http://s/en.srt"},
+    ])
+    assert saved == ["subs/en.vtt", "subs/en.srt"]
+
+    folder = os.path.join(d.episode_dir(7, 1, 3, 2020), "subs")
+    vtt = open(os.path.join(folder, "en.vtt"), encoding="utf-8").read()
+    # 格式转换必须真的发生：VTT 要有文件头、毫秒分隔符是点。
+    assert vtt.startswith("WEBVTT")
+    assert "00:00:01.000" in vtt
+    assert open(os.path.join(folder, "en.srt"), encoding="utf-8").read() == srt
+
+
+def test_save_subtitles_detects_format_by_content(sandbox, monkeypatch):
+    """源站声明的 type 不可信，一律按内容判定：body 是 vtt 就不能再套一层头。"""
+    _sub_env(monkeypatch, {
+        "http://s/x": b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n",
+    })
+    d.save_subtitles(7, 1, 3, 2020, [
+        {"language": "en", "url": "http://s/x", "type": "srt"},
+    ])
+    folder = os.path.join(d.episode_dir(7, 1, 3, 2020), "subs")
+    vtt = open(os.path.join(folder, "en.vtt"), encoding="utf-8").read()
+    assert vtt.count("WEBVTT") == 1
+    srt = open(os.path.join(folder, "en.srt"), encoding="utf-8").read()
+    assert "WEBVTT" not in srt and "00:00:01,000" in srt
+
+
+def test_save_subtitles_filters_languages_and_dedupes(sandbox, monkeypatch):
+    """白名单外的语种一律丢弃；同语种只取第一条。"""
+    session = _sub_env(monkeypatch, {
+        "http://s/en1": b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\na\n",
+    })
+    saved = d.save_subtitles(7, 1, 3, 2020, [
+        {"language": "fr", "url": "http://s/fr"},
+        {"language": "en", "url": "http://s/en1"},
+        {"language": "en", "url": "http://s/en2"},
+        "not-a-dict",
+    ])
+    assert saved == ["subs/en.vtt", "subs/en.srt"]
+    assert [c[0] for c in session.calls] == ["http://s/en1"]
+
+
+def test_save_subtitles_passes_caption_headers(sandbox, monkeypatch):
+    """取流侧算好的 headers 必须原样带上——两套 CDN 鉴权方向相反，丢了就拉不到。"""
+    session = _sub_env(monkeypatch, {
+        "http://s/en": b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\na\n",
+    })
+    d.save_subtitles(7, 1, 3, 2020, [
+        {"language": "en", "url": "http://s/en",
+         "headers": {"Referer": "https://peak/"}},
+    ])
+    assert session.calls[0][1] == {"Referer": "https://peak/"}
+
+
+def test_save_subtitles_failure_is_non_fatal(sandbox, monkeypatch):
+    """单条字幕失败只跳过该语种，其余照常保存，整体不抛异常。"""
+    _sub_env(monkeypatch, {
+        "http://s/en": RuntimeError("boom"),
+        "http://s/zh": "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\n\u4f60\u597d\n".encode(),
+    })
+    saved = d.save_subtitles(7, 1, 3, 2020, [
+        {"language": "en", "url": "http://s/en"},
+        {"language": "zh", "url": "http://s/zh"},
+    ])
+    assert saved == ["subs/zh.vtt", "subs/zh.srt"]
+
+
+def test_save_subtitles_rejects_oversized_body(sandbox, monkeypatch):
+    """超过上限立刻中止，不把疑似视频/错误页整个读进内存，也不留下空文件。"""
+    _sub_env(monkeypatch, {"http://s/en": b"x" * 5000})
+    monkeypatch.setattr(d, "SUBTITLE_MAX_BYTES", 100)
+    saved = d.save_subtitles(7, 1, 3, 2020, [
+        {"language": "en", "url": "http://s/en"},
+    ])
+    assert saved == []
+    # 目录推迟到真拿到内容才建，失败时不该留空 subs/
+    assert not os.path.isdir(os.path.join(d.episode_dir(7, 1, 3, 2020), "subs"))
+
+
+def test_save_subtitles_disabled_or_empty(sandbox, monkeypatch):
+    """开关关掉、或取流侧没给 captions 时都直接返回空，不发任何请求。"""
+    session = _sub_env(monkeypatch, {})
+    monkeypatch.setattr(d, "SUBTITLES_ENABLED", False)
+    assert d.save_subtitles(7, 1, 3, 2020,
+                            [{"language": "en", "url": "http://s/en"}]) == []
+
+    monkeypatch.setattr(d, "SUBTITLES_ENABLED", True)
+    assert d.save_subtitles(7, 1, 3, 2020, None) == []
+    assert session.calls == []
+
+
+def test_build_meta_lists_subtitles(sandbox):
+    """meta.json 的 subtitles[] 要按 语种/格式/路径 三元组填实。"""
+    meta = d.build_meta({}, {"tmdbId": 7, "season": 1, "episode": 3},
+                        ["subs/en.vtt", "subs/zh.srt"])
+    assert meta["subtitles"] == [
+        {"language": "en", "format": "vtt", "path": "subs/en.vtt"},
+        {"language": "zh", "format": "srt", "path": "subs/zh.srt"},
+    ]
+    # 没抓到字幕时为空列表，等 fetch_subtitles.py 事后补
+    assert d.build_meta({}, {"tmdbId": 7, "season": 1,
+                             "episode": 3})["subtitles"] == []
+
+
+def test_collect_sidecar_assets_includes_subtitles(sandbox):
+    """上传清单必须带上字幕，否则字幕只留在本地、传不到 R2。"""
+    assets = d.collect_sidecar_assets({
+        "tmdbId": 7, "season": 1, "episode": 3, "year": 2020,
+        "subtitle_files": ["subs/en.vtt", "subs/en.srt"],
+        "has_meta": True,
+    })
+    assert assets == ["subs/en.vtt", "subs/en.srt", "meta.json"]
+
+
+def test_finalize_one_entry_saves_captions(sandbox, monkeypatch):
+    """端到端接线：conversion_job 的 captions -> subs/ 落盘 -> meta + success_info。
+
+    这条链路断在任何一环，字幕都只会静默消失（不报错、不影响成败），
+    所以必须有一个覆盖全链的用例把它钉住。
+    """
+    temp = sandbox / "temp"
+    temp.mkdir()
+    ts = temp / "t.ts"
+    ts.write_bytes(b"x")
+    monkeypatch.setattr(d, "convert_ts_to_mp4",
+                        lambda s, dst: open(dst, "wb").write(b"mp4") and True)
+    _sub_env(monkeypatch, {
+        "http://s/en": b"WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi\n",
+    })
+
+    d.processing_ids.add("1_S01E01")
+    _, ok, info = d.finalize_one_entry({
+        "tmdbId": "1", "season": 1, "episode": 1, "normalized_id": "1_S01E01",
+        "title": "T", "year": 2001, "url": "u", "final_ts": str(ts),
+        "temp_mp4": str(temp / "t.mp4"), "cleanup_paths": [str(ts)],
+        "bitrate_kbps": 1, "resolution": "1920x1080",
+        "missing_segment_count": 0, "missing_segment_indices": [],
+        "captions": [{"language": "en", "url": "http://s/en"}],
+    }, set())
+
+    assert ok is True
+    assert info["subtitle_files"] == ["subs/en.vtt", "subs/en.srt"]
+    folder = os.path.dirname(info["final_path"])
+    assert os.path.isfile(os.path.join(folder, "subs", "en.vtt"))
+    with open(os.path.join(folder, "meta.json"), encoding="utf-8") as fh:
+        assert json.load(fh)["subtitles"][0]["language"] == "en"
+    # 上传清单必须带上字幕
+    assert "subs/en.vtt" in d.collect_sidecar_assets(info)
+
+
+def test_finalize_one_entry_survives_subtitle_crash(sandbox, monkeypatch):
+    """🔴 字幕阶段整个炸掉也不能把已下好的一集判失败——尽力而为。"""
+    temp = sandbox / "temp"
+    temp.mkdir()
+    ts = temp / "t.ts"
+    ts.write_bytes(b"x")
+    monkeypatch.setattr(d, "convert_ts_to_mp4",
+                        lambda s, dst: open(dst, "wb").write(b"mp4") and True)
+
+    def boom(*a, **kw):
+        raise RuntimeError("字幕模块整个炸了")
+
+    monkeypatch.setattr(d, "save_subtitles", boom)
+
+    d.processing_ids.add("1_S01E01")
+    _, ok, info = d.finalize_one_entry({
+        "tmdbId": "1", "season": 1, "episode": 1, "normalized_id": "1_S01E01",
+        "title": "T", "year": 2001, "url": "u", "final_ts": str(ts),
+        "temp_mp4": str(temp / "t.mp4"), "cleanup_paths": [str(ts)],
+        "bitrate_kbps": 1, "resolution": "1920x1080",
+        "missing_segment_count": 0, "missing_segment_indices": [],
+        "captions": [{"language": "en", "url": "http://s/en"}],
+    }, set())
+
+    assert ok is True and info["subtitle_files"] == []
+    assert os.path.exists(info["final_path"])
+    assert info["has_meta"] is True          # meta 照常生成

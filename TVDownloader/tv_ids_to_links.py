@@ -297,6 +297,11 @@ _SERIES_META = load_series_metadata()
 # 必须保护、绝不允许被覆盖（下游据此做去重、拼文件名与 R2 对象键）。
 _IDENTITY_KEYS = frozenset({
     "urls", "tmdbId", "season", "episode", "title", "fetched_at",
+    # captions 是**集级**的（每集字幕各不相同），而 _SERIES_META 是剧级的。
+    # 不保护它的话，剧级元数据里一旦出现同名键，整部剧几十集会被写成同一份
+    # 字幕地址 —— 与 season/episode 被覆盖是同一类事故，且更难发现
+    # （字幕能下下来，只是内容对不上集）。
+    "captions",
 })
 # tmdbId -> TMDB 剧名，由 main() 在季集展开后填充；源站不返回 title 时用它兜底
 _TMDB_NAMES = {}
@@ -610,6 +615,143 @@ def _url_entry(url, provider, type_, headers=None, quality=None, size=None):
     }
 
 
+# ---------- 内嵌字幕（随取流顺手带回，零额外配额） ----------
+# 源站给的语言标识 -> ISO 639-1 小写代码。
+#
+# ⚠️ 必须显式映射、不能只靠正则：源站大量使用 639-2 三字母码（"eng"/"zho"），
+# 正则会把 "eng" 原样透传，与白名单里的 "en" 永不相等，字幕被静默丢弃。
+# （电影侧 §12.25 踩过这个坑，这里直接照搬修好的版本。）
+_CAPTION_LANGUAGE_CODES = {
+    # 英语
+    "en": "en", "eng": "en", "english": "en",
+    # 中文（源站会给 zho/chi 两种 639-2 码，简繁都归到 zh）
+    "zh": "zh", "zho": "zh", "chi": "zh", "chinese": "zh",
+    "chinese simplified": "zh", "chinese traditional": "zh",
+    "simplified chinese": "zh", "traditional chinese": "zh",
+    "mandarin": "zh",
+    # 以下语种实测在样本里频繁出现。默认白名单只要 en/zh，但把映射写全：
+    # 用户改 subtitle_languages 即可启用，不必再回来改代码。
+    # 注意 "Protuguese (BR)" 是源站的**拼写错误**，照抄。
+    "es": "es", "spa": "es", "spanish": "es",
+    "pt": "pt", "por": "pt", "portuguese": "pt",
+    "portuguese (br)": "pt", "protuguese (br)": "pt",
+    "ar": "ar", "ara": "ar", "arabic": "ar",
+    "fr": "fr", "fra": "fr", "fre": "fr", "french": "fr",
+    "de": "de", "deu": "de", "ger": "de", "german": "de",
+    "it": "it", "ita": "it", "italian": "it",
+    "ru": "ru", "rus": "ru", "russian": "ru",
+    "ja": "ja", "jpn": "ja", "japanese": "ja",
+    "ko": "ko", "kor": "ko", "korean": "ko",
+    "id": "id", "ind": "id", "indonesian": "id",
+    "tr": "tr", "tur": "tr", "turkish": "tr",
+    "pl": "pl", "pol": "pl", "polish": "pl",
+    "ro": "ro", "ron": "ro", "rum": "ro", "romanian": "ro",
+    "nl": "nl", "nld": "nl", "dut": "nl", "dutch": "nl",
+    "sv": "sv", "swe": "sv", "swedish": "sv",
+    "fi": "fi", "fin": "fi", "finnish": "fi",
+    "da": "da", "dan": "da", "danish": "da",
+    "no": "no", "nor": "no", "norwegian": "no",
+    "cs": "cs", "ces": "cs", "cze": "cs", "czech": "cs",
+    "el": "el", "ell": "el", "gre": "el", "greek": "el",
+    "he": "he", "heb": "he", "hebrew": "he",
+    "hi": "hi", "hin": "hi", "hindi": "hi",
+    "th": "th", "tha": "th", "thai": "th",
+    "vi": "vi", "vie": "vi", "vietnamese": "vi",
+    "hr": "hr", "hrv": "hr", "croatian": "hr",
+    "sr": "sr", "srp": "sr", "serbian": "sr",
+    "hu": "hu", "hun": "hu", "hungarian": "hu",
+    "uk": "uk", "ukr": "uk", "ukrainian": "uk",
+    "bg": "bg", "bul": "bg", "bulgarian": "bg",
+}
+
+
+def _caption_language_code(language):
+    """把源站给的语言标识规范成 ISO 639-1 小写代码（en / zh / ...）。
+
+    归一顺序（缺一不可，每一步都对应实测存在的形态）：
+      1. 整串查表 —— 覆盖 "English" / "eng" / "zh-CN" 之外的全部具名写法，
+         含带括号的 "Portuguese (BR)"；
+      2. 去掉地区后缀再查表 —— "zh-CN" / "pt_BR" -> "zh" / "pt"；
+      3. 已是 2 字母代码则直接采信（表里没列的小语种也能过）。
+    返回 None 表示无法识别（如整句描述 "Spanish; Castilian"），由调用方丢弃。
+    """
+    raw = str(language or "").strip()
+    if not raw:
+        return None
+
+    mapped = _CAPTION_LANGUAGE_CODES.get(raw.lower())
+    if mapped:
+        return mapped
+
+    # "zh-CN" / "pt_BR" / "en-US" 这类带地区后缀的：取主语言段再查表
+    head = re.split(r"[-_]", raw, maxsplit=1)[0].strip().lower()
+    mapped = _CAPTION_LANGUAGE_CODES.get(head)
+    if mapped:
+        return mapped
+
+    # 表外的 2 字母代码直接采信（ISO 639-1 本身就是两字母，不会误收语言名）
+    return head if re.fullmatch(r"[a-z]{2}", head) else None
+
+
+def _caption_entry(url, language, type_=None, headers=None):
+    """构造一条字幕记录。type 取字幕格式（srt / vtt），缺失时按 url 后缀推断。
+
+    headers 是下载该字幕时必须携带的请求头（与 _url_entry 同义）：字幕与视频
+    往往来自同一批 CDN，那些主机对 Referer/UA 有硬校验，缺了会 428/429。
+    """
+    fmt = str(type_ or "").strip().lower().lstrip(".")
+    if fmt not in ("srt", "vtt"):
+        path = str(url or "").split("?", 1)[0].split("#", 1)[0]
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        fmt = ext if ext in ("srt", "vtt") else "srt"
+    entry = {"url": url, "language": language, "type": fmt}
+    if headers:
+        entry["headers"] = dict(headers)
+    return entry
+
+
+def _parse_captions(items, where="", headers=None):
+    """把源站的字幕数组归一成 [{url, language, type}]，同语种保留第一条。
+
+    一个函数吃三家的形态（字段名各不相同，故 url 与 language 都要按多个
+    候选键依次取）：
+      vidup   tracks[]    : {"lang"/"language": "eng", "url": ...}
+                            {"label": "English",       "file": ...}   ← 键名完全不同
+      vidlink captions[]  : {"language": "English", "url": ...}
+      videasy subtitles[] : {"lang"/"language": "English"|"zh-CN", "url": ...}
+                            （TV 侧未接入 videasy，形态一并支持以备将来）
+
+    🔴 **整段容错**：任何结构异常都退化成空列表。字幕是"有就拿、没有就算了"的
+    附加物，绝不能让它的解析失败把一集有源的剧拖成瞬时错误、进而反复重试 ——
+    那等于用字幕的代价去换视频的成功率，方向完全反了。
+    """
+    if not isinstance(items, list):
+        return []
+
+    result = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # url 的候选键：vidup 形态 B 用 file，其余用 url
+        url = item.get("url") or item.get("file") or item.get("src")
+        if not url or not isinstance(url, str):
+            continue
+        # language 的候选键：vidup 形态 B 用 label，其余用 lang/language
+        code = _caption_language_code(
+            item.get("lang") or item.get("language") or item.get("label")
+        )
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        result.append(_caption_entry(url, code, item.get("type"), headers))
+
+    if result and where:
+        print(f"  [{where}] 字幕 {len(result)} 条: "
+              f"{', '.join(c['language'] for c in result)}")
+    return result
+
+
 def _fetch_vidup_like(session, site, api_name, tid, season, episode):
     """vidup.to / vidfast.vc 同构链路：
     页面正则 → enc-{api} → servers POST → dec-{api} → 逐 server stream POST → dec-{api} 取 url。"""
@@ -666,6 +808,7 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
     last_server_error = None
     urls = []
     result_title = None
+    result_captions = []
     stream_404 = 0
     for server in servers_decrypted:
         server_name = server.get('name', 'unknown') if isinstance(server, dict) else 'unknown'
@@ -693,6 +836,15 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
                 urls.append(_url_entry(url, api_name, "m3u8"))
             if result_title is None:
                 result_title = stream_decrypted.get("title")
+            # 🔑 内嵌字幕在 stream_decrypted.tracks[] 里 —— 电影侧实测命中率
+            # 38.5%，是三家里最高的。这个响应本来就在手里，解析它**零额外请求、
+            # 零 SubDL 配额**；不取白不取。各 server 的 tracks 通常相同，
+            # 取首个非空即可。
+            if not result_captions:
+                result_captions = _parse_captions(
+                    stream_decrypted.get("tracks"),
+                    f"{api_name}/{server_name} {label}",
+                )
         except HttpStatusError as e:
             # 只有源站 stream 接口本身的 404 才算“该 server 无源”；enc-dec 的 404 是服务故障
             if e.status == 404 and e.where == "stream":
@@ -706,7 +858,7 @@ def _fetch_vidup_like(session, site, api_name, tid, season, episode):
             continue
 
     if urls:
-        return urls, result_title
+        return urls, result_title, result_captions
     if stream_404 == len(servers_decrypted):
         raise NoSource(f"all {stream_404} {api_name} servers returned 404 for {label}")
     raise Exception(f"All {api_name} servers failed for {label}. Last error: {last_server_error}")
@@ -771,7 +923,17 @@ def _fetch_vidlink(session, tid, season, episode):
         raise Exception(f"vidlink api: qualities without url for {label}")
     # 画质从高到低，下游按顺序择优
     entries.sort(key=lambda u: (u["quality"] is None, -(u["quality"] or 0)))
-    return entries, None
+    # 🔑 内嵌字幕在 data.captions[] 里。
+    # ⚠️ 这里必须**显式压掉 Referer/X-Requested-With**：vidlink 的 CDN
+    # （hakunaymatata 系）带任何 Referer 都会 429，而 peakstorm（vidup 系）
+    # 反过来**要求** Referer，两套 CDN 的鉴权方向完全相反，不能一刀切。
+    # mp4 视频路径由下载侧的 _mp4_request_headers 统一置 None，字幕路径没有
+    # 那一层，故必须在这里就把头写进条目里。requests 对值为 None 的头不发送。
+    return entries, None, _parse_captions(
+        data.get("captions"),
+        headers={**VIDLINK_DOWNLOAD_HEADERS,
+                 "Referer": None, "X-Requested-With": None},
+    )
 
 
 PROVIDERS = {
@@ -836,11 +998,13 @@ def process_episode(tid, season, episode, providers=None):
                 urls = []
                 seen_urls = set()
                 result_title = None
+                result_captions = []
                 nosource_errors = []
                 transient_errors = []
                 for name in providers:
                     try:
-                        provider_urls, provider_title = PROVIDERS[name](session, tid, season, episode)
+                        provider_urls, provider_title, provider_captions = \
+                            PROVIDERS[name](session, tid, season, episode)
                     except NoSource as e:
                         nosource_errors.append(f"{name}: {e}")
                         continue
@@ -859,6 +1023,12 @@ def process_episode(tid, season, episode, providers=None):
                             urls.append(u)
                     if result_title is None and provider_title:
                         result_title = provider_title
+                    # 字幕取**第一个给出非空的 provider**，不跨源合并：
+                    # 每条字幕的 headers 与各自源站的 CDN 鉴权强绑定
+                    # （peakstorm 要 Referer、hakunaymatata 拒绝 Referer），
+                    # 混在一起只会让后到的那份带着错误的头去请求、必然失败。
+                    if not result_captions and provider_captions:
+                        result_captions = provider_captions
 
                 if urls:
                     # 恒用入参 tid/season/episode 作为 key，保证全链路一致：
@@ -877,6 +1047,10 @@ def process_episode(tid, season, episode, providers=None):
                         # 等于白跑一次下载。
                         "fetched_at": int(time.time()),
                     }
+                    # 内嵌字幕：有才写，避免给绝大多数没有字幕的集凭空加一个
+                    # 空列表字段（results.jsonl 是几十万行的大文件）。
+                    if result_captions:
+                        result["captions"] = result_captions
                     # 合并剧级静态元数据，但**绝不覆盖上面的身份字段**：元数据来自
                     # tv_series.jsonl，是剧级的（一剧一条），若它哪天多出 season/
                     # episode/tmdbId 之类的键，直接 update 会把本集的真实身份改掉，

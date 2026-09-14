@@ -1483,3 +1483,76 @@ def test_run_batch_cancels_pending_on_interrupt(tmp_path, monkeypatch):
         m.run_batch(items, tmp_path / "r.jsonl", tmp_path / "f.txt", max_workers=1)
     # 单线程：第一个抛 KeyboardInterrupt 后，剩余排队任务被 cancel（最多再漏跑 1 个已被 worker 取走的）
     assert started[0] == "first" and len(started) <= 2
+
+
+# ---------- 内嵌字幕解析 ----------
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("English", "en"),          # 语言全名
+    ("eng", "en"),              # ISO 639-2
+    ("zho", "zh"),
+    ("chi", "zh"),              # 639-2/B 的另一拼法
+    ("zh-CN", "zh"),            # 带地区后缀
+    ("pt_BR", "pt"),
+    ("EN", "en"),               # 大小写不敏感
+    ("ja", "ja"),               # 表外的 2 字母码直接采信
+    ("Spanish; Castilian", None),  # 整句描述识别不了 -> 丢弃
+    ("", None),
+    (None, None),
+])
+def test_caption_language_code(raw, expected):
+    """源站混用 639-1 / 639-2 / 语言全名 / 带地区后缀，必须全部归一到 639-1。"""
+    assert m._caption_language_code(raw) == expected
+
+
+def test_parse_captions_handles_all_provider_shapes():
+    """三家的字段名各不相同（url/file、lang/language/label），要一并吃下。"""
+    got = m._parse_captions([
+        {"lang": "eng", "url": "http://a/en.vtt"},
+        {"label": "Chinese", "file": "http://a/zh.srt"},   # vidup 形态 B
+    ])
+    assert got == [
+        {"url": "http://a/en.vtt", "language": "en", "type": "vtt"},
+        {"url": "http://a/zh.srt", "language": "zh", "type": "srt"},
+    ]
+
+
+def test_parse_captions_dedupes_and_drops_garbage():
+    """同语种只留第一条；结构异常/缺 url/语种识别不出的一律丢弃。"""
+    got = m._parse_captions([
+        "not-a-dict",
+        {"lang": "en"},                              # 缺 url
+        {"lang": "Spanish; Castilian", "url": "x"},  # 语种识别不出
+        {"lang": "eng", "url": "http://a/1.srt"},
+        {"lang": "English", "url": "http://a/2.srt"},  # 同语种，丢弃
+    ])
+    assert got == [{"url": "http://a/1.srt", "language": "en", "type": "srt"}]
+
+
+def test_parse_captions_never_raises_on_bad_shape():
+    """🔴 整段容错：字幕解析绝不能把一集有源的剧拖成失败。"""
+    assert m._parse_captions(None) == []
+    assert m._parse_captions({"captions": []}) == []
+    assert m._parse_captions("oops") == []
+
+
+def test_parse_captions_attaches_headers():
+    """headers 与源站 CDN 鉴权强绑定，必须逐条带上供下载侧原样使用。"""
+    got = m._parse_captions(
+        [{"lang": "en", "url": "http://a/en.vtt"}],
+        headers={"Referer": "https://peak/"},
+    )
+    assert got[0]["headers"] == {"Referer": "https://peak/"}
+    # 不传 headers 时不写该键，避免 results.jsonl 里塞一堆空字典
+    assert "headers" not in m._parse_captions(
+        [{"lang": "en", "url": "http://a/en.vtt"}])[0]
+
+
+def test_captions_is_episode_level_identity_key():
+    """🔴 captions 是**集级**的，必须在 _IDENTITY_KEYS 里。
+
+    否则剧级元数据缓存会把 A 集的字幕覆盖到 B 集上 —— 同一部剧几十上百集
+    共用一个 tmdbId，串台的是整季。
+    """
+    assert "captions" in m._IDENTITY_KEYS

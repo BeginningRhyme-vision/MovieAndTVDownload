@@ -422,3 +422,320 @@ def test_interrupt_returns_130_and_still_prints_summary(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "已中断" in out
     assert "重跑本命令即可从断点继续" in out
+
+
+# ------------------------------------------------- AsyncRefetcher（异步重取）
+
+class _FakeFetcher:
+    """替身取流模块：按集级 key 返回预设结果，并记录调用与 providers。"""
+
+    def __init__(self, results=None, providers_sink=None):
+        self.results = results or {}
+        self.calls = []
+        self.providers_sink = (
+            providers_sink if providers_sink is not None else []
+        )
+
+    def process_episode(self, tid, season, episode, providers=None):
+        key = f"{tid}_S{season:02d}E{episode:02d}"
+        self.calls.append(key)
+        self.providers_sink.append(providers)
+        return self.results.get(key, ("dead", None))
+
+
+def _ok_result(tid, season=1, episode=1, urls=("new",), fetched_at=999):
+    return ("ok", {"tmdbId": tid, "season": season, "episode": episode,
+                   "urls": list(urls), "fetched_at": fetched_at})
+
+
+def _drain(refetcher, timeout=3.0):
+    """等到在途归零（worker 先 put 结果再减计数，故归零后 collect 不会漏）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if refetcher.pending_count() == 0:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_async_refetcher_revives_and_persists(monkeypatch, tmp_path):
+    """重取成功要做三件事：落盘、逐键覆盖 urls/fetched_at、放进 _done。
+
+    落盘是关键：即使本次运行没赶上消费，下次启动也能按 fetched_at 择新用上。
+    """
+    fake = _FakeFetcher({"7_S01E03": _ok_result("7", 1, 3)})
+    monkeypatch.setattr(p, "fetcher", fake)
+    out = tmp_path / "results.jsonl"
+    monkeypatch.setattr(p.downloader, "INPUT_JSONL", str(out))
+
+    stop = threading.Event()
+    r = p.AsyncRefetcher(2, stop)
+    r.start()
+    try:
+        entry = _ep("7", 1, 3, title="旧标题", year="2020")
+        assert r.dispatch([entry]) == 1
+        assert _drain(r)
+        got = r.collect()
+    finally:
+        stop.set()
+
+    assert len(got) == 1
+    assert got[0]["urls"] == ["new"]          # 换成了新链接
+    assert got[0]["fetched_at"] == 999
+    assert got[0]["title"] == "旧标题"        # 历史元数据必须保留（逐键覆盖）
+    assert got[0]["year"] == "2020"
+    assert r.revived == 1
+    # 落盘：下次运行的兜底
+    assert out.exists() and "new" in out.read_text(encoding="utf-8")
+
+
+def test_async_refetcher_refreshes_captions(monkeypatch, tmp_path):
+    """🔴 captions 必须跟 urls 一起刷新：旧字幕地址与旧节点同批签发、一起过期。
+
+    留着旧 captions 会让下载侧拿着过期地址去拉字幕，白白浪费请求；
+    新结果没给 captions 时要置空，绝不能回落到旧值。
+    """
+    monkeypatch.setattr(p.downloader, "INPUT_JSONL", str(tmp_path / "r.jsonl"))
+
+    def _run(result):
+        monkeypatch.setattr(p, "fetcher", _FakeFetcher({"7_S01E03": result}))
+        stop = threading.Event()
+        r = p.AsyncRefetcher(1, stop)
+        r.start()
+        try:
+            r.dispatch([_ep("7", 1, 3,
+                            captions=[{"language": "en", "url": "old"}])])
+            assert _drain(r)
+            return r.collect()[0]
+        finally:
+            stop.set()
+
+    ok, payload = _ok_result("7", 1, 3)
+    payload["captions"] = [{"language": "zh", "url": "fresh"}]
+    assert _run((ok, payload))["captions"] == [
+        {"language": "zh", "url": "fresh"}
+    ]
+    # 新结果没带 captions -> 置空，不保留旧的
+    assert _run(_ok_result("7", 1, 3))["captions"] == []
+
+
+def test_async_refetcher_dedupes_inflight_by_episode_key(monkeypatch):
+    """🔴 同一集在途时拒收重复投递，且去重必须按**集级 key** 而非 tmdbId。
+
+    同一部剧几十上百集共用一个 tmdbId：按剧去重会让一部剧只重取得了一集，
+    其余全被当成"已在途"拒收 —— 与 §0.07 那个"一部剧只下得了一集"同源的坑。
+    """
+    gate = threading.Event()
+
+    class _Blocking(_FakeFetcher):
+        def process_episode(self, tid, season, episode, providers=None):
+            gate.wait(3)
+            return super().process_episode(tid, season, episode, providers)
+
+    monkeypatch.setattr(p, "fetcher", _Blocking())
+    stop = threading.Event()
+    r = p.AsyncRefetcher(4, stop)
+    r.start()
+    try:
+        # 同一集投两次 → 第二次被拒
+        assert r.dispatch([_ep("9", 1, 1)]) == 1
+        assert r.dispatch([_ep("9", 1, 1)]) == 0
+        assert r.skipped_inflight == 1
+        # 同剧不同集 → 必须放行（按集级 key 去重的核心断言）
+        assert r.dispatch([_ep("9", 1, 2)]) == 1
+        assert r.dispatch([_ep("9", 2, 1)]) == 1
+    finally:
+        gate.set()
+        _drain(r)
+        stop.set()
+
+
+def test_async_refetcher_inflight_drops_to_zero_on_every_path(monkeypatch,
+                                                              tmp_path):
+    """🔴 无论成功/无果/抛异常，在途计数都必须减掉。
+
+    漏减会让主循环与 QueueEntrySource 永远以为"还有货没回来"：前者白等满
+    ASYNC_REFETCH_WAIT_SECONDS，后者永不返回 done → 主循环空转、永不收尾。
+
+    ⚠️ 三条分支的异常必须分别覆盖到**不同的层**，否则测不到 _loop 的 finally：
+      - process_episode 抛的异常被 _handle 内部的 except 吃掉，走不到 _loop；
+      - 故第 4 条让 **write_log 落盘时**抛，那是 _handle 里唯一没被包住的动作，
+        异常会真正冒泡到 _loop —— 只有它能验证 finally 的必要性。
+    """
+    class _Mixed(_FakeFetcher):
+        def process_episode(self, tid, season, episode, providers=None):
+            if season == 2:
+                raise RuntimeError("源站 502")
+            return super().process_episode(tid, season, episode, providers)
+
+    monkeypatch.setattr(p, "fetcher", _Mixed({
+        "1_S01E01": _ok_result("1"),
+        "4_S03E01": _ok_result("4", 3, 1),
+    }))
+    monkeypatch.setattr(
+        p.downloader, "INPUT_JSONL", str(tmp_path / "r.jsonl")
+    )
+
+    real_write_log = p.downloader.write_log
+
+    def flaky_write_log(path, data):
+        # 只让第 4 条（S03）落盘失败，异常冒泡到 _loop。
+        if data.get("season") == 3:
+            raise OSError("磁盘写失败")
+        return real_write_log(path, data)
+
+    monkeypatch.setattr(p.downloader, "write_log", flaky_write_log)
+
+    stop = threading.Event()
+    r = p.AsyncRefetcher(3, stop)
+    r.start()
+    try:
+        r.dispatch([
+            _ep("1", 1, 1),   # ok
+            _ep("2", 1, 1),   # dead（无果）
+            _ep("3", 2, 1),   # process_episode 抛异常（_handle 内部兜住）
+            _ep("4", 3, 1),   # 落盘抛异常（冒泡到 _loop，只有 finally 能兜）
+        ])
+        assert _drain(r), "在途计数没有归零，主循环会永久空转"
+    finally:
+        stop.set()
+    assert r.pending_count() == 0
+    # 冒泡那条也必须把 key 从在途集合里摘掉，否则该集此后再也投递不进来
+    assert r.dispatch([_ep("4", 3, 1)]) == 1
+
+
+def test_async_refetcher_survives_system_exit(monkeypatch):
+    """取流侧用 SystemExit 做配置校验，单集重取绝不能带塌整批。"""
+    class _Exiting(_FakeFetcher):
+        def process_episode(self, tid, season, episode, providers=None):
+            raise SystemExit("缺少代理凭证: PROXY_USER")
+
+    monkeypatch.setattr(p, "fetcher", _Exiting())
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop)
+    r.start()
+    try:
+        r.dispatch([_ep("1", 1, 1)])
+        assert _drain(r)
+    finally:
+        stop.set()
+    assert r.collect() == []
+    assert r.revived == 0
+
+
+def test_async_refetcher_passes_providers_through(monkeypatch):
+    """--providers 必须透传给重取，否则会绕过用户明确指定的源。"""
+    sink = []
+    monkeypatch.setattr(p, "fetcher", _FakeFetcher(providers_sink=sink))
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop, providers=["vidlink"])
+    r.start()
+    try:
+        r.dispatch([_ep("1", 1, 1)])
+        assert _drain(r)
+    finally:
+        stop.set()
+    assert sink == [["vidlink"]]
+
+
+# ------------------------------------------ QueueEntrySource 的重取通道
+
+class _StubRefetcher:
+    """只实现 collect/pending_count 的替身，用于驱动来源侧的重取分支。"""
+
+    def __init__(self, results=(), pending=0):
+        self._results = list(results)
+        self._pending = pending
+
+    def collect(self):
+        out, self._results = self._results, []
+        return out
+
+    def pending_count(self):
+        return self._pending
+
+    def set_pending(self, n):
+        self._pending = n
+
+
+def test_revived_entries_are_delivered_first(monkeypatch):
+    """🔴 投递优先级：重取结果 > 实时队列 > backlog。
+
+    重取结果是**刚签出**的直链，时效最紧，且是失败集当次运行唯一的救回机会。
+    """
+    q = queue.Queue()
+    q.put(_ep("queued", 1, 1))
+    revived = _ep("revived", 1, 1, urls=["fresh"])
+    source = p.QueueEntrySource(
+        q, backlog=[_ep("backlog", 1, 1)],
+        refetcher=_StubRefetcher([revived]),
+    )
+    assert source.poll() == ("item", revived)          # 重取最先
+    state, entry = source.poll()
+    assert entry["tmdbId"] == "queued"                 # 其次队列
+    state, entry = source.poll()
+    assert entry["tmdbId"] == "backlog"                # 最后 backlog
+
+
+def test_revived_replaces_pending_backlog_entry_in_place(monkeypatch):
+    """重取结果若先于对应 backlog 条目回来，就地替换掉那条旧链接。
+
+    否则同一集会被投两次：旧的白占一个下载槽位，且必然因过期而失败。
+    """
+    q = queue.Queue()
+    old = _ep("5", 1, 1, urls=["old"])
+    new = _ep("5", 1, 1, urls=["new"])
+    source = p.QueueEntrySource(
+        q, backlog=[old], refetcher=_StubRefetcher([new])
+    )
+    # 队列空、backlog 那条已被就地换成新链接 → 发出来的是新的
+    state, entry = source.poll()
+    assert (state, entry["urls"]) == ("item", ["new"])
+    assert source.revived_delivered == 1
+    # 只发一份
+    q.put(p._SENTINEL)
+    assert source.poll() == ("done", None)
+
+
+def test_revived_waits_for_busy_episode(monkeypatch):
+    """旧链接还在下载时，新链接先压在缓冲里，等它离开处理态再投。
+
+    此刻投出去会被 process_one_entry 判"重复条目正在处理"直接丢掉，
+    新链接就白换了。
+    """
+    q = queue.Queue()
+    q.put(p._SENTINEL)
+    busy = {"3_S01E01"}
+    new = _ep("3", 1, 1, urls=["new"])
+    source = p.QueueEntrySource(
+        q, backlog=[], refetcher=_StubRefetcher([new]),
+        is_busy=lambda key: key in busy,
+    )
+    # 该集正忙 → 不投，但也不能报 done（缓冲里还压着货）
+    assert source.poll() == ("wait", None)
+    busy.clear()
+    state, entry = source.poll()
+    assert (state, entry["urls"]) == ("item", ["new"])
+
+
+def test_source_waits_while_refetch_is_inflight():
+    """🔴 取流收工后，只要还有重取在途就必须 wait 而不是 done。
+
+    max_rounds=1 下这是新直链**唯一**的消费窗口：过早报 done 会让主循环收尾，
+    重取回来的链接只能等下次运行，本次白救。
+    """
+    q = queue.Queue()
+    q.put(p._SENTINEL)
+    stub = _StubRefetcher([], pending=1)
+    source = p.QueueEntrySource(q, backlog=[], refetcher=stub)
+    assert source.poll() == ("wait", None)     # 在途 → 等
+    stub.set_pending(0)
+    assert source.poll() == ("done", None)     # 归零且无结果 → 收工
+
+
+def test_source_without_refetcher_behaves_as_before():
+    """未装重取钩子时行为与改动前完全一致（单独跑 download_tv.py 的路径）。"""
+    q = queue.Queue()
+    q.put(p._SENTINEL)
+    source = p.QueueEntrySource(q, backlog=[])
+    assert source.poll() == ("done", None)

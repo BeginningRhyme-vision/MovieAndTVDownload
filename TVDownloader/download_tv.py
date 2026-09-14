@@ -3,6 +3,7 @@
 
 import json
 import importlib
+import functools
 import hashlib
 import os
 import math
@@ -133,6 +134,31 @@ AUTO_REFETCH_SKIP_QUALITY_DEAD = bool(
 AUTO_REFETCH_TIMEOUT = max(
     30, int(_REFETCH_CFG.get("round_timeout_seconds", 600))
 )
+# 【仅 pipeline.py】异步重取的钩子。由 pipeline.py 在起线程前装上一个
+# AsyncRefetcher 实例；单独跑 download_tv.py 时恒为 None，重取走同步老路。
+#
+# 🔑 为什么必须有这条异步路径（2026-09-14，§0.20）：
+#   同步的 refetch_entries 由**主事件循环线程**执行，期间 wait(pending) 整个停摆，
+#   已下载完的集无人提交转封装、成品堆在 temp、上传反压链条僵住。pipeline 的
+#   整个前提是"主循环一步都不阻塞"，故那条路在 pipeline 模式下不能走。
+#   而不走它、又没有异步路径的话，pipeline 模式下过期直链**当次运行零自愈**。
+async_refetch_hook = None
+# 【仅 pipeline.py】轮末投出异步重取后，等待结果回来的上限（秒）。
+# 投完必须等一等再判"还有没有集要重投"——否则会认为没有、直接收尾，
+# 重取成功的新链接就没有任何轮次去消费它。期间每秒收一次，在途清零即提前
+# 结束，不会白等满。单独跑 download_tv.py 时本项无效（走同步重取）。
+ASYNC_REFETCH_WAIT_SECONDS = max(
+    1, int(_REFETCH_CFG.get("async_wait_seconds", 120))
+)
+# ---- 收尾自动补传 ----
+# 上传槽位等待超时（upload_slot_wait_timeout）后会降级为"留本地 + 写
+# upload_pending.jsonl"，这些成品**不会被任何后续轮次处理**——它们下载是成功的，
+# 既不在失败队列里也不在重试桶里，唯一的出路是人跑 `download_tv.py reupload`。
+# 而主流程跑完时 R2 往往早已恢复（降级只需积压 300s，主流程还要跑几小时），
+# 自动补一次能省掉这次人工介入。手动 reupload 子命令始终保留。
+AUTO_REUPLOAD_ENABLED = bool(
+    (_CFG.get("auto_reupload", {}) or {}).get("enabled", True)
+)
 # 两个独立的下载态状态文件（区别于 SUCCESS_LOG/FAILED_LOG）。
 DOWNLOAD_OK_LOG = resolve_file(_CFG.get("download_ok_log"), "download_ok.jsonl")
 DOWNLOAD_FAIL_LOG = resolve_file(_CFG.get("download_fail_log"), "download_fail.jsonl")
@@ -186,9 +212,13 @@ _ASSETS_CFG = _CFG.get("assets", {}) or {}
 META_ENABLED = bool(_ASSETS_CFG.get("meta_enabled", True))
 # 集目录下存放字幕的子目录名（与 fetch_subtitles.py 保持一致）。
 SUBS_SUBDIR = "subs"
-# 字幕语种白名单与输出格式。TV 下载侧本身不抓字幕（取流源不带 captions），
-# 但这些必须与 fetch_subtitles.py **同源**——补来的字幕要落到视频找得到的
-# 地方、用前端认得的格式，两套实现各改一半就会对不上。
+# 是否抓取取流侧带回的内嵌字幕（results.jsonl 的 captions 字段）。
+# 这批字幕零配额白捡：取流响应里本就带着（vidup 的 tracks[]、vidlink 的
+# captions[]），顺手下下来即可，不消耗 SubDL 的每日额度。抓不到不算整集失败。
+SUBTITLES_ENABLED = bool(_ASSETS_CFG.get("subtitles_enabled", True))
+SUBTITLE_TIMEOUT = float(_ASSETS_CFG.get("subtitle_timeout", 30))
+# 字幕语种白名单与输出格式。下载侧的内嵌字幕与 fetch_subtitles.py 的 SubDL
+# 补抓必须**同源**——两条链路落的是同一个 subs/ 目录，各改一半就会对不上。
 SUBTITLE_LANGUAGES = [
     str(lang).strip().lower()
     for lang in (_ASSETS_CFG.get("subtitle_languages") or ["en", "zh"])
@@ -205,7 +235,11 @@ SUBTITLE_FORMATS = [
 SUBTITLE_MAX_BYTES = int(_ASSETS_CFG.get("subtitle_max_bytes", 5 * 1024 * 1024))
 
 # 下载线程池固定保持的影片下载数。
-MAX_WORKERS = _CFG.get("max_workers", 32)
+# 默认 16（2026-09-14 由 32 下调，与电影侧对齐）：全局连接数 =
+# MAX_WORKERS × SEGMENT_CONCURRENCY，32×64=2048 条并发 HTTPS 会触发源站 429；
+# 且总吞吐由带宽定死、与并发数无关，多开只是把同一块带宽切得更碎。
+# 依据详见 config.yaml 同名项。配置缺失时的兜底必须与 config 默认值一致。
+MAX_WORKERS = _CFG.get("max_workers", 16)
 # 主循环同时持有的“下载 future”上限（分批投递深度）。
 # 一次性把整轮几万集全 submit 进 pending，会让 wait(FIRST_COMPLETED) 每次都对
 # 全部未完成 future 挂/摘 waiter，主循环退化成 O(N²)。分批后 wait 规模恒定在
@@ -222,9 +256,14 @@ STREAM_IDLE_POLL_SECONDS = max(
     0.1, float(_CFG.get("stream_idle_poll_seconds", 2))
 )
 # 独立的 FFmpeg 转封装/移动线程数，不占用上面的下载槽位。
-CONVERT_WORKERS = _CFG.get("convert_workers", 16)
+# 默认 8：转封装是 `ffmpeg -c copy` 纯 IO 拷贝，并发过高只会在同一块盘上
+# 互抢 IO，吞吐不升反降（兜底值原为 16，与 config.yaml 的 8 不一致，已对齐）。
+CONVERT_WORKERS = _CFG.get("convert_workers", 8)
 # 单部影片同时下载的分片数。
-SEGMENT_CONCURRENCY = _CFG.get("segment_concurrency", 64)
+# 默认 16（2026-09-14 由 64 下调，与电影侧对齐）：这是**每集各开一个**
+# ThreadPoolExecutor，故全局连接数 = MAX_WORKERS × 本值。64 会让 2048 条连接
+# 去分同一条链路的带宽，每条只有几十 KB/s，且源站会当成攻击行为。
+SEGMENT_CONCURRENCY = _CFG.get("segment_concurrency", 16)
 TEMP_DIR = resolve_dir(_CFG.get("temp_dir"), "temp")
 SAMPLE_COUNT = int(_CFG.get("sample_count", 10))
 SEG_RETRY_MAX = int(_CFG.get("seg_retry_max", 20))
@@ -250,8 +289,12 @@ SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 3)))
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
 # playlist（master/media）解析阶段的请求重试：源站临时 5xx 抽风时，这一层
-# 若过早放弃会直接判整部影片失败。故给足重试次数与退避上限，扛过几十秒级故障。
-PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 10))
+# 若过早放弃会直接判整集失败。但预算也不能给太大 ——
+# 默认 4（2026-09-14 由 10 下调，与电影侧对齐）：退避指数增长、第 7 次起封顶
+# 60s，跑满 10 次约 4 分钟，而实测这类 400/500/502 全是 CDN 回源故障（换 IP 无效、
+# 恢复是小时级），第 3~4 次就能定论，后面纯属空耗并占死下载窗口。
+# 1+2+4 ≈ 7 秒仍足以跨过源站几秒级的真抖动。
+PLAYLIST_RETRY_MAX = int(_CFG.get("playlist_retry_max", 4))
 PLAYLIST_RETRY_BACKOFF = float(_CFG.get("playlist_retry_backoff", 1.0))
 PLAYLIST_RETRY_BACKOFF_MAX = float(_CFG.get("playlist_retry_backoff_max", 60.0))
 # 方案C 分阶重试：多节点 fallback 时，非末节点用更小的 playlist 重试次数，
@@ -271,16 +314,26 @@ MP4_SAMPLE_SIZE = int(_CFG.get("mp4_sample_size", 8 * 1024 * 1024))
 # 仅在上游 runtime_minutes 缺失、不得不用样本时长时才参与判断。
 MP4_MIN_TRUSTED_DURATION = float(_CFG.get("mp4_min_trusted_duration", 600))
 MIN_RESOLUTION_HEIGHT = int(_CFG.get("min_resolution_height", 1080))
+# 【分辨率是否参与画质判定】false（默认）= 模式 B：只按码率，分辨率红线整关放行、
+# 码率门槛用**不缩放的绝对线**；true = 模式 A：分辨率红线 + 码率门槛按 (h/1080)²
+# 随流高度缩放，择优也按高度优先（2026-09-14 之前 TV 侧的唯一口径）。
+#
+# ⚠️ 为什么 false 时必须同时去掉 (h/1080)² 缩放：那个因子本身就是分辨率在参与
+# 判定。若只摘掉红线关却保留缩放，480p 的门槛会被缩到 2000×(480/1080)²≈316
+# kbps —— 低分辨率片反而更容易过关，等于把分辨率以更隐蔽的方式又请了回来，
+# 与"只按码率判断"的意图正好相反。
+RESOLUTION_CHECK_ENABLED = bool(_CFG.get("resolution_check_enabled", False))
 # 唯一宽松系数：同时放宽“分辨率红线”与“码率门槛”两关（合并原来的两个容差系数）。
 LENIENCY = float(_CFG.get("leniency", 0.8))
-# 各编码在 1080p 基准下的最低码率门槛（kbps）。实际门槛按该流自身高度平方缩放：
-#   门槛 = 基准[codec] × (h/1080)² × LENIENCY
+# 各编码在 1080p 基准下的最低码率门槛（kbps）。
+#   模式 A：门槛 = 基准[codec] × (h/1080)² × LENIENCY（随流高度缩放）
+#   模式 B：门槛 = 基准[codec] × LENIENCY（绝对线，任何分辨率同一条）
 # HEVC/AV1/VP9 同主观画质更省码率，单独设等效基准；探测不到编码回退 H.264 基准（最严）。
 BITRATE_BASELINE = {
-    "h264": float(_CFG.get("bitrate_h264", 1850)),
-    "hevc": float(_CFG.get("bitrate_hevc", 1100)),
-    "av1": float(_CFG.get("bitrate_av1", 925)),
-    "vp9": float(_CFG.get("bitrate_vp9", 1400)),
+    "h264": float(_CFG.get("bitrate_h264", 2000)),
+    "hevc": float(_CFG.get("bitrate_hevc", 1189)),
+    "av1": float(_CFG.get("bitrate_av1", 1000)),
+    "vp9": float(_CFG.get("bitrate_vp9", 1514)),
 }
 # 1080p 码率基准高度：门槛随 (实测高度/此值)² 缩放（码率需求 ∝ 像素数 ∝ 高度²）。
 _BITRATE_BASELINE_HEIGHT = 1080
@@ -1201,9 +1254,11 @@ def load_quality_dead_keys():
 
 
 # ---------- 画质判死的跨运行持久化（DOWNLOAD_DEAD_LOG） ----------
-# 从判死文案里回抽实测码率与门槛。TV 侧只有一种措辞（由三处 raise 生成）：
-#   分辨率 854x480 流（h264）码率未达到门槛：372 kbps < 1600 kbps
-# 只锚定"码率未达到门槛：N kbps < M kbps"这段公共前缀，措辞微调也不会失效。
+# 从判死文案里回抽实测码率与门槛。两种模式的措辞不同（见 bitrate_reject_message）：
+#   模式 A：分辨率 854x480 流（h264）码率未达到门槛：372 kbps < 1600 kbps
+#   模式 B：码率未达到门槛：372 kbps < 1600 kbps（h264，实测 854x480）
+# 码率数值只锚定"码率未达到门槛：N kbps < M kbps"这段公共前缀，两模式通用、
+# 措辞微调也不会失效；分辨率与编码则各按各的模式抽。
 #
 # ⚠️ 抽出来的是**末节点**的数值：外层判死文案只嵌末节点错误，前面节点的实测值
 # 落盘时已不存在。这让 --retry-dead 偏保守（多节点集可能漏救几集），
@@ -1211,7 +1266,10 @@ def load_quality_dead_keys():
 _DEAD_BITRATE_RE = re.compile(
     r"码率未达到门槛[：:]\s*([0-9.]+)\s*kbps\s*<\s*([0-9.]+)\s*kbps"
 )
-_DEAD_RESOLUTION_RE = re.compile(r"分辨率 (\d+x\d+) 流（([^）]+)）")
+# 实测分辨率与编码：模式 B 写在尾部括号里，模式 A 写在开头。两条各自可选。
+_DEAD_RESOLUTION_RE = re.compile(r"实测 (\d+x\d+)")
+_DEAD_MODE_A_RE = re.compile(r"分辨率 (\d+x\d+) 流（([^）]+)）")
+_DEAD_CODEC_B_RE = re.compile(r"kbps（([^，]+)，实测")
 
 
 def parse_dead_quality_evidence(error_msg):
@@ -1230,10 +1288,17 @@ def parse_dead_quality_evidence(error_msg):
         "bitrate_kbps": float(match.group(1)),
         "threshold_kbps": float(match.group(2)),
     }
-    detail = _DEAD_RESOLUTION_RE.search(error_msg)
-    if detail:
-        evidence["resolution"] = detail.group(1)
-        evidence["codec"] = detail.group(2)
+    mode_a = _DEAD_MODE_A_RE.search(error_msg)
+    if mode_a:
+        evidence["resolution"] = mode_a.group(1)
+        evidence["codec"] = mode_a.group(2)
+    else:
+        resolution = _DEAD_RESOLUTION_RE.search(error_msg)
+        if resolution:
+            evidence["resolution"] = resolution.group(1)
+        codec = _DEAD_CODEC_B_RE.search(error_msg)
+        if codec:
+            evidence["codec"] = codec.group(1)
     return evidence
 
 
@@ -1306,15 +1371,30 @@ def dead_record_passes_now(record):
     门槛恰好压在记录值上时放回，重新采样很可能测出略低的值又被判死一次，
     形成来回震荡、每轮都白跑。要求"新门槛 × 余量 <= 记录值"才放回。
 
-    🔴 height 缺失必须挡住：TV 侧 `bitrate_threshold` 按 (h/1080)² 缩放，
-    height=0 会让门槛恒为 0，`0 × 余量 <= 任何码率` **恒真** —— 这批记录会被
-    无条件放回。故 height 抽不出来时一律不放回（保守）。
+    🔴 两个必须挡住的坑：
+
+    1. **跨模式复判**：`bitrate_threshold` 的行为由 RESOLUTION_CHECK_ENABLED
+       决定（模式 A 按 (h/1080)² 缩放、模式 B 用绝对线），两者门槛能差 5 倍。
+       拿当前模式去复判另一个模式下判死的记录，结论没有意义。
+       故记录里存了判死当时的模式，**不一致就不放回**（保守）。
+       老记录没有该字段 → 视为未知 → 同样不放回，避免按错误口径误放。
+
+    2. **height 缺失时门槛归零**：模式 A 下 `bitrate_threshold` 按 (h/1080)²
+       缩放，height=0 会让门槛恒为 0，`0 × 余量 <= 任何码率` **恒真** ——
+       这批记录会被无条件放回。故模式 A 下 height 抽不出来时一律不放回。
+       模式 B 下 height 根本不参与计算，不必挡（挡了反而会把"未知分辨率"
+       那批本该复判的记录永久关在门外）。
     """
     evidence = record.get("evidence") or {}
     bitrate = evidence.get("bitrate_kbps")
     if bitrate is None:
         # 没有依据 → 无法证明现在仍不达标，放回（见 load_dead_keys 文档）。
         return True
+
+    # 坑 1：判死时的模式必须与当前一致，否则门槛口径不可比。
+    recorded_mode = record.get("resolution_check_enabled")
+    if recorded_mode is None or bool(recorded_mode) != RESOLUTION_CHECK_ENABLED:
+        return False
 
     resolution = str(evidence.get("resolution") or "")
     height = 0
@@ -1323,8 +1403,8 @@ def dead_record_passes_now(record):
             height = int(resolution.split("x")[1])
         except (ValueError, IndexError):
             height = 0
-    # height=0 会让 (h/1080)² 归零、门槛恒真，保守起见不放回。
-    if height <= 0:
+    # 坑 2：模式 A 下 height=0 会让门槛归零 → 恒真放回。保守起见不放回。
+    if height <= 0 and RESOLUTION_CHECK_ENABLED:
         return False
 
     current = bitrate_threshold(height, evidence.get("codec"))
@@ -1343,6 +1423,9 @@ def record_quality_dead(entry, error_msg, urls=None):
         **_entry_identity(entry),
         "dead_at": int(time.time()),
         "reason_class": "quality",
+        # 判死当时的画质判定模式，复判时用来确认口径可比（见
+        # dead_record_passes_now 的坑 1：两模式门槛能差 5 倍）。
+        "resolution_check_enabled": RESOLUTION_CHECK_ENABLED,
         "error": error_msg,
         "evidence": parse_dead_quality_evidence(error_msg) or {},
         "node_count": len(urls or []),
@@ -1896,11 +1979,106 @@ def vtt_to_srt(text):
     return "\n\n".join(out) + "\n" if out else ""
 
 
-def build_meta(entry, success_info):
+def _fetch_caption_text(caption):
+    """下载单条字幕，返回 (文本, 源格式) 或 None。失败直接抛异常由调用方吞。"""
+    url = caption.get("url")
+    if not url:
+        return None
+    # headers 与各自源站的 CDN 鉴权强绑定（peakstorm 要 Referer、
+    # hakunaymatata 拒绝 Referer），取流侧已按源站算好，此处原样带上。
+    headers = dict(caption.get("headers") or {})
+    with get_session().get(
+        url, timeout=SUBTITLE_TIMEOUT, headers=headers or None, stream=True
+    ) as response:
+        response.raise_for_status()
+        chunks = []
+        total = 0
+        # 流式读 + 边读边计量：源站若塞来视频/错误页，在超限那一刻就停，
+        # 不会把它整个读进内存。
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > SUBTITLE_MAX_BYTES:
+                raise ValueError(
+                    f"字幕体积超过上限 {SUBTITLE_MAX_BYTES} 字节，疑似非字幕内容"
+                )
+            chunks.append(chunk)
+    raw = b"".join(chunks)
+    if not raw.strip():
+        raise ValueError("字幕内容为空")
+    text = _decode_subtitle(raw)
+    # 一律按**内容**判定格式，不信源站声明的 type：源站把 srt 标成 vtt
+    # （或反过来）很常见，按声明转换会产出播放器读不了的残废文件。
+    fmt = "vtt" if text.lstrip().upper().startswith("WEBVTT") else "srt"
+    return text, fmt
+
+
+def save_subtitles(tmdb_id, season, episode, year, captions):
+    """把取流侧带回的内嵌字幕落到集目录的 subs/ 下，返回相对路径列表。
+
+    尽力而为：任何一条字幕失败都只打印告警并跳过，绝不影响整集成败——
+    抓不到的语种后续由 fetch_subtitles.py 从 SubDL 补。
+    """
+    if not SUBTITLES_ENABLED or not captions:
+        return []
+
+    # 先按白名单筛选并去重：取流侧可能给十几种语言，全存会白白放大存储
+    # 与上传请求数。同语种只取第一条（取流侧已按源站优先级排好）。
+    wanted = {}
+    for caption in captions:
+        if not isinstance(caption, dict):
+            continue
+        lang = str(caption.get("language") or "").strip().lower()
+        if lang in SUBTITLE_LANGUAGES and lang not in wanted:
+            wanted[lang] = caption
+    if not wanted:
+        return []
+
+    label = episode_key(tmdb_id, season, episode)
+    target_dir = os.path.join(
+        episode_dir(tmdb_id, season, episode, year), SUBS_SUBDIR
+    )
+    saved = []
+    for lang, caption in wanted.items():
+        try:
+            fetched = _fetch_caption_text(caption)
+            if not fetched:
+                continue
+            text, source_format = fetched
+            # 无论源格式是哪一种，都补齐另一种：vtt 供浏览器原生 <track>，
+            # srt 供本地播放器。
+            variants = {}
+            if source_format == "srt":
+                variants["srt"] = text
+                variants["vtt"] = srt_to_vtt(text)
+            else:
+                variants["vtt"] = text
+                variants["srt"] = vtt_to_srt(text)
+            # 目录推迟到真拿到内容才建，避免留下一堆空 subs/。
+            os.makedirs(target_dir, exist_ok=True)
+            for fmt in SUBTITLE_FORMATS:
+                content = variants.get(fmt)
+                if not content or not content.strip():
+                    continue
+                path = os.path.join(target_dir, f"{lang}.{fmt}")
+                with open(path, "w", encoding="utf-8", newline="") as fh:
+                    fh.write(content)
+                saved.append(f"{SUBS_SUBDIR}/{lang}.{fmt}")
+        except Exception as exc:  # noqa: BLE001 - 字幕失败绝不影响整集
+            print(f"  [{label}] ⚠️ 字幕 {lang} 获取失败（已跳过）: {exc}",
+                  flush=True)
+    if saved:
+        print(f"  [{label}] 已保存字幕: {', '.join(saved)}", flush=True)
+    return saved
+
+
+def build_meta(entry, success_info, subtitle_files=None):
     """组装 meta.json 的内容：取流侧已有的元数据 + 本次实测的技术参数。
 
     全部字段都来自已有数据，不发起任何额外网络请求。
-    subtitles 恒为空列表：字幕由 fetch_subtitles.py 事后补抓并就地更新该字段。
+    subtitles 填的是本次下载顺手抓到的内嵌字幕；没抓到时为空列表，
+    由 fetch_subtitles.py 事后从 SubDL 补抓并就地更新该字段。
     """
     tmdb_id = success_info.get("tmdbId")
     season = success_info.get("season")
@@ -1923,7 +2101,12 @@ def build_meta(entry, success_info):
             "bitrateKbps": success_info.get("bitrate_kbps"),
             "missingSegmentCount": success_info.get("missing_segment_count"),
         },
-        "subtitles": [],
+        "subtitles": [
+            {"language": os.path.basename(path).rsplit(".", 1)[0],
+             "format": path.rsplit(".", 1)[-1],
+             "path": path}
+            for path in (subtitle_files or [])
+        ],
         "generatedAt": int(time.time()),
     }
 
@@ -1946,13 +2129,13 @@ def save_meta(tmdb_id, season, episode, year, meta):
 
 
 def collect_sidecar_assets(success_info):
-    """列出该集的旁车资产相对路径（相对集目录），如 ["meta.json"]。
+    """列出该集的旁车资产相对路径（相对集目录），如 ["subs/en.vtt", "meta.json"]。
 
-    优先用 success_info 里记录的标记；缺失时（如 pending 记录来自旧版本）回退
+    优先用 success_info 里记录的清单；缺失时（如 pending 记录来自旧版本）回退
     为扫描集目录 —— reupload 补传时 success_info 可能只是一条 pending 记录，
-    没有 has_meta 字段，此时必须能自己发现资产，否则补传会漏掉。
+    没有 subtitle_files/has_meta 字段，此时必须能自己发现资产，否则补传会漏掉。
     """
-    assets = []
+    assets = list(success_info.get("subtitle_files") or [])
     if success_info.get("has_meta"):
         assets.append("meta.json")
     if assets:
@@ -2175,6 +2358,11 @@ def parse_resolution(resolution):
         return None
 
 
+# 模式 B 下探测不到分辨率时的占位文案。此时分辨率只是成品元数据、不参与判定，
+# 如实标注"未知"即可，不该因为探不到就丢掉一集已经下完的正片。
+UNKNOWN_RESOLUTION = "未知分辨率"
+
+
 def probe_resolution(sample_path):
     """用 ffprobe 读取采样文件的真实分辨率，失败返回 None。"""
     command = [
@@ -2251,16 +2439,27 @@ def normalize_codec(codec):
 
 
 def bitrate_threshold(height, codec):
-    """单一码率曲线：按“该流自身实测高度 height”平方缩放并乘 LENIENCY。
+    """码率门槛（kbps）。分辨率判定开关决定要不要按高度缩放。
 
-    门槛 = 基准[codec] × (height / 1080)² × LENIENCY
-    - height 用每个流自己的实测高度，不是红线（高分辨率流按自身高度算，
-      调低红线时也不会集体免检进伪高清）。
-    - codec 无法识别/探测失败时回退 H.264 基准（最严），依赖多轮重采样再探。
-    - 码率需求 ∝ 像素数 ∝ 高度²，故用平方缩放而非线性。
+    RESOLUTION_CHECK_ENABLED=True（模式 A）——单一码率曲线：
+        门槛 = 基准[codec] × (height / 1080)² × LENIENCY
+      - height 用每个流自己的实测高度，不是红线（高分辨率流按自身高度算，
+        调低红线时也不会集体免检进伪高清）。
+      - 码率需求 ∝ 像素数 ∝ 高度²，故用平方缩放而非线性。
+
+    RESOLUTION_CHECK_ENABLED=False（模式 B，默认）——与分辨率无关的绝对线：
+        门槛 = 基准[codec] × LENIENCY
+      此时 height 参数被完全忽略（保留在签名里是为了两条分支调用点一致）。
+      去掉缩放是"只按码率判断"的必要条件：留着 (h/1080)² 等于让分辨率继续
+      隐式参与——480p 门槛会被缩到约五分之一，低清片反而更好过关。
+
+    两分支共同点：codec 无法识别/探测失败时回退 H.264 基准（最严）；
+    都乘 LENIENCY，故"整体调松/调严"始终只改 leniency 一处。
     """
     key = normalize_codec(codec)
     baseline = BITRATE_BASELINE.get(key, BITRATE_BASELINE["h264"])
+    if not RESOLUTION_CHECK_ENABLED:
+        return baseline * LENIENCY
     scale = (height / _BITRATE_BASELINE_HEIGHT) ** 2
     return baseline * scale * LENIENCY
 
@@ -2268,9 +2467,38 @@ def bitrate_threshold(height, codec):
 def meets_resolution_redline(height):
     """分辨率红线（带 LENIENCY 容差）：实测高度 ≥ 红线×宽松系数 即过关。
 
-    容差用于救回准红线片（如红线 1080 时的 1072/900），避免差几像素被一刀切。
+    容差用于救回准红线集（如红线 1080 时的 1072/900），避免差几像素被一刀切。
+
+    分辨率判定关闭时恒真——把开关收敛在这一个函数里，三处红线关卡
+    （mp4 声明预检 / mp4 样本预检 / mp4 实测复检 / m3u8 流层）与 master 候选
+    过滤都会自动放行，无需在每个调用点各写一次 if，也就不会漏掉某一处。
     """
+    if not RESOLUTION_CHECK_ENABLED:
+        return True
     return height >= MIN_RESOLUTION_HEIGHT * LENIENCY
+
+
+def bitrate_reject_message(resolution, codec_label, bitrate, min_bitrate):
+    """码率不达标的淘汰文案。分辨率在两种模式下的地位不同，措辞也要跟着变。
+
+    模式 A：分辨率是判定标准之一，写在前面合理。
+    模式 B：分辨率**根本没参与判定**，若仍以"分辨率 854x480 流…"开头，日后翻
+    failed.jsonl 会误以为是分辨率把这一集卡掉的，从而对着一个不生效的
+    min_resolution_height 反复调参。故降级为括号里的附带信息。
+
+    ⚠️ 两种措辞都必须保留 `码率未达到门槛` 这段 —— `_PERMANENT_FAILURE_MARKERS`、
+    `_REJECT_REASON_RULES` 与 `_DEAD_BITRATE_RE` 都靠它工作，历史 failed.jsonl
+    也按它归类。
+    """
+    if RESOLUTION_CHECK_ENABLED:
+        return (
+            f"分辨率 {resolution} 流（{codec_label}）"
+            f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+        )
+    return (
+        f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+        f"（{codec_label}，实测 {resolution}）"
+    )
 
 
 # ---------- 分片下载 ----------
@@ -2871,9 +3099,10 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
             pre_min_bitrate = bitrate_threshold(pre_height, pre_codec)
             if pre_bitrate < pre_min_bitrate:
                 raise QualityRejectedError(
-                    f"分辨率 {pre_resolution} 流（{pre_codec or 'unknown'}）"
-                    f"码率未达到门槛：{pre_bitrate:.0f} kbps"
-                    f" < {pre_min_bitrate:.0f} kbps"
+                    bitrate_reject_message(
+                        pre_resolution, pre_codec or "unknown",
+                        pre_bitrate, pre_min_bitrate,
+                    )
                 )
 
     # 不做断点续传：节点失败时上层会删掉残留 ts，启动时也会清理 temp_*，
@@ -2948,10 +3177,18 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
         raise RuntimeError(f"直链下载长度不符：{written} != {total_size}")
 
     actual_size = probe_resolution(output_path)
-    if not actual_size:
+    if not actual_size and RESOLUTION_CHECK_ENABLED:
+        # 模式 A：分辨率是判定标准，探不到就无从判断，只能判失败重下。
         raise RuntimeError("采样探测分辨率失败（可重试）")
-    resolution = f"{actual_size[0]}x{actual_size[1]}"
-    height = actual_size[1]
+    # 模式 B（默认，只看码率）：整片**已经下完了**，此时仅因探不到分辨率就丢弃
+    # 它是纯粹的误杀——分辨率根本不参与判定，height 只会被 bitrate_threshold
+    # 忽略。继续用码率判定即可；分辨率降级为成品元数据，未知就如实标注。
+    if actual_size:
+        resolution = f"{actual_size[0]}x{actual_size[1]}"
+        height = actual_size[1]
+    else:
+        resolution = UNKNOWN_RESOLUTION
+        height = 0
     print(f"  [{label}] 直链实测分辨率: {resolution}")
     if not meets_resolution_redline(height):
         raise QualityRejectedError(
@@ -2975,8 +3212,7 @@ def _download_mp4_direct(node, output_path, label, runtime_minutes=None):
     )
     if bitrate < min_bitrate:
         raise QualityRejectedError(
-            f"分辨率 {resolution} 流（{codec_label}）"
-            f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+            bitrate_reject_message(resolution, codec_label, bitrate, min_bitrate)
         )
     return resolution, bitrate
 
@@ -3066,6 +3302,8 @@ def process_one_entry(entry, processed_ids):
                 "resolution": resolution,
                 "missing_segment_count": 0,
                 "missing_segment_indices": [],
+                # 取流侧带回的内嵌字幕，转封装成功后由 save_subtitles 落盘。
+                "captions": entry.get("captions"),
             }
             print(
                 f"  [{label}] 直链下载完成，已释放下载槽位并进入转封装队列",
@@ -3086,27 +3324,38 @@ def process_one_entry(entry, processed_ids):
             (resolution, playlist_url, bandwidth, parse_resolution(resolution))
             for resolution, playlist_url, bandwidth in variants
         ]
-        # 已声明分辨率且低于红线（含容差）的流直接排除，不必浪费采样流量。
-        # 未声明分辨率的流保留，等采样后用 ffprobe 探测真实高度再判。
+        # 模式 A：已声明分辨率且低于红线（含容差）的流直接排除，不必浪费采样流量。
+        #   未声明分辨率的流保留，等采样后用 ffprobe 探测真实高度再判。
+        # 模式 B：meets_resolution_redline 恒真 → 全部保留，候选一条不筛。
+        #   这是对的：低码率流要靠**实测采样码率**才能判，声明分辨率说明不了问题
+        #   （480p 也可能是高码率的清晰流）。代价是多采样几条流，但不会误杀。
         candidates = [
             item
             for item in annotated
             if item[3] is None or meets_resolution_redline(item[3][1])
         ]
         if not candidates:
+            # 仅模式 A 可能走到：模式 B 下上面的过滤恒为全保留，variants 非空则
+            # candidates 必非空（variants 为空已在前面单独报错）。故文案只按
+            # 模式 A 的语义写即可。
             raise QualityRejectedError(
                 f"没有找到高度达标（≥ {MIN_RESOLUTION_HEIGHT}×{LENIENCY:.2f}）的流"
             )
 
         # 预排序：先试声明高度更高的流，同高度试声明 BANDWIDTH 更高的。
         # 未声明分辨率（item[3] is None）用 -1 排最后，等采样后 ffprobe 探测再定夺。
-        candidates.sort(
-            key=lambda item: (
-                item[3][1] if item[3] else -1,
-                item[2],
-            ),
-            reverse=True,
-        )
+        # 模式 B 下分辨率不参与判定，改为纯按声明 BANDWIDTH 降序——此时择优只比
+        # 码率，高声明带宽的流最可能先胜出，先试它才能让下面的提前终止真正省下采样。
+        if RESOLUTION_CHECK_ENABLED:
+            candidates.sort(
+                key=lambda item: (
+                    item[3][1] if item[3] else -1,
+                    item[2],
+                ),
+                reverse=True,
+            )
+        else:
+            candidates.sort(key=lambda item: item[2], reverse=True)
 
         best_height = -1
         best_bitrate = 0.0
@@ -3127,15 +3376,30 @@ def process_one_entry(entry, processed_ids):
         stream_needs_refetch = False
 
         for resolution, playlist_url, _declared_bandwidth, size in candidates:
-            # 候选已按声明高度降序排列。走到"声明高度严格低于已选中流"的候选时，
-            # 它即便采样也必然落选：有声明分辨率的流下面直接采信声明值（不做
-            # ffprobe），而择优是"高度绝对优先、同高度才比码率"，height <
-            # best_height 时 better 恒为 false。故这里跳过纯属浪费的采样。
-            # 只跳过"有声明高度且严格更低"的：同高度的仍要比码率，未声明分辨率
-            # 的（size is None，排在末尾）仍要采样后 ffprobe 探测真实高度。
+            # 【提前终止采样】候选已按声明高度降序排列。走到"声明高度严格低于已
+            # 选中流"的候选时，它即便采样也必然落选：有声明分辨率的流下面直接
+            # 采信声明值（不做 ffprobe），而择优是"高度绝对优先、同高度才比码率"，
+            # height < best_height 时 better 恒为 false。故这里跳过纯属浪费的采样。
             # 一个 master 常有 1080/720/480/360 四档，1080 命中后可省下三次
             # "解析 media playlist + 下载 10 个分片 + 两次 ffprobe"。
-            if size is not None and best_selected and size[1] < best_height:
+            #
+            # 四个合取项缺一不可：
+            #   RESOLUTION_CHECK_ENABLED —— 本剪枝的正确性完全建立在"择优按高度
+            #     绝对优先"之上。模式 B 下择优改成纯比码率，而声明高度低不代表
+            #     实测码率低，此时剪枝会真的丢掉更优的流。声明 BANDWIDTH 也不能
+            #     拿来剪枝：它是源站声明的峰值带宽，与我们实测的采样码率口径不同，
+            #     据此跳过同样会误剪。故模式 B 下老老实实全部采样。
+            #   size is not None —— 未声明分辨率的流排在末尾，真实高度未知，
+            #     必须采样后 ffprobe，跳过会丢画质；
+            #   best_selected —— 只有真正选中过某流才生效，否则最高档瞬时抖动
+            #     挂掉后整集会因"无一入选"白白失败，直接损失成功率；
+            #   严格小于 —— 同高度的仍要采样比码率。
+            if (
+                RESOLUTION_CHECK_ENABLED
+                and size is not None
+                and best_selected
+                and size[1] < best_height
+            ):
                 print(f"  跳过流 {resolution}：声明高度低于已选中的 {best_resolution}")
                 continue
             print(f"  检测流 {resolution}: {playlist_url}")
@@ -3192,15 +3456,21 @@ def process_one_entry(entry, processed_ids):
                 actual_resolution = resolution
                 if actual_size is None:
                     actual_size = probe_resolution(sample_path)
-                    if actual_size is None:
+                    if actual_size is None and RESOLUTION_CHECK_ENABLED:
+                        # 模式 A：分辨率是判定标准，探不到就无从判断。
                         # 探测失败常是采样片本次没下全/损坏（瞬时抖动），
                         # 不是真无高清流 → 判可重试，下一轮重采样有机会救回。
                         raise RuntimeError("采样探测分辨率失败（可重试）")
-                    actual_resolution = f"{actual_size[0]}x{actual_size[1]}"
+                    if actual_size is None:
+                        # 模式 B：分辨率不参与判定，采样已经下好了、码率照样算得出，
+                        # 仅因探不到分辨率就丢弃这条流是纯粹的误杀。
+                        actual_resolution = UNKNOWN_RESOLUTION
+                    else:
+                        actual_resolution = f"{actual_size[0]}x{actual_size[1]}"
                     print(f"  流 {resolution} 实测分辨率: {actual_resolution}")
 
-                height = actual_size[1]
-                # 第 1 关 · 分辨率红线（带 LENIENCY 容差）。
+                height = actual_size[1] if actual_size else 0
+                # 第 1 关 · 分辨率红线（带 LENIENCY 容差）。模式 B 下恒真。
                 if not meets_resolution_redline(height):
                     raise QualityRejectedError(
                         f"分辨率 {actual_resolution} 低于红线 "
@@ -3212,8 +3482,8 @@ def process_one_entry(entry, processed_ids):
                 bitrate = media_bytes * 8 / sample_duration / 1000
                 print(f"  流 {actual_resolution} 采样码率: {bitrate:.0f} kbps")
 
-                # 第 2 关 · 码率曲线：门槛按“该流自身高度”平方缩放并乘 LENIENCY，
-                # 每个流一律按自身高度档卡码率（无免码率线）。探测不到编码回退 H.264 基准。
+                # 第 2 关 · 码率门槛。模式 A 按"该流自身高度"平方缩放并乘 LENIENCY；
+                # 模式 B 用不缩放的绝对线。探测不到编码回退 H.264 基准（最严）。
                 codec = probe_codec(sample_path)
                 min_bitrate = bitrate_threshold(height, codec)
                 codec_label = codec or "unknown"
@@ -3223,15 +3493,21 @@ def process_one_entry(entry, processed_ids):
                 )
                 if bitrate < min_bitrate:
                     raise QualityRejectedError(
-                        f"分辨率 {actual_resolution} 流（{codec_label}）"
-                        f"码率未达到门槛：{bitrate:.0f} kbps < {min_bitrate:.0f} kbps"
+                        bitrate_reject_message(
+                            actual_resolution, codec_label, bitrate, min_bitrate
+                        )
                     )
 
-                # 择优：分辨率（实测高度）绝对优先，高度完全相同再比采样码率。
-                # 用实测高度而非粗档 tier，任意分辨率都能精确区分，降档也不退化。
-                better = height > best_height or (
-                    height == best_height and bitrate > best_bitrate
-                )
+                # 择优：模式 A 下实测高度绝对优先、高度完全相同再比采样码率
+                # （用实测高度而非粗档 tier，任意分辨率都能精确区分，降档也不退化）；
+                # 模式 B 下纯比采样码率——既然高度不再是画质标准，就不该拿它决定
+                # "多条合格流选哪条"，否则等于分辨率仍在暗中主导。
+                if RESOLUTION_CHECK_ENABLED:
+                    better = height > best_height or (
+                        height == best_height and bitrate > best_bitrate
+                    )
+                else:
+                    better = bitrate > best_bitrate
                 if better:
                     best_height = height
                     best_bitrate = bitrate
@@ -3369,6 +3645,8 @@ def process_one_entry(entry, processed_ids):
             "resolution": best_resolution,
             "missing_segment_count": len(failed_segment_indices),
             "missing_segment_indices": failed_segment_indices,
+            # 取流侧带回的内嵌字幕，转封装成功后由 save_subtitles 落盘。
+            "captions": entry.get("captions"),
         }
         print(
             f"  [{label}] 分片下载完成，已释放下载槽位并进入转封装队列",
@@ -3571,11 +3849,27 @@ def finalize_one_entry(conversion_job, processed_ids):
             ],
         }
 
+        # 内嵌字幕：成品已落地才抓，抓不到不影响整集。
+        # save_subtitles 内部已逐条吞异常，但 episode_dir 等仍可能抛，故再兜一层。
+        subtitle_files = []
+        try:
+            subtitle_files = save_subtitles(
+                tmdb_id, season, episode, year,
+                conversion_job.get("captions"),
+            )
+        except Exception as exc:  # noqa: BLE001 - 双重兜底
+            print(f"  [{normalized_id}] ⚠️ 字幕阶段异常（已跳过）: {exc}",
+                  flush=True)
+        success_info["subtitle_files"] = subtitle_files
+
         # save_meta 内部已吞异常，但 build_meta 仍可能因脏 entry 抛错，故整段再兜一层。
         try:
             if save_meta(
                 tmdb_id, season, episode, year,
-                build_meta(conversion_job.get("entry") or {}, success_info),
+                build_meta(
+                    conversion_job.get("entry") or {}, success_info,
+                    subtitle_files,
+                ),
             ):
                 success_info["has_meta"] = True
         except Exception as exc:  # noqa: BLE001 - 双重兜底
@@ -3789,6 +4083,8 @@ def refetch_entries(entries, refetch_counts):
                 new_entry = dict(entry)
                 new_entry["urls"] = result["urls"]
                 new_entry["fetched_at"] = result.get("fetched_at")
+                # 字幕地址跟旧 urls 一起作废，必须同步刷新（没给就置空）。
+                new_entry["captions"] = result.get("captions") or []
                 revived.append(new_entry)
                 print(
                     f"  [重取成功] {key}: {len(result['urls'])} 个新节点",
@@ -3796,12 +4092,22 @@ def refetch_entries(entries, refetch_counts):
                 )
         except TimeoutError:
             # 超时只是"本次不再等"，不是"作废"：仍在跑的 future 已经把请求发
-            # 出去了，跑完若成功也不会落盘（我们不再收结果）——但那批集本来
-            # 就会沿用旧链接照常下载，不构成损失。
+            # 出去了，那批集本轮沿用旧链接照常下载，不构成损失。
+            # 但它们跑完若成功，结果不该白扔——挂回调把新链接落盘，
+            # 让"跨运行重试"接力（下次启动按 fetched_at 择新直接用上）。
             done = len(revived)
+            late = 0
+            for future, (key, _entry) in future_to_item.items():
+                if future.done():
+                    continue
+                future.add_done_callback(
+                    functools.partial(_persist_late_refetch, key)
+                )
+                late += 1
             print(
                 f"⚠️ 重取超过 {AUTO_REFETCH_TIMEOUT}s，已收下 {done} 集，"
-                f"其余放弃等待（沿用原直链，不影响本次下载）。",
+                f"其余 {late} 集放弃等待（沿用原直链，不影响本次下载；"
+                f"若稍后取回成功会落盘供下次运行使用）。",
                 flush=True,
             )
     finally:
@@ -3809,6 +4115,35 @@ def refetch_entries(entries, refetch_counts):
         # 而主流程不该为此干等。cancel_futures 砍掉尚未开跑的。
         executor.shutdown(wait=False, cancel_futures=True)
     return revived
+
+
+def _persist_late_refetch(key, future):
+    """refetch_entries 超时后才跑完的重取：成功则落盘 INPUT_JSONL，供下次运行使用。
+
+    在 executor 的 worker 线程里执行（或被 cancel 时在主线程）。本轮主循环早已
+    离开 refetch_entries，这里不能再往 revived 里塞，唯一能做的就是把新链接
+    持久化，让"跨运行重试"接力。任何异常都不能逃逸——回调里抛错只会被
+    concurrent.futures 吞掉记日志，但没必要留这种噪音。
+    """
+    try:
+        if future.cancelled():
+            return
+        try:
+            status, result = future.result()
+        except (Exception, SystemExit) as exc:
+            print(f"  [重取失败·迟到] {key}: {exc}", flush=True)
+            return
+        if status != "ok" or not result or not result.get("urls"):
+            print(f"  [重取无果·迟到] {key}: {status}", flush=True)
+            return
+        write_log(INPUT_JSONL, result)
+        print(
+            f"  [重取成功·迟到] {key}: {len(result['urls'])} 个新节点已落盘，"
+            f"下次运行可用",
+            flush=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [重取迟到落盘异常] {key}: {exc}", flush=True)
 
 
 def merge_next_batch(round_failed_retriable, revived):
@@ -3832,6 +4167,112 @@ def merge_next_batch(round_failed_retriable, revived):
     return list(merged.values())
 
 
+def _select_stale_entries(entries, label="启动预检"):
+    """挑出本次要重取的陈旧条目（TV 侧三步筛选），返回 (待重取列表, 推迟数)。
+
+    同步预检（refresh_stale_entries）与异步预检（dispatch_stale_entries_async）
+    **共用同一套口径**——抽出来就是为了这个：两条路径若各写一遍，早晚会漏掉
+    画质判死跳过或限额其中一条，而那两条恰恰是 TV 侧规模下最省配额的部分。
+    """
+    now = time.time()
+    stale = [entry for entry in entries if is_stale_entry(entry, now)]
+    if not stale:
+        return [], 0
+
+    # ① 跳过"上次因画质不达标判死"的集：重取回来还是同样不达标，白烧配额。
+    #    TV 侧有源率个位数，这类集在失败总量里占比很高。
+    quality_dead = load_quality_dead_keys()
+    if quality_dead:
+        before = len(stale)
+        stale = [
+            entry for entry in stale
+            if (record_episode_key(entry) or "") not in quality_dead
+        ]
+        skipped = before - len(stale)
+        if skipped:
+            print(
+                f"[{label}] 跳过 {skipped} 集上次因画质不达标判死的"
+                f"（重取回来仍不达标，省下取流配额）",
+                flush=True,
+            )
+        if not stale:
+            return [], 0
+
+    # ② 限额 + 最旧优先。TV 全量下 stale 可达几万到十几万集，一次性全投会让
+    #    绝大多数集排队到总超时被丢弃（且它们的 refetch_counts 不会 +1，
+    #    下次运行又从头再来，队尾永远轮不到）。按 fetched_at 升序截断：
+    #    最旧的直链最可能已经过期，优先换它们。
+    deferred = 0
+    if AUTO_REFETCH_MAX_PER_RUN and len(stale) > AUTO_REFETCH_MAX_PER_RUN:
+        # 无 fetched_at 的不会出现在这里（is_stale_entry 已把它们判为不陈旧）。
+        stale.sort(key=lambda e: parse_int(e.get("fetched_at")) or 0)
+        deferred = len(stale) - AUTO_REFETCH_MAX_PER_RUN
+        stale = stale[:AUTO_REFETCH_MAX_PER_RUN]
+    return stale, deferred
+
+
+def dispatch_stale_entries_async(entries, refetch_counts):
+    """pipeline 模式的启动预检：把陈旧条目**非阻塞**地投给 async_refetch_hook。
+
+    与 refresh_stale_entries 同一目的、不同手段：pipeline 的前提是主循环一步
+    都不阻塞，故不能同步等新链接回来。改为只投递、立即返回——旧链接照常进
+    首轮（它未必真失效），新链接由首轮来源（QueueEntrySource）随到随投：若对应
+    的旧存量条目还没发出则就地替换掉它，已发出/在下则等它离开处理态再投；
+    即使本次运行没赶上消费，AsyncRefetcher 也已把结果追加进 INPUT_JSONL，
+    下次运行按 fetched_at 择新直接用上。
+
+    🔑 为什么 pipeline 模式必须有这条路（TV 侧比电影侧更要命）：
+    取流侧的 load_processed 只补 results.jsonl 里**没有**的集，不会主动给
+    已成功的集换链接。没有这条预检，backlog（断点续跑存量）里的集每次运行都
+    拿同一条旧 url 重投 —— 而 §0.0 ③ 要跑很多天，第 1 天的直链到第 10 天
+    早已过期，那批集会每次运行都判一遍"需重新取流"然后什么也不做，永久卡死。
+
+    投递计入 refetch_counts（每集重取上限跨预检与轮次共用）。返回投递数。
+    """
+    hook = async_refetch_hook
+    if (
+        hook is None or not entries
+        or STALE_LINK_SECONDS <= 0 or not AUTO_REFETCH_ENABLED
+    ):
+        return 0
+
+    stale, deferred = _select_stale_entries(entries)
+    to_dispatch = []
+    for entry in stale:
+        key = record_episode_key(entry)
+        if not key:
+            continue
+        if refetch_counts.get(key, 0) >= AUTO_REFETCH_MAX_PER_EPISODE:
+            continue
+        refetch_counts[key] = refetch_counts.get(key, 0) + 1
+        to_dispatch.append(entry)
+    if not to_dispatch:
+        return 0
+
+    try:
+        hook.dispatch(to_dispatch)
+    except Exception as exc:  # noqa: BLE001
+        # 预检是锦上添花：投不出去就沿用旧链接，绝不影响首轮下载。
+        print(f"⚠️ 启动预检投递失败，沿用原直链继续: {exc}", flush=True)
+        return 0
+
+    hours = STALE_LINK_SECONDS / 3600
+    print(
+        f"\n[启动预检] {len(to_dispatch)}/{len(entries)} 集的直链已超过 "
+        f"{hours:.0f} 小时，已交给取流线程异步换新（不阻塞首轮下载；"
+        f"旧链接照常先试，新链接回收后随到随投或留待下次运行）。",
+        flush=True,
+    )
+    if deferred:
+        print(
+            f"[启动预检] 另有 {deferred} 集也已陈旧，本次不处理"
+            f"（单次上限 {AUTO_REFETCH_MAX_PER_RUN} 集，按最旧优先）；"
+            f"它们照常用原直链下载，下次运行会优先轮到。",
+            flush=True,
+        )
+    return len(to_dispatch)
+
+
 def refresh_stale_entries(entries, refetch_counts):
     """启动时把陈旧条目换成新直链，返回替换后的完整列表（顺序不变）。
 
@@ -3846,41 +4287,10 @@ def refresh_stale_entries(entries, refetch_counts):
     if not entries or STALE_LINK_SECONDS <= 0 or not AUTO_REFETCH_ENABLED:
         return entries
 
-    now = time.time()
-    stale = [entry for entry in entries if is_stale_entry(entry, now)]
+    # 筛选口径与异步预检完全一致（画质判死跳过 + 限额 + 最旧优先），见该函数。
+    stale, deferred = _select_stale_entries(entries)
     if not stale:
         return entries
-
-    # ① 跳过"上次因画质不达标判死"的集：重取回来还是同样不达标，白烧配额。
-    #    TV 侧有源率个位数，这类集在失败总量里占比很高（电影侧为此专门建了
-    #    download_dead.jsonl 账本，这里用 failed.jsonl 做等效的轻量实现）。
-    quality_dead = load_quality_dead_keys()
-    if quality_dead:
-        before = len(stale)
-        stale = [
-            entry for entry in stale
-            if (record_episode_key(entry) or "") not in quality_dead
-        ]
-        skipped = before - len(stale)
-        if skipped:
-            print(
-                f"[启动预检] 跳过 {skipped} 集上次因画质不达标判死的"
-                f"（重取回来仍不达标，省下取流配额）",
-                flush=True,
-            )
-        if not stale:
-            return entries
-
-    # ② 限额 + 最旧优先。TV 全量下 stale 可达几万到十几万集，一次性全投会让
-    #    绝大多数集排队到总超时被丢弃（且它们的 refetch_counts 不会 +1，
-    #    下次运行又从头再来，队尾永远轮不到）。按 fetched_at 升序截断：
-    #    最旧的直链最可能已经过期，优先换它们。
-    deferred = 0
-    if AUTO_REFETCH_MAX_PER_RUN and len(stale) > AUTO_REFETCH_MAX_PER_RUN:
-        # 无 fetched_at 的不会出现在这里（is_stale_entry 已把它们判为不陈旧）。
-        stale.sort(key=lambda e: parse_int(e.get("fetched_at")) or 0)
-        deferred = len(stale) - AUTO_REFETCH_MAX_PER_RUN
-        stale = stale[:AUTO_REFETCH_MAX_PER_RUN]
 
     hours = STALE_LINK_SECONDS / 3600
     print(
@@ -4104,6 +4514,29 @@ def main():
         if monitor_thread is not None:
             monitor_thread.join(timeout=DISK_CHECK_INTERVAL + 1)
         release_main_lock()
+
+    # 收尾自动补传：上传槽位超时降级留下的成品躺在 upload_pending.jsonl 里，
+    # 不会被任何后续轮次处理，只能靠人跑 `download_tv.py reupload`。此时
+    # R2 往往已经恢复，自动补一次能省掉这次人工介入。
+    #
+    # ⚠️ 位置有四个讲究，都不能改：
+    #   ① 在 release_main_lock() **之后** —— reupload_pending 内部有
+    #      is_main_running() 跨进程守卫，锁还没释放会把自己挡掉、静默什么也不做；
+    #   ② 在 finally **之外**（正常路径上）—— 被中断/异常退出时不补传，
+    #      此刻状态未知，且用户正想让它停下，不该再发起一批上传；
+    #   ③ 在 compact_failed_log() **之前** —— 补传成功会删掉 stage=="upload"
+    #      的失败行，先补传再轮转，归档的才是最终态；
+    #   ④ `except (Exception, SystemExit)` 兜住 —— 收尾动作失败不该把一次
+    #      已经跑完的运行判成失败退出。但**必须放过 KeyboardInterrupt**。
+    if AUTO_REUPLOAD_ENABLED and S3_ENABLED:
+        print("\n===== 收尾自动补传 =====", flush=True)
+        try:
+            reupload_pending()
+        except (Exception, SystemExit) as exc:
+            # 补传失败不影响主流程的成功结论：成品仍在本地且 pending 记录还在，
+            # 随时可以手动 reupload。
+            print(f"⚠️ 自动补传异常，成品仍留本地待手动 reupload: {exc}",
+                  flush=True)
 
     # failed.jsonl 轮转：纯追加的它在全量跑时会涨到让每次启动的
     # load_quality_dead_keys() 全量顺扫都变慢。
@@ -4385,9 +4818,48 @@ def _run_pipeline():
             if should_retry and round_failed_retriable is not None:
                 round_failed_retriable.append(entry)
             # 有节点的签名直链已过期：重投拿到的还是同一条、必然再挂，
-            # 必须换新 url 才有意义。攒到轮末统一重取。
+            # 必须换新 url 才有意义。
             if should_refetch and round_failed_expired is not None:
                 round_failed_expired.append(entry)
+                # pipeline 模式下**发现即投递**，不攒到轮末（§0.20）。
+                #
+                # 🔴 这条路径在 max_rounds=1 时是**唯一**的当次自愈机会：
+                # 轮末那条集中重取的判据是 has_more_rounds（round_no < MAX_ROUNDS），
+                # 单轮下恒假。首轮来源 QueueEntrySource 会随到随投，
+                # 新链接当轮就能下掉；攒到轮末则根本没有下一轮去消费它。
+                # 末轮且来源已不是队列时不投：拿到也没轮次用，白耗取流配额。
+                if (
+                    streaming
+                    and async_refetch_hook is not None
+                    and AUTO_REFETCH_ENABLED
+                    and (round_no == 1 or round_no < MAX_ROUNDS)
+                ):
+                    key = record_episode_key(entry)
+                    used = (
+                        refetch_counts.get(key, 0) if key
+                        else AUTO_REFETCH_MAX_PER_EPISODE
+                    )
+                    if key and used < AUTO_REFETCH_MAX_PER_EPISODE:
+                        try:
+                            accepted = async_refetch_hook.dispatch([entry])
+                            if accepted is not None and accepted <= 0:
+                                # 该集的重取仍在途（多半是预检投的那次还没回来），
+                                # 钩子已合并，不重复计额度。
+                                print(
+                                    "  → 直链过期，该集重取仍在途，合并等待结果",
+                                    flush=True,
+                                )
+                            else:
+                                refetch_counts[key] = used + 1
+                                print(
+                                    f"  → 直链过期，已即刻投递异步重取"
+                                    f"（第 {used + 1}/"
+                                    f"{AUTO_REFETCH_MAX_PER_EPISODE} 次）",
+                                    flush=True,
+                                )
+                        except Exception as exc:  # noqa: BLE001
+                            # 投递失败不影响本集的失败结论，轮末/下次运行还有退路。
+                            print(f"⚠️ 异步重取投递失败: {exc}", flush=True)
 
         elif stage == "conversion":
             entry = conversion_future_to_entry.pop(future)
@@ -4518,17 +4990,24 @@ def _run_pipeline():
         # 每集被就地重取过几次（集级 key → 次数），跨预检与后续轮次共用同一本账，
         # 防"取流-过期-重取"反复空转。
         refetch_counts = {}
-        # 陈旧直链启动预检：只对**非流式**（单独跑 download_tv.py）生效。
+        # 陈旧直链启动预检：两条路径按运行模式分流，**都不会被跳过**。
         #
-        # ⚠️ pipeline 模式刻意不做：它的整个前提是"主循环一步都不阻塞"，而
-        # refetch_entries 是同步的，最长能堵住 AUTO_REFETCH_TIMEOUT。此时取流
-        # 线程已经在灌队列，堵住主循环反而会让队列里的新鲜直链继续变旧——与本
-        # 预检的目的正相反。
-        # 而且 pipeline 模式下这个缺口本就小得多：取流与下载只隔几分钟，
-        # 真正会陈旧的只有 backlog（断点续跑存量）那一部分。
-        # 电影侧为此专门建了 AsyncRefetcher 走非阻塞投递，TV 侧待 §0.0 ③
-        # 全量重跑拿到数据后再评估是否需要，现在不预先设计。
-        if ListEntrySource is _ListEntrySource:
+        #   - 非流式（单独跑 download_tv.py）：同步 refresh_stale_entries，
+        #     换完新链接再开跑。此刻下载还没开始，堵一会儿无妨。
+        #   - pipeline 模式：异步 dispatch_stale_entries_async，只投递、
+        #     立即返回。因为 refetch_entries 是同步的、最长堵 AUTO_REFETCH_TIMEOUT，
+        #     而 pipeline 的整个前提是"主循环一步都不阻塞"——堵住它反而会让
+        #     队列里的新鲜直链继续变旧，与预检目的正相反。
+        #
+        # 🔴 2026-09-14（§0.20）之前这里只有非流式一条路，pipeline 模式**完全
+        #    不做预检**。那会造成死闭环：取流侧的 load_processed 跳过已成功的集、
+        #    不给它们换链接，而 backlog 里的旧 url 每次运行都原样重投一遍 ——
+        #    ③ 全量重跑要跑很多天，第 1 天的直链到第 10 天早已过期，
+        #    这批集会每次运行都判一遍"需重新取流"然后什么也不做，永久卡死。
+        streaming = ListEntrySource is not _ListEntrySource
+        if streaming:
+            dispatch_stale_entries_async(current_batch, refetch_counts)
+        else:
             current_batch = refresh_stale_entries(current_batch, refetch_counts)
         round_no = 1
         while True:
@@ -4654,21 +5133,102 @@ def _run_pipeline():
 
             # 本轮下载全部有结论，决定是否再来一轮。
             # 先处理"直链过期"桶：这批集重投同一条 url 必然再挂，必须换新 url。
-            # 放在 break 判断**之前**：即使本轮没有可重试失败（round_failed_retriable
-            # 为空）、按旧逻辑就要收尾了，只要有过期直链就仍值得重取一轮 ——
-            # 否则这些集要等下次运行的启动预检才轮得到，白白慢一整轮。
+            #
+            # 两条路径（互斥，由运行模式决定）：
+            #   - 异步（pipeline 模式）：过期集已在 handle_done_future 里
+            #     **发现即投递**。首轮来源 QueueEntrySource 随到随投、且在途
+            #     归零前不报 done，故首轮末这里通常无事可做；第 2 轮起来源是
+            #     list，不再直接消费重取结果，改由这里等一等再 collect()。
+            #   - 同步（只跑下载，无取流线程）：走原有的 refetch_entries 老路。
             revived = []
             has_more_rounds = round_no < MAX_ROUNDS
+            if async_refetch_hook is not None:
+                # 先收已完成的重取结果——它们是真正救回来的集，
+                # 与同步路径的 revived 等价，走同一套 merge_next_batch 合并。
+                try:
+                    revived = async_refetch_hook.collect()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"⚠️ 收取异步重取结果失败: {exc}", flush=True)
+                    revived = []
+
             if AUTO_REFETCH_ENABLED and round_failed_expired and has_more_rounds:
-                revived = refetch_entries(round_failed_expired, refetch_counts)
+                try:
+                    if async_refetch_hook is not None:
+                        if not streaming:
+                            # 装了钩子却不是流式来源（正常部署不会出现）：
+                            # 没人在轮中投递，退回轮末集中投递。次数上限仍由
+                            # 这里把关——钩子只负责投递，不认识 refetch_counts。
+                            to_dispatch = []
+                            for entry in round_failed_expired:
+                                key = record_episode_key(entry)
+                                if not key:
+                                    continue
+                                if refetch_counts.get(key, 0) >= AUTO_REFETCH_MAX_PER_EPISODE:
+                                    continue
+                                refetch_counts[key] = refetch_counts.get(key, 0) + 1
+                                to_dispatch.append(entry)
+                            if to_dispatch:
+                                async_refetch_hook.dispatch(to_dispatch)
+                                print(
+                                    f"\n[自动重取流] {len(to_dispatch)} 集因直链过期失败，"
+                                    f"已交给取流线程异步重取（不阻塞本轮下载）",
+                                    flush=True,
+                                )
+                        # 有在途就等一等再判 next_batch：dispatch 是异步的，
+                        # 立刻判会发现 next_batch 为空而 break，重取成功的新
+                        # 链接就没有任何轮次去消费。有上限、且在途清零就提前
+                        # 退出，不会白等满。
+                        if async_refetch_hook.pending_count() > 0:
+                            print(
+                                f"\n[自动重取流] 本轮 {len(round_failed_expired)} 集直链过期"
+                                f"已投异步重取，等待在途结果"
+                                f"（最多 {ASYNC_REFETCH_WAIT_SECONDS}s）...",
+                                flush=True,
+                            )
+                            deadline = time.time() + ASYNC_REFETCH_WAIT_SECONDS
+                            while time.time() < deadline:
+                                fresh = async_refetch_hook.collect()
+                                if fresh:
+                                    revived.extend(fresh)
+                                # 在途清零即可收工，无需等满。
+                                if async_refetch_hook.pending_count() == 0:
+                                    revived.extend(async_refetch_hook.collect())
+                                    break
+                                # 可打断：Ctrl+C 后不该再干等满。
+                                if interrupted.wait(1):
+                                    break
+                        if revived:
+                            print(
+                                f"[自动重取流] 收回 {len(revived)} 集新直链，并入下一轮",
+                                flush=True,
+                            )
+                    else:
+                        revived = refetch_entries(round_failed_expired, refetch_counts)
+                except (Exception, SystemExit) as exc:
+                    # 重取是尽力而为的捞回，绝不能让它崩掉整条流水线：
+                    # 失败就当作没救回，本轮其余结论照常生效。
+                    # 连 SystemExit 一起兜（取流侧模块级校验用的就是它），
+                    # 但放过 KeyboardInterrupt —— Ctrl+C 该中止整个流程。
+                    print(f"⚠️ 就地重取流异常，已跳过本轮重取: {exc}", flush=True)
+                    revived = []
             elif round_failed_expired and not has_more_rounds:
-                # 末轮不重取：拿到新链接也没有轮次去消费，白耗取流配额。
-                # 它们已落 failed.jsonl，下次运行的启动预检会接手。
-                print(
-                    f"\n本轮有 {len(round_failed_expired)} 集的直链已过期，"
-                    f"但已是末轮、不再重取（下次运行的启动预检会换新链接）。",
-                    flush=True,
-                )
+                # 末轮不再集中重取：拿到新链接也没有下一轮去消费。
+                # pipeline 模式下它们其实**已在本轮被即刻投递过**（见
+                # handle_done_future），新链接由首轮来源随到随投；
+                # 非流式模式下则留给下次运行的启动预检接手。
+                if async_refetch_hook is not None and streaming:
+                    print(
+                        f"\n本轮有 {len(round_failed_expired)} 集的直链已过期，"
+                        f"均已即刻投递异步重取（新链接随到随下；未赶上的已落盘 "
+                        f"results.jsonl，下次运行自动使用）。",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"\n本轮有 {len(round_failed_expired)} 集的直链已过期，"
+                        f"但已是末轮、不再重取（下次运行的启动预检会换新链接）。",
+                        flush=True,
+                    )
 
             next_batch = merge_next_batch(round_failed_retriable, revived)
             if not next_batch:
