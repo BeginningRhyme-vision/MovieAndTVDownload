@@ -795,6 +795,87 @@ def test_sampling_uses_tiered_retry_budget(sandbox, monkeypatch):
     assert budgets == [3, None]
 
 
+# ------------------------------------------------- 重试分层（L1 交给 L3）
+# 2026-09-14 与电影侧对齐。urllib3(L1) 原本 status_forcelist=(429,500,502,
+# 503,504) + status=2，会对 5xx **静默重试 2 次**且对上层完全透明——L3 打印
+# "分片 X 下载失败 (1/20)" 时底层其实已发了 3 个请求。单个采样分片最坏
+# 3(L3)×3(L1)=9 个请求，日志只显示 3 次。
+# 现在状态码重试全部收归 L3。这组用例锁死"职责转移而非取消重试"。
+
+
+def test_l1_does_not_retry_status_codes():
+    """L1 不得再对状态码重试——否则与 L3 叠乘且完全静默。
+
+    对 TV 侧还有一层额外代价：L1 的退避叫不醒（不响应 interrupted），
+    dead_streak_breaker 熔断与 Ctrl+C 都打不断它。
+    """
+    session = d.get_session()
+    retry = session.get_adapter("https://example.com").max_retries
+    assert tuple(retry.status_forcelist or ()) == (), \
+        "status_forcelist 必须为空，5xx/429 交给 L3"
+    assert retry.status == 0, "status 重试次数必须为 0"
+
+
+def test_l1_still_retries_connection_level():
+    """连接级/读取级重试要保留：socket 抖动在同一条连接上立即重试很划算，
+    且不像 5xx 那样会被上层重复覆盖。"""
+    session = d.get_session()
+    retry = session.get_adapter("https://example.com").max_retries
+    assert retry.connect == 2
+    assert retry.read == 2
+
+
+def test_l3_still_retries_502(monkeypatch):
+    """🔴 关键：502 的重试**没有消失**，只是从 L1 移到了 L3。
+
+    若 L3 也不重试，源站几秒级抽风会直接判掉整集——那才是真的降成功率。
+    """
+    calls = []
+
+    def flaky(method, url, **kw):
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("502 Server Error: Bad Gateway")
+        return b"\x47" + b"x" * 100      # 第 3 次成功
+
+    monkeypatch.setattr(d, "request_with_retry", flaky)
+    monkeypatch.setattr(d, "validate_segment_content", lambda c, u: None)
+
+    content = d.download_single_segment(
+        "https://x/seg.ts", 0, retry_max=5, delay=0.001
+    )
+    assert content is not None
+    assert len(calls) == 3, "L3 必须继续重试 502 直到成功"
+
+
+def test_sample_retry_budget_matches_movie_side():
+    """采样预算 5：L1 清空后一次循环只发 1 个请求，需靠循环次数补回容错。
+
+    改前的 3 是在 L1 会静默重试 2 次（一次循环 ≈ 3 个请求）的前提下定的，
+    现在那个前提没了，仍留 3 就成了"真的只试 3 次"，容错反而变弱。
+    5 × 1 = 5 个请求，仍低于改动前的 9。
+    """
+    assert d.SAMPLE_SEG_RETRY_MAX == 5
+    # 与正片预算保持分层，绝不能被拉平
+    assert d.SAMPLE_SEG_RETRY_MAX < d.SEG_RETRY_MAX
+
+
+def test_sample_retry_fallback_matches_config_default():
+    """🔴 代码里的兜底值必须与 config.yaml 的默认值一致。
+
+    上面那条用例读的是 config.yaml 的实际取值，**测不到 .get 的兜底参数**。
+    两者不一致时，谁没带配置文件跑就会拿到另一套行为，且悄无声息
+    （§0.18 已因同类问题吃过亏：配置与代码兜底各写各的）。
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(d)
+    match = re.search(r'_CFG\.get\("sample_seg_retry_max",\s*(\d+)\)', source)
+    assert match, "没找到 sample_seg_retry_max 的兜底取值"
+    assert int(match.group(1)) == 5, "代码兜底值必须与 config.yaml 保持一致"
+
+
 def test_variant_sampling_stops_after_higher_stream_wins(sandbox, monkeypatch):
     """选中 1080 后，声明高度更低的流不再采样。
 

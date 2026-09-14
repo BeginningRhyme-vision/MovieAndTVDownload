@@ -279,12 +279,14 @@ SEG_RETRY_DELAY = float(_CFG.get("seg_retry_delay", 1))
 # 四档候选流，这个损失要乘以集数。**它占死的是下载窗口，本可成功的集会被饿死**，
 # 直接触及"不得降低下载成功率"这根红线。
 #
-# 取 3 而非电影侧的 5：电影侧把 L1(urllib3) 的 status_forcelist 清空了，单次
-# 循环只发 1 个请求，故要靠循环次数补回容错；TV 侧 L1 仍保留 status_forcelist
-# （见 get_session），单次循环底下实际有 3 个请求，3 次循环 ≈ 9 个请求，
-# 与电影侧调整前等价，足以跨过源站几秒级抖动。
-# L3 退避 1+2+4 ≈ 7s，远低于正片那套（封顶 60s）。
-SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 3)))
+# 🔴 2026-09-14 由 3 提到 5，与电影侧对齐（同批把 L1 的 status_forcelist 清空）。
+# 改前的 3 是在 L1(urllib3) 仍会**静默重试 2 次**的前提下定的——那时单次循环
+# 底下实际有 3 个请求，3 次循环 ≈ 9 个请求。现在状态码重试已全部收归 L3
+# （见 get_session），一次循环就是 1 个请求，3 次就真的只试 3 次，对源站几秒级
+# 抖动的容错反而变弱、会压低成功率。提到 5 后：
+#   实际请求数 5 × 1 = 5 < 改动前的 9，**成本仍是降的**；
+#   L3 退避 1+2+4+8 ≈ 15s，足以跨过短抖动，又远低于正片那套（封顶 60s）。
+SAMPLE_SEG_RETRY_MAX = max(1, int(_CFG.get("sample_seg_retry_max", 5)))
 # 转封装(ffmpeg -c copy)单片超时(秒)：纯拷贝通常几十秒内完成，给足冗余防坏 TS
 # 让 ffmpeg 无限阻塞占死 convert worker。超时判失败(可重试)，不拖垮转封装池。
 CONVERT_TIMEOUT = int(_CFG.get("convert_timeout", 1800))
@@ -714,13 +716,37 @@ def get_session():
     """每个线程复用自己的 requests.Session。"""
     if not hasattr(_thread_local, "session"):
         session = requests.Session()
+        # ⚠️ 状态码重试**全部交给上层**（L3 分片层 / mp4 块层），这里只保留
+        # 连接级与读取级重试。2026-09-14 与电影侧对齐（其 2026-09-10 实测结论）。
+        #
+        # 原配置 status_forcelist=(429,500,502,503,504) + status=2 会让 urllib3
+        # 对 5xx **静默重试 2 次**，且这层对上层完全透明——L3 日志里打印
+        # "分片 X 下载失败 (1/20)" 时，底层其实已经发了 3 个请求。
+        # 于是单个采样分片最坏 = 3(L3) × 3(L1) = 9 个请求，而日志只显示 3 次。
+        # 电影侧 1000 部实跑 `502 Server Error` 出现 7038 次、采样耗尽 2720 次，
+        # 两个数字对不上正是因为中间那批请求根本不可见。
+        #
+        # 交给 L3 的三个理由（逐条已核对在 TV 侧同样成立）：
+        #   1. L3 的退避更合理（1/2/4/8s 指数 + 抖动，封顶 60s），
+        #      而 L1 的 backoff_factor=0.5 只有 0s、1s，重试过于密集；
+        #   2. L3 可被 `interrupted` 打断（download_single_segment 用
+        #      interrupted.wait 退避），**L1 的退避叫不醒** —— 这条对 TV 侧
+        #      尤其要命：dead_streak_breaker 熔断与 Ctrl+C 都打不断 L1；
+        #   3. L3 每次重试都有日志，L1 完全静默，排障时看不见真实请求量。
+        #
+        # 🔑 顺带修掉一个隐患：429 留在 forcelist 里会让 mp4 主机熔断
+        # （MP4_HOST_CIRCUIT_THRESHOLD）延迟生效——我们想"立刻换节点"，
+        # urllib3 却会先自己重试 2 次。移除后熔断真正做到即时短路。
+        #
+        # connect/read 保留：连接重置、握手失败这类 socket 级抖动在同一条连接上
+        # 立即重试很划算，且不像 5xx 那样会被上层重复覆盖。
         retry = Retry(
             total=2,
             connect=2,
             read=2,
-            status=2,
+            status=0,               # 状态码一律不在本层重试
             backoff_factor=0.5,
-            status_forcelist=(429, 500, 502, 503, 504),
+            status_forcelist=(),    # 空：5xx/429 全部上抛给 L3 处理
             allowed_methods=frozenset(("GET", "HEAD")),
             raise_on_status=False,
         )
