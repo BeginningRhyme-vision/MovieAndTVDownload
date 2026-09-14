@@ -1,5 +1,6 @@
 """Offline unit tests for fetch_tv_metadata.py (no network, no real datasets)."""
 
+import logging
 import sqlite3
 
 import pandas as pd
@@ -1048,6 +1049,146 @@ def test_ensure_dataset_ignores_garbage_content_length(monkeypatch, tmp_path):
         lambda *a, **k: _FakeResp(payload, {"Content-Length": "abc"}),
     )
     assert m.ensure_dataset("ratings").read_text() == "a\tb\n1\t2\n"
+
+
+# ---------------------------------------------------------------- ensure_dataset: download retry
+class _BrokenRaw:
+    """模拟 r.raw 中途断连：urllib3 抛 ProtocolError（不是 RequestException）。"""
+    def __init__(self, head: bytes):
+        self.head = head
+        self.sent = False
+
+    def read(self, n=-1):
+        if not self.sent:
+            self.sent = True
+            return self.head
+        import urllib3
+        raise urllib3.exceptions.ProtocolError("Connection broken: IncompleteRead")
+
+
+def test_ensure_dataset_retries_on_mid_stream_disconnect(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    payload = _gz_bytes("a\tb\n1\t2\n")
+    calls = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            r = _FakeResp(b"", {"Content-Length": str(len(payload))})
+            r.raw = _BrokenRaw(payload[:5])
+            return r
+        return _FakeResp(payload, {"Content-Length": str(len(payload))})
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    out = m.ensure_dataset("ratings")
+    assert len(calls) == 3
+    assert out.read_text() == "a\tb\n1\t2\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["title.ratings.tsv"]
+
+
+def test_ensure_dataset_retries_on_short_content_length_then_gives_up(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    payload = _gz_bytes("a\tb\n1\t2\n")
+    calls = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return _FakeResp(payload[:-3], {"Content-Length": str(len(payload))})
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    with pytest.raises(IOError, match="下载不完整"):
+        m.ensure_dataset("ratings")
+    assert len(calls) == m.DOWNLOAD_RETRIES
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_ensure_dataset_does_not_retry_http_4xx(monkeypatch, tmp_path):
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(m.time, "sleep", lambda s: pytest.fail("4xx 不应重试等待"))
+    import requests
+    calls = []
+
+    class _Resp404(_FakeResp):
+        def raise_for_status(self):
+            resp = requests.Response()
+            resp.status_code = 404
+            raise requests.HTTPError("404", response=resp)
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return _Resp404(b"")
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    with pytest.raises(requests.HTTPError):
+        m.ensure_dataset("ratings")
+    assert len(calls) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_ensure_dataset_does_not_retry_decompress_failure(monkeypatch, tmp_path):
+    """解压失败说明 gz 本身有问题（或 Content-Length 校验缺失时的截断），重下无意义。"""
+    monkeypatch.setattr(m, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(m.time, "sleep", lambda s: pytest.fail("解压失败不应重试"))
+    calls = []
+
+    def fake_get(*a, **k):
+        calls.append(1)
+        return _FakeResp(b"not gzip at all")
+
+    monkeypatch.setattr(m.requests, "get", fake_get)
+    with pytest.raises(Exception):
+        m.ensure_dataset("ratings")
+    assert len(calls) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------- check_tmdb_key / warm_indexes
+class _FakeConfiguration:
+    outcome = None
+
+    def info(self):
+        if isinstance(_FakeConfiguration.outcome, Exception):
+            raise _FakeConfiguration.outcome
+        return _FakeConfiguration.outcome or {}
+
+
+@pytest.fixture
+def fake_configuration(monkeypatch):
+    monkeypatch.setattr(m.tmdb, "Configuration", _FakeConfiguration)
+    _FakeConfiguration.outcome = None
+    return _FakeConfiguration
+
+
+def test_check_tmdb_key_passes_on_success(fake_configuration):
+    fake_configuration.outcome = {"images": {}}
+    m.check_tmdb_key()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_check_tmdb_key_exits_on_auth_error(fake_configuration, status):
+    fake_configuration.outcome = _http_err(status)
+    with pytest.raises(SystemExit) as ei:
+        m.check_tmdb_key()
+    assert "TMDB_API_KEY" in str(ei.value)
+    assert "SECRET123" not in str(ei.value)
+
+
+@pytest.mark.parametrize("err", [_http_err(500), _http_err(429), ConnectionError("dns")])
+def test_check_tmdb_key_only_warns_on_non_auth_error(fake_configuration, caplog, err):
+    fake_configuration.outcome = err
+    with caplog.at_level(logging.WARNING, logger=m.log.name):
+        m.check_tmdb_key()  # 不抛
+    assert any("预检未通过" in r.message for r in caplog.records)
+    assert "SECRET123" not in caplog.text
+
+
+def test_warm_indexes_populates_engine_and_tolerates_empty():
+    df = pd.DataFrame({"v": [1, 2]}, index=pd.Index(["tt1", "tt2"], name="tconst"))
+    empty = pd.DataFrame({"v": []}, index=pd.Index([], name="tconst"))
+    m.warm_indexes(df, empty)
+    assert df.index._engine.is_mapping_populated
 
 
 # ---------------------------------------------------------------- 资源释放

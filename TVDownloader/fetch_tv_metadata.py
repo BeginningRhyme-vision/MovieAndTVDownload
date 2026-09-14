@@ -319,6 +319,23 @@ def _content_length(resp):
         return None
 
 
+DOWNLOAD_RETRIES = 3
+
+
+def _download(filename: str, gz_part: Path):
+    """单次下载到 gz_part 并做 Content-Length 校验；任何失败抛异常（由调用方决定重试）。"""
+    with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        expected = _content_length(r)
+        with open(gz_part, "wb") as f:
+            shutil.copyfileobj(r.raw, f)
+            written = f.tell()
+    if expected is not None and written != expected:
+        raise IOError(
+            f"{filename} 下载不完整: Content-Length={expected:,} 实际写入={written:,}"
+        )
+
+
 def ensure_dataset(key: str) -> Path:
     """下载并解压 IMDB 数据集。
     半成品保护：下载/解压都先写到 .part 临时文件，完成后原子 rename 到最终名。
@@ -332,7 +349,12 @@ def ensure_dataset(key: str) -> Path:
     🔴 Content-Length 校验：IMDB 服务端会给 Content-Length。若截断恰好落在
     gzip 成员边界，解压不会报错，只会得到**少一截**的 tsv，并被永久"已存在跳过"。
     所以写入字节数与 Content-Length 不等时直接抛错（由 finally 清场）。
-    服务端没给时（或走代理被剥掉）退化为不校验。"""
+    服务端没给时（或走代理被剥掉）退化为不校验。
+
+    下载重试：单个 gz 数百 MB，到 IMDB CDN 的连接中途断开 / 超时并不罕见，
+    直接抛出会让整个进程退出（前面已下载的文件不受影响，但要人工重启）。
+    这里对**下载环节**（含 Content-Length 不符）重试 DOWNLOAD_RETRIES 次，
+    每次失败都删掉半截 .part 从头下；解压失败与 4xx 不重试（重下也一样）。"""
     filename = DATASETS[key]
     tsv_path = DATA_DIR / filename.replace(".gz", "")
     if tsv_path.exists():
@@ -342,17 +364,25 @@ def ensure_dataset(key: str) -> Path:
     gz_part = gz_path.with_name(gz_path.name + ".part")
     tsv_part = tsv_path.with_name(tsv_path.name + ".part")
     try:
-        log.info(f"下载 {filename} ...")
-        with requests.get(BASE_URL + filename, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            expected = _content_length(r)
-            with open(gz_part, "wb") as f:
-                shutil.copyfileobj(r.raw, f)
-                written = f.tell()
-        if expected is not None and written != expected:
-            raise IOError(
-                f"{filename} 下载不完整: Content-Length={expected:,} 实际写入={written:,}"
-            )
+        for attempt in range(1, DOWNLOAD_RETRIES + 1):
+            log.info(f"下载 {filename} ...")
+            try:
+                _download(filename, gz_part)
+                break
+            except Exception as e:
+                # 不细分异常类型：r.raw 中途断连抛的是 urllib3.exceptions.ProtocolError
+                # （不是 requests.RequestException 也不是 OSError），逐一列举容易漏。
+                # _download 只做网络读 + 落盘，任何 Exception 都值得重下；Ctrl+C 是
+                # BaseException 不在此列。
+                gz_part.unlink(missing_ok=True)
+                status = _http_status(e)
+                if status is not None and 400 <= status < 500:
+                    raise  # 404/403 等：重下不会变好
+                if attempt >= DOWNLOAD_RETRIES:
+                    raise
+                delay = 5 * attempt
+                log.warning(f"{filename} 第{attempt}次下载失败: {type(e).__name__}: {e}，{delay}s 后重试")
+                time.sleep(delay)
         gz_part.replace(gz_path)
         log.info(f"解压 {filename} ...")
         with gzip.open(gz_path, "rb") as gz, open(tsv_part, "wb") as out:
@@ -897,7 +927,33 @@ def run_pool(pending, job, max_workers: int, window: int = None, log_every: int 
     return stats
 
 
+def check_tmdb_key():
+    """启动即验证 TMDB_API_KEY：main 后面要先下载 ~10GB、建索引一小时，密钥错误
+    要到 run_pool 才以 TMDBAuthError 暴露，白等太久。
+    只有 401/403 才 fail-fast；网络不通 / 5xx / 429 只 warning，交给主流程的重试。"""
+    try:
+        tmdb.Configuration().info()
+    except Exception as e:
+        status = _http_status(e)
+        if status in (401, 403):
+            raise SystemExit(f"TMDB 拒绝访问（HTTP {status}），请检查 TMDB_API_KEY")
+        log.warning(f"TMDB 预检未通过（非密钥问题，继续）: {_redact(e)}")
+        return
+    log.info("TMDB_API_KEY 预检通过")
+
+
+def warm_indexes(*frames):
+    """pandas 的 Index 哈希引擎在**首次** loc / in 时懒构建；8 个 worker 同时首次访问
+    会并发触发同一份构建，pandas 历史上对此有过竞态 issue。主线程各触发一次即可。"""
+    for df in frames:
+        if len(df.index):
+            df.index.get_loc(df.index[0])
+
+
 def main():
+    # 0. 密钥预检（在下载 / 建索引之前）
+    check_tmdb_key()
+
     # 1. 确保所有数据集已下载
     log.info("=== 检查数据集 ===")
     for key in DATASETS:
@@ -913,6 +969,7 @@ def main():
     ratings = load_ratings()
     crew = load_crew(basics.index)
     names_dict = load_names_dict()
+    warm_indexes(basics, ratings, crew)
 
     # 4. 开始处理
     done = load_done()
