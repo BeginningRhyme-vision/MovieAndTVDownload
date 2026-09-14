@@ -178,11 +178,18 @@ tmdb_ids_to_links:
   proxy:
     # true=启用下方代理，false=直连
     enabled: true
-    host: "unmetered.residential.proxyrack.net"
+    # 当前代理：dataedpt。单端口，由网关自身在每次请求时轮换出口 IP
+    # （已实测：连续请求得到的出口 IP 分属不同国家），因此 port_range 取单点即可。
+    host: "4x3h6x5m-as.dataedpt.com"
     user: ""
     password: ""
     # 端口范围 [起, 止]，每次请求随机取一个端口以更换出口 IP
-    port_range: [9000, 9050]
+    port_range: [2345, 2345]
+    # --- 旧代理 proxyrack（保留备查，需回滚时把上面两项换成下面两行）---
+    # host: "unmetered.residential.proxyrack.net"
+    # port_range: [9000, 9050]
+    # 与 dataedpt 的差异：proxyrack 靠「随机端口」换出口 IP，故需 9000-9050 的范围；
+    # dataedpt 由网关自动轮换，单端口即可。两者同为 HTTP 协议，build_proxy() 无需改动。
 
 
 # ----------------------------------------------------------------------------
