@@ -19,6 +19,8 @@ import download_tv as d
 
 
 def _read_jsonl(path):
+    if not os.path.exists(path):
+        return []
     with open(path, encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
 
@@ -202,6 +204,86 @@ def test_scan_downloaded_mp4_ids(sandbox):
 
 def test_scan_downloaded_mp4_ids_missing_base(sandbox):
     assert d.scan_downloaded_mp4_ids() == (set(), {})
+
+
+def test_reconcile_unlogged_downloads_writes_log_and_pending(sandbox, monkeypatch):
+    """① 成品落地但未入账（既不在 SUCCESS_LOG 也不在 pending）的集：启动巡检补写
+    SUCCESS_LOG(uploaded=false, reconciled=true) + pending，让收尾 reupload 认领。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    base = sandbox / "downloads"
+    p_unlogged = _put_episode(base, "2008", "100", 1, 1, data=b"video")
+    _put_episode(base, "2008", "200", 0, 5, data=b"video")      # 已入账
+    _put_episode(base, "unknown_year", "300", 2, 3, data=b"video")  # 无年份目录
+
+    d.write_log(d.SUCCESS_LOG, {"tmdbId": "200", "season": 0, "episode": 5, "uploaded": True})
+    logged = d.load_success_log_ids()
+    disk, _ = d.scan_downloaded_mp4_ids()
+    assert disk == {"100_S01E01", "200_S00E05", "300_S02E03"}
+
+    assert d.reconcile_unlogged_downloads(disk, logged) == 2
+
+    logs = _read_jsonl(d.SUCCESS_LOG)
+    by_key = {d.record_episode_key(r): r for r in logs}
+    assert set(by_key) == {"200_S00E05", "100_S01E01", "300_S02E03"}
+    r100 = by_key["100_S01E01"]
+    assert r100["uploaded"] is False and r100["reconciled"] is True
+    assert r100["final_path"] == str(p_unlogged)
+    assert r100["year"] == "2008" and r100["s3_key"] == "tv/2008/100/S01/E01/E01.mp4"
+    assert r100["provider"] is None       # 归因键齐全、值为 None
+    r300 = by_key["300_S02E03"]
+    assert r300["year"] is None and r300["s3_key"] == "tv/unknown_year/300/S02/E03/E03.mp4"
+
+    pend = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert {d.record_episode_key(r) for r in pend} == {"100_S01E01", "300_S02E03"}
+    p100 = next(r for r in pend if d.record_episode_key(r) == "100_S01E01")
+    assert p100["local_path"] == str(p_unlogged)
+    assert p100["s3_key"] == r100["s3_key"]
+    assert "启动巡检" in p100["fail_reason"]
+
+    # 巡检幂等：补账后 logged 已含这些 key，再跑一次不重复写。
+    logged2 = d.load_success_log_ids()
+    assert d.reconcile_unlogged_downloads(disk, logged2) == 0
+    assert len(_read_jsonl(d.SUCCESS_LOG)) == 3
+
+
+def test_reconcile_unlogged_downloads_local_mode_no_pending(sandbox, monkeypatch):
+    """S3 关闭：成品本就留本地，只补 SUCCESS_LOG 防重下，不写 pending。"""
+    monkeypatch.setattr(d, "S3_ENABLED", False)
+    base = sandbox / "downloads"
+    _put_episode(base, "2008", "100", 1, 1, data=b"video")
+    disk, _ = d.scan_downloaded_mp4_ids()
+    assert d.reconcile_unlogged_downloads(disk, set()) == 1
+    assert len(_read_jsonl(d.SUCCESS_LOG)) == 1
+    assert not os.path.exists(d.UPLOAD_PENDING_LOG)
+
+
+def test_reconcile_unlogged_downloads_skips_missing_and_noop_when_clean(sandbox, monkeypatch):
+    """key 在 disk_ids 里但磁盘上已找不到（扫描后被删）→ 跳过不写；无缝隙 → 0。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    assert d.reconcile_unlogged_downloads(set(), set()) == 0
+    assert d.reconcile_unlogged_downloads({"100_S01E01", "garbage"}, set()) == 0
+    assert not os.path.exists(d.SUCCESS_LOG)
+    assert not os.path.exists(d.UPLOAD_PENDING_LOG)
+
+
+def test_reconciled_pending_is_claimed_by_reupload(sandbox, monkeypatch):
+    """端到端：巡检写出的 pending 能被 reupload_pending 正常认领上传并清本地。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    base = sandbox / "downloads"
+    p = _put_episode(base, "2008", "100", 1, 1, data=b"video")
+    disk, _ = d.scan_downloaded_mp4_ids()
+    d.reconcile_unlogged_downloads(disk, set())
+
+    calls = []
+    monkeypatch.setattr(d, "upload_to_r2", lambda lp, k: calls.append((lp, k)) or (True, None))
+    d.reupload_pending()
+    assert calls == [(str(p), "tv/2008/100/S01/E01/E01.mp4")]
+    assert not p.exists()
+    assert _read_jsonl(d.UPLOAD_PENDING_LOG) == []
+    logs = _read_jsonl(d.SUCCESS_LOG)
+    assert len(logs) == 1 and logs[0]["uploaded"] is True and logs[0]["reupload"] is True
 
 
 def test_move_to_target_folder_uses_episode_dir(sandbox):
@@ -1537,6 +1619,88 @@ def test_upload_to_r2_skips_retry_on_permanent_error(sandbox, monkeypatch):
     assert len(attempts) == 1 and sleeps == []
 
 
+def _http_error(status, code="X"):
+    exc = Exception(f"http {status} {code}")
+    exc.response = {
+        "Error": {"Code": code},
+        "ResponseMetadata": {"HTTPStatusCode": status},
+    }
+    return exc
+
+
+def test_upload_to_r2_http_400_gets_limited_backoff(sandbox, monkeypatch):
+    """HTTP 400 不再当永久失败立即放弃：走 UPLOAD_RETRY_MAX_400 的有限退避（默认 2 次）。
+    瞬时 400（RequestTimeout/BadDigest）第二次能成功；一直 400 则在 2 次后放弃。"""
+    monkeypatch.setattr(d, "UPLOAD_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "UPLOAD_RETRY_MAX_400", 2)
+    monkeypatch.setattr(d, "UPLOAD_RETRY_DELAY", 3)
+    monkeypatch.setattr(d.random, "uniform", lambda a, b: 0.0)
+    sleeps = []
+    monkeypatch.setattr(d.interrupted, "wait", lambda s: sleeps.append(s) or False)
+
+    # 场景 A：第一次 400（RequestTimeout），第二次成功。
+    attempts = []
+
+    class _Flaky:
+        def upload_file(self, path, bucket, key):
+            attempts.append(key)
+            if len(attempts) == 1:
+                raise _http_error(400, "RequestTimeout")
+
+    monkeypatch.setattr(d, "get_s3_client", lambda: _Flaky())
+    ok, reason = d.upload_to_r2("/tmp/x.mp4", "k")
+    assert ok is True and reason is None
+    assert len(attempts) == 2 and sleeps == [3]
+
+    # 场景 B：一直 400 → 恰好尝试 2 次后放弃，原因说明是 400 上限，不是"不重试"。
+    attempts.clear()
+    sleeps.clear()
+
+    class _Always400:
+        def upload_file(self, path, bucket, key):
+            attempts.append(key)
+            raise _http_error(400, "InvalidArgument")
+
+    monkeypatch.setattr(d, "get_s3_client", lambda: _Always400())
+    ok, reason = d.upload_to_r2("/tmp/x.mp4", "k")
+    assert ok is False
+    assert "HTTP 400" in reason and "上限(2)" in reason
+    assert len(attempts) == 2 and sleeps == [3]
+
+    # 场景 C：先网络错再 400 → 预算只减不增：网络错 1 次 + 400 1 次 = 2 次后停。
+    attempts.clear()
+    sleeps.clear()
+
+    class _NetThen400:
+        def upload_file(self, path, bucket, key):
+            attempts.append(key)
+            if len(attempts) == 1:
+                raise OSError("connection reset")
+            raise _http_error(400, "RequestTimeout")
+
+    monkeypatch.setattr(d, "get_s3_client", lambda: _NetThen400())
+    ok, reason = d.upload_to_r2("/tmp/x.mp4", "k")
+    assert ok is False and "HTTP 400" in reason
+    assert len(attempts) == 2
+
+
+def test_upload_to_r2_401_403_404_still_permanent(sandbox, monkeypatch):
+    """收窄永久列表后 401/403/404 仍然一次即放弃。"""
+    monkeypatch.setattr(d.interrupted, "wait", lambda s: (_ for _ in ()).throw(AssertionError("不应退避")))
+    for status in (401, 403, 404):
+        attempts = []
+
+        class _Client:
+            def upload_file(self, path, bucket, key):
+                attempts.append(key)
+                raise _http_error(status)
+
+        monkeypatch.setattr(d, "get_s3_client", lambda: _Client())
+        ok, reason = d.upload_to_r2("/tmp/x.mp4", "k")
+        assert ok is False and "不重试" in reason, status
+        assert len(attempts) == 1, status
+
+
 def test_upload_to_r2_retries_transient_with_exponential_backoff(sandbox, monkeypatch):
     """网络类错误仍重试，且退避是指数（3/6/12...）而非线性。
     退避走 interrupted.wait（B1，可被中断打断），所以在事件上打桩而非 time.sleep。"""
@@ -2367,6 +2531,203 @@ def test_upload_one_entry_exception_is_contained(sandbox, monkeypatch):
     assert os.path.exists(info["final_path"])
     pend = _read_jsonl(d.UPLOAD_PENDING_LOG)[0]
     assert d.record_episode_key(pend) == "1_S01E01"
+
+
+def _write_sidecars(info, subs=("en.vtt",), meta=True):
+    """在 info 的集目录里落 meta.json / subs/*，返回 {rel: abs_path}。"""
+    folder = os.path.dirname(info["final_path"])
+    out = {}
+    if meta:
+        p = os.path.join(folder, "meta.json")
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("{}")
+        out["meta.json"] = p
+    if subs:
+        os.makedirs(os.path.join(folder, d.SUBS_SUBDIR), exist_ok=True)
+        for name in subs:
+            p = os.path.join(folder, d.SUBS_SUBDIR, name)
+            with open(p, "w", encoding="utf-8") as fh:
+                fh.write("WEBVTT")
+            out[f"{d.SUBS_SUBDIR}/{name}"] = p
+    return out
+
+
+def test_upload_one_entry_sidecar_failure_writes_assets_only_pending(sandbox, monkeypatch):
+    """③ 视频传成功、meta.json 失败：视频照删、SUCCESS_LOG 记 uploaded=true，
+    但要写一条 assets_only pending 让 reupload 能补传——否则集目录里只剩
+    meta.json，既没人认领也没人清理。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    info = _success_info(sandbox)
+    info["provider"] = "vidsrc"
+    paths = _write_sidecars(info)
+
+    def fake_upload(p, k):
+        if k.endswith("meta.json"):
+            return False, "HTTP 400 达到有限重试上限(2): bad"
+        return True, None
+
+    monkeypatch.setattr(d, "upload_to_r2", fake_upload)
+    key, ok, out = d.upload_one_entry(info)
+    assert ok is True
+    assert out["asset_keys"] == ["tv/2001/1/S01/E01/subs/en.vtt"]
+    assert not os.path.exists(info["final_path"])
+    assert not os.path.exists(paths["subs/en.vtt"])
+    assert os.path.exists(paths["meta.json"])          # 失败资产留在本地
+    assert os.path.isdir(os.path.dirname(info["final_path"]))  # 目录不能被清
+    rec = _read_jsonl(d.SUCCESS_LOG)[0]
+    assert rec["uploaded"] is True
+    pend = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert len(pend) == 1
+    assert pend[0]["assets_only"] is True
+    assert pend[0]["failed_assets"] == ["meta.json"]
+    assert pend[0]["provider"] == "vidsrc"
+    assert pend[0]["local_path"] == info["final_path"]
+    assert pend[0]["s3_key"] == "tv/2001/1/S01/E01/E01.mp4"
+    assert "meta.json" in pend[0]["fail_reason"]
+
+
+def test_upload_one_entry_sidecar_exception_writes_assets_only_pending(sandbox, monkeypatch):
+    """资产上传抛异常（而非返回 False）同样计入 failed 并写 pending。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    info = _success_info(sandbox)
+    _write_sidecars(info, subs=())
+
+    def fake_upload(p, k):
+        if k.endswith("meta.json"):
+            raise RuntimeError("client crashed")
+        return True, None
+
+    monkeypatch.setattr(d, "upload_to_r2", fake_upload)
+    key, ok, out = d.upload_one_entry(info)
+    assert ok is True and out["asset_keys"] == []
+    pend = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert [r.get("assets_only") for r in pend] == [True]
+    assert pend[0]["failed_assets"] == ["meta.json"]
+
+
+def test_reupload_assets_only_success_clears_pending_and_dir(sandbox, monkeypatch, capsys):
+    """assets_only pending：视频本地已不存在也**不算孤儿**；回扫集目录补传
+    meta.json/subs，全部成功 → 移出 pending + 清空目录 + SUCCESS_LOG 不动。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    info = _success_info(sandbox)
+    os.remove(info["final_path"])                      # 视频早已上传并删除
+    paths = _write_sidecars(info, subs=("en.vtt", "zh.srt"))
+    (sandbox / "success.jsonl").write_text(
+        json.dumps({"tmdbId": "1", "season": 1, "episode": 1, "uploaded": True,
+                    "s3_key": "tv/2001/1/S01/E01/E01.mp4"}) + "\n",
+        encoding="utf-8",
+    )
+    (sandbox / "pending.jsonl").write_text(json.dumps({
+        "tmdbId": "1", "season": 1, "episode": 1, "year": 2001, "title": "T",
+        "local_path": info["final_path"], "s3_key": "tv/2001/1/S01/E01/E01.mp4",
+        "assets_only": True, "failed_assets": ["meta.json"],
+        "fail_reason": "旁车资产上传失败: meta.json", "ts": "old",
+    }) + "\n", encoding="utf-8")
+
+    calls = []
+    monkeypatch.setattr(d, "upload_to_r2",
+                        lambda p, k: (calls.append(k) or (True, None)))
+    d.reupload_pending()
+
+    # 回扫以目录实况为准：不只补 failed_assets 里的 meta.json，字幕也一并传。
+    assert calls == [
+        "tv/2001/1/S01/E01/meta.json",
+        "tv/2001/1/S01/E01/subs/en.vtt",
+        "tv/2001/1/S01/E01/subs/zh.srt",
+    ]
+    assert not any(os.path.exists(p) for p in paths.values())
+    assert not os.path.isdir(os.path.dirname(info["final_path"]))
+    assert _read_jsonl(d.UPLOAD_PENDING_LOG) == []
+    succ = _read_jsonl(d.SUCCESS_LOG)
+    assert len(succ) == 1 and succ[0]["uploaded"] is True
+    out = capsys.readouterr().out
+    assert "旁车资产补齐 1" in out
+    assert "孤儿(本地已无)清理 0" in out
+
+
+def test_reupload_assets_only_partial_failure_keeps_pending(sandbox, monkeypatch, capsys):
+    """部分资产仍失败：成功的删本地，失败的留下；pending 保留并更新
+    failed_assets / fail_reason / ts；目录不清。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    monkeypatch.setattr(d.time, "strftime", lambda fmt: "NEW-TS")
+    info = _success_info(sandbox)
+    os.remove(info["final_path"])
+    paths = _write_sidecars(info, subs=("en.vtt",))
+    (sandbox / "pending.jsonl").write_text(json.dumps({
+        "tmdbId": "1", "season": 1, "episode": 1, "year": 2001,
+        "local_path": info["final_path"], "s3_key": "tv/2001/1/S01/E01/E01.mp4",
+        "assets_only": True, "failed_assets": ["meta.json", "subs/en.vtt"],
+        "fail_reason": "old", "ts": "old",
+    }) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        d, "upload_to_r2",
+        lambda p, k: (True, None) if k.endswith(".vtt") else (False, "still 400"),
+    )
+    d.reupload_pending()
+
+    assert not os.path.exists(paths["subs/en.vtt"])
+    assert os.path.exists(paths["meta.json"])
+    assert os.path.isdir(os.path.dirname(info["final_path"]))
+    remaining = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert len(remaining) == 1
+    assert remaining[0]["assets_only"] is True
+    assert remaining[0]["failed_assets"] == ["meta.json"]
+    assert remaining[0]["ts"] == "NEW-TS"
+    assert "meta.json" in remaining[0]["fail_reason"]
+    out = capsys.readouterr().out
+    assert "仍失败 1" in out
+
+
+def test_reupload_assets_only_empty_dir_is_resolved(sandbox, monkeypatch, capsys):
+    """集目录里已无资产（被上次补传/手动清理）：视为消解，移出 pending。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    info = _success_info(sandbox)
+    os.remove(info["final_path"])
+    (sandbox / "pending.jsonl").write_text(json.dumps({
+        "tmdbId": "1", "season": 1, "episode": 1, "year": 2001,
+        "local_path": info["final_path"], "s3_key": "k",
+        "assets_only": True, "failed_assets": ["meta.json"],
+    }) + "\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: (calls.append(k) or (True, None)))
+    d.reupload_pending()
+    assert calls == []
+    assert _read_jsonl(d.UPLOAD_PENDING_LOG) == []
+    assert "孤儿(本地已无)清理 1" in capsys.readouterr().out
+
+
+def test_reupload_video_ok_but_sidecar_fails_degrades_to_assets_only(sandbox, monkeypatch):
+    """普通 pending 补传：视频成功、资产失败 → 视频删、SUCCESS_LOG 标 uploaded，
+    该集在 pending 里降级为 assets_only 记录而不是消失。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    info = _success_info(sandbox)
+    paths = _write_sidecars(info, subs=())
+    (sandbox / "pending.jsonl").write_text(json.dumps({
+        "tmdbId": "1", "season": 1, "episode": 1, "year": 2001, "provider": "p1",
+        "local_path": info["final_path"], "s3_key": "", "fail_reason": "orig",
+    }) + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        d, "upload_to_r2",
+        lambda p, k: (False, "nope") if k.endswith("meta.json") else (True, None),
+    )
+    d.reupload_pending()
+
+    assert not os.path.exists(info["final_path"])
+    assert os.path.exists(paths["meta.json"])
+    succ = _read_jsonl(d.SUCCESS_LOG)
+    assert len(succ) == 1 and succ[0]["uploaded"] is True and succ[0]["provider"] == "p1"
+    remaining = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert len(remaining) == 1
+    assert remaining[0]["assets_only"] is True
+    assert remaining[0]["failed_assets"] == ["meta.json"]
+    assert remaining[0]["s3_key"] == "tv/2001/1/S01/E01/E01.mp4"
+    assert remaining[0]["provider"] == "p1"
 
 
 # ---------------------------------------------------------------- main lock

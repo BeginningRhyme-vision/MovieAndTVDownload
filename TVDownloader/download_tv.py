@@ -420,6 +420,11 @@ UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
 MAX_PENDING_UPLOADS = max(1, int(_S3_CFG.get("max_pending_uploads", 64)))
 UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
 UPLOAD_RETRY_DELAY = _S3_CFG.get("upload_retry_delay", 3)
+# HTTP 400 的重试预算（总尝试次数）。400 既可能是瞬时的（RequestTimeout /
+# RequestTimeTooSkewed / BadDigest / IncompleteBody），也可能是确定性的（键名非法
+# 等），无法仅凭状态码区分，所以给一个比通用预算小的有限退避：能救回瞬时错，
+# 又不会让真·坏请求白占 5 轮槽位。
+UPLOAD_RETRY_MAX_400 = max(1, int(_S3_CFG.get("upload_retry_max_400", 2)))
 # boto3 连接/读取超时（秒）：botocore 默认 60s 太长，R2 抖动时会顶满反压。
 S3_CONNECT_TIMEOUT = float(_S3_CFG.get("connect_timeout", 15))
 S3_READ_TIMEOUT = float(_S3_CFG.get("read_timeout", 120))
@@ -906,6 +911,9 @@ def load_success_log_ids():
 
 _SEASON_DIR_RE = re.compile(r"^S(\d+)$")
 _EPISODE_DIR_RE = re.compile(r"^E(\d+)$")
+# episode_key 的反解：`{tid}_S{ss}E{ee}`。贪婪 `.+` + 尾部锚定保证只切最后
+# 一个 `_SxxEyy`，tid 内部即使含 `_S01E01` 字样也不会被误切。
+_EPISODE_KEY_RE = re.compile(r"^(.+)_S(\d+)E(\d+)$")
 
 
 def _scandir_subdirs(path):
@@ -991,6 +999,113 @@ def scan_downloaded_mp4_ids():
         key: paths for key, paths in locations.items() if len(paths) > 1
     }
     return downloaded_ids, duplicates
+
+
+def reconcile_unlogged_downloads(disk_ids, logged_ids):
+    """启动巡检：把"成品已落地但从未入账"的集补进 SUCCESS_LOG + pending。
+
+    缝隙来源：`finalize_one_entry` 成品 move 落地后立刻 `processed_ids.add`，
+    而 SUCCESS_LOG 要等上传阶段 `upload_one_entry` 才写。若进程恰在两者之间被杀
+    （或上传 future 未来得及跑），下次启动这集既在 disk_ids（被跳过、不再下载）
+    又不在 SUCCESS_LOG / pending（没人认领上传）——会**永久**留在本地、永不进 R2。
+
+    做法：对 `disk_ids - logged_ids` 的每个 key，从磁盘定位 mp4（按年份目录一次
+    listdir、再对命中的 tid 精确 stat，不做全量重扫），写一条
+    SUCCESS_LOG(uploaded=false, reconciled=true) 防重下；S3 开启时再写一条
+    pending，让收尾的 `reupload_pending` 自动认领上传。S3 关闭时成品本就留本地，
+    只补账不补 pending。
+
+    返回补账条数。key 解析失败 / 磁盘上找不到（扫描与巡检之间被人删了）的集
+    直接跳过，下次启动它已不在 disk_ids，自然回到正常下载路径。
+    """
+    unlogged = set(disk_ids) - set(logged_ids)
+    if not unlogged:
+        return 0
+
+    # key -> (tid, season, episode)；解析不出的 key 跳过。
+    wanted = {}
+    for key in unlogged:
+        match = _EPISODE_KEY_RE.match(str(key))
+        if not match:
+            continue
+        wanted[key] = (match.group(1), int(match.group(2)), int(match.group(3)))
+    if not wanted:
+        return 0
+    wanted_tids = {tid for tid, _, _ in wanted.values()}
+
+    root = os.path.join(BASE_DIR, FOLDER_PREFIX) if FOLDER_PREFIX else BASE_DIR
+    located = {}   # key -> (mp4_path, year_or_None)
+    for year_entry in _scandir_subdirs(root):
+        year_name = year_entry.name
+        year = year_name if year_name.isdigit() else None
+        try:
+            present = {
+                normalize_tmdb_id(name) for name in os.listdir(year_entry.path)
+            } & wanted_tids
+        except OSError:
+            continue
+        if not present:
+            continue
+        for key, (tid, season, episode) in wanted.items():
+            if key in located or tid not in present:
+                continue
+            try:
+                mp4_path = os.path.join(
+                    episode_dir(tid, season, episode, year),
+                    episode_video_name(episode),
+                )
+                if os.stat(mp4_path).st_size > 0:
+                    located[key] = (mp4_path, year)
+            except (OSError, ValueError):
+                continue
+
+    if not located:
+        return 0
+
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    count = 0
+    for key in sorted(located):
+        mp4_path, year = located[key]
+        tid, season, episode = wanted[key]
+        try:
+            s3_key = build_s3_key(tid, season, episode, year)
+        except ValueError:
+            continue
+        record = {
+            "tmdbId": tid,
+            "season": season,
+            "episode": episode,
+            "title": "",
+            "year": year,
+            **_attribution_of(None),
+            "final_path": mp4_path,
+            "s3_key": s3_key,
+            "uploaded": False,
+            "reconciled": True,
+        }
+        write_log(SUCCESS_LOG, record)
+        if S3_ENABLED:
+            write_pending({
+                "tmdbId": tid,
+                "season": season,
+                "episode": episode,
+                "title": "",
+                "year": year,
+                **_attribution_of(None),
+                "local_path": mp4_path,
+                "s3_key": s3_key,
+                "fail_reason": "启动巡检：成品已落地但未入账",
+                "ts": now,
+            })
+        count += 1
+
+    if count:
+        print(
+            f"启动巡检：{count} 个成品已落地但未入账，已补写 SUCCESS_LOG(uploaded=false)"
+            + ("，并加入 pending 待收尾补传" if S3_ENABLED else "（本地模式，无需上传）"),
+            flush=True,
+        )
+    return count
 
 
 def write_log(log_file, data):
@@ -1779,18 +1894,30 @@ def build_s3_key(tmdb_id, season, episode, year=None, asset=None):
     return f"{S3_PREFIX}/{rel}" if S3_PREFIX else rel
 
 
+def _upload_error_status(exc):
+    """从 botocore 风格异常中取 HTTP 状态码；非 botocore 异常返回 None。"""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return None
+    return response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+
+
 def _is_permanent_upload_error(exc):
     """判断上传失败是否"重试也没用"：凭证错误/桶不存在/权限不足等配置类问题。
 
     这类失败重试 5 次只是白等 30s，而且每次都占着反压槽位、拖慢整条流水线。
     网络类错误（超时/连接重置/5xx）仍然重试——那才是重试真正能救回来的场景。
+
+    注意 HTTP 400 **不**在此列：S3 协议把 RequestTimeout / RequestTimeTooSkewed /
+    BadDigest / IncompleteBody 这些瞬时错也报成 400，无法与"键名非法"之类的确定性
+    400 区分。它由 `upload_to_r2` 单独走 `UPLOAD_RETRY_MAX_400` 的有限退避。
     """
     response = getattr(exc, "response", None)
     if not isinstance(response, dict):
         return False
     status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
     code = str(response.get("Error", {}).get("Code", ""))
-    if status in (400, 401, 403, 404):
+    if status in (401, 403, 404):
         return True
     return code in (
         "InvalidAccessKeyId", "SignatureDoesNotMatch", "AccessDenied",
@@ -1801,7 +1928,9 @@ def _is_permanent_upload_error(exc):
 def upload_to_r2(local_path, s3_key):
     """带指数退避重试地上传单个文件到 R2。成功返回 (True, None)，失败返回 (False, 原因)。
 
-    确定性失败（凭证/权限/桶不存在）立即返回，不做无谓重试。
+    确定性失败（凭证/权限/桶不存在）立即返回，不做无谓重试。HTTP 400 走
+    `UPLOAD_RETRY_MAX_400` 的有限退避（默认 2 次）：瞬时 400 能救回来，确定性 400
+    也只多花一轮，不会像通用预算那样白占 5 轮槽位。
 
     中断语义：退避等待用 `interrupted.wait` 而非裸 sleep，置位后立即返回
     `(False, "收到中断信号...")`。这与"真实上传失败"走**完全相同**的路径——
@@ -1812,7 +1941,10 @@ def upload_to_r2(local_path, s3_key):
     """
     client = get_s3_client()
     last_exc = None
-    for attempt in range(1, UPLOAD_RETRY_MAX + 1):
+    attempt = 0
+    max_attempts = UPLOAD_RETRY_MAX
+    while attempt < max_attempts:
+        attempt += 1
         if interrupted.is_set():
             return False, f"收到中断信号，放弃上传（最近错误: {last_exc}）"
         try:
@@ -1822,7 +1954,12 @@ def upload_to_r2(local_path, s3_key):
             last_exc = exc
             if _is_permanent_upload_error(exc):
                 return False, f"确定性上传失败（不重试）: {exc}"
-            if attempt < UPLOAD_RETRY_MAX:
+            if _upload_error_status(exc) == 400:
+                # 400 一旦出现就把预算收窄到 UPLOAD_RETRY_MAX_400（只减不增）。
+                max_attempts = min(max_attempts, UPLOAD_RETRY_MAX_400)
+                if attempt >= max_attempts:
+                    return False, f"HTTP 400 达到有限重试上限({max_attempts}): {exc}"
+            if attempt < max_attempts:
                 # 指数退避 + 抖动，封顶 60s：与下载侧各重试层口径一致。
                 wait = min(UPLOAD_RETRY_DELAY * (2 ** (attempt - 1)), 60)
                 wait += random.uniform(0, min(1.0, wait * 0.2))
@@ -2277,11 +2414,23 @@ def _cleanup_episode_dir(folder):
 
 
 def upload_sidecar_assets(success_info, assets=None):
-    """把 meta.json 等旁车资产上传到与视频同前缀的 R2 位置。
+    """把 meta.json 等旁车资产上传到与视频同前缀的 R2 位置，返回已上传的对象键列表。
 
-    返回已上传的对象键列表。**全程尽力而为**：单个资产失败只打印，不写 pending、
-    不影响视频的上传结果——视频才是主体，元信息缺失顶多是前端少个功能，
-    为它把整集打回重传不值得。
+    兼容包装：只关心成功列表的调用方（测试、旧调用点）继续用这个签名；需要
+    知道"哪些资产没传上去"的调用点用 `_upload_sidecar_assets_detailed`。
+    """
+    uploaded, _failed = _upload_sidecar_assets_detailed(success_info, assets)
+    return uploaded
+
+
+def _upload_sidecar_assets_detailed(success_info, assets=None):
+    """旁车资产上传的完整版：返回 `(uploaded_keys, failed_rels)`。
+
+    **全程尽力而为**：单个资产失败只打印并记进 failed，不影响视频的上传结果——
+    视频才是主体，为元信息把整集打回重传不值得。但失败不能就此消失：调用方
+    拿到 failed 后应写一条 `assets_only` pending（见 `write_assets_only_pending`），
+    让 reupload 有路径把 meta.json/字幕补上——否则视频已删、目录里只剩几个
+    旁车文件，既没人认领也没人清理。
 
     上传成功的资产会按 DELETE_LOCAL_AFTER_UPLOAD 删除本地副本（与视频同口径）：
     R2 已有副本，本地再留一份只会在几十万集规模下累积出海量小文件与 inode，
@@ -2296,14 +2445,15 @@ def upload_sidecar_assets(success_info, assets=None):
     if assets is None:
         assets = collect_sidecar_assets(success_info)
     if not assets:
-        return []
+        return [], []
 
     try:
         folder = episode_dir(tmdb_id, season, episode, year)
     except ValueError:
-        return []
+        return [], []
 
     uploaded = []
+    failed = []
     for rel in assets:
         local = os.path.join(folder, *rel.split("/"))
         if not os.path.isfile(local):
@@ -2316,14 +2466,44 @@ def upload_sidecar_assets(success_info, assets=None):
                 if DELETE_LOCAL_AFTER_UPLOAD:
                     remove_file(local)
             else:
-                print(f"  [{key}] ⚠️ 资产上传失败（已跳过）{rel}: {reason}",
-                      flush=True)
+                failed.append(rel)
+                print(f"  [{key}] ⚠️ 资产上传失败 {rel}: {reason}", flush=True)
         except Exception as exc:  # noqa: BLE001 - 资产失败不影响视频
-            print(f"  [{key}] ⚠️ 资产上传异常（已跳过）{rel}: {exc}", flush=True)
+            failed.append(rel)
+            print(f"  [{key}] ⚠️ 资产上传异常 {rel}: {exc}", flush=True)
 
     if uploaded:
         print(f"  [{key}] 已上传 {len(uploaded)} 个附属资产", flush=True)
-    return uploaded
+    return uploaded, failed
+
+
+def write_assets_only_pending(success_info, local_path, s3_key, failed):
+    """视频已进 R2、旁车资产没传全时，写一条 `assets_only: true` 的 pending。
+
+    与普通 pending 的区别：视频（local_path）通常已被删除，reupload 不能拿
+    "视频不在本地"当孤儿判定，而应回扫集目录把剩余资产补传、全部成功后再清
+    目录。写入本身吞异常：这条记录只是补救路径，写不进去也不能影响主流程。
+    """
+    try:
+        write_pending({
+            "tmdbId": success_info.get("tmdbId"),
+            "season": success_info.get("season"),
+            "episode": success_info.get("episode"),
+            "title": success_info.get("title", ""),
+            "year": success_info.get("year"),
+            **_attribution_of(success_info),
+            "local_path": local_path,
+            "s3_key": s3_key,
+            "assets_only": True,
+            "failed_assets": list(failed),
+            "fail_reason": f"旁车资产上传失败: {', '.join(failed)}",
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+    except Exception as exc:  # noqa: BLE001
+        key = episode_key(success_info.get("tmdbId"), success_info.get("season"),
+                          success_info.get("episode"))
+        print(f"  [{key}] ⚠️ assets_only pending 写入失败（{exc}），"
+              f"未传资产: {failed}", flush=True)
 
 
 # ---------- M3U8 解析 ----------
@@ -4021,12 +4201,19 @@ def upload_one_entry(success_info):
             success_info["uploaded"] = True
             success_info["s3_key"] = s3_key
             # 先传附属资产再删视频：删视频不依赖资产结果，但把两者放在一起
-            # 便于日志按集聚集。资产上传内部已完全吞异常。
-            success_info["asset_keys"] = upload_sidecar_assets(success_info)
+            # 便于日志按集聚集。资产上传内部已完全吞异常；没传上去的资产记一条
+            # assets_only pending，留给 reupload 回扫补传（否则视频删了、目录里
+            # 只剩几个旁车文件，既无人认领也无人清理）。
+            asset_keys, failed_assets = _upload_sidecar_assets_detailed(success_info)
+            success_info["asset_keys"] = asset_keys
+            if failed_assets:
+                write_assets_only_pending(success_info, local_path, s3_key,
+                                          failed_assets)
             if DELETE_LOCAL_AFTER_UPLOAD:
                 remove_file(local_path)
                 # 视频与资产都已进 R2，本地集目录此时应为空 —— 删掉它，避免
-                # 几十万集规模下留下海量空目录把 inode 吃干净。
+                # 几十万集规模下留下海量空目录把 inode 吃干净。（还有资产残留
+                # 时 rmdir 会失败，目录自然保留给补传。）
                 _cleanup_episode_dir(os.path.dirname(local_path))
             write_log(SUCCESS_LOG, success_info)
             print(f"  [{key}] 上传成功: {s3_key}", flush=True)
@@ -4086,7 +4273,9 @@ def is_stale_entry(entry, now=None):
     ⚠️ **没有 fetched_at 的条目一律判为不陈旧**。旧版 results.jsonl 与手工
     构造的输入都没有这个字段，把它们当成"无限旧"会让整批集在启动时全部去
     重取流——取流配额与耗时双重浪费，且多半是徒劳（那些链接可能好好的）。
-    宁可漏判，不可误判。
+    宁可漏判，不可误判。当前取流侧（tv_ids_to_links / 就地重取）写出的每条
+    结果都带 fetched_at，所以这条只影响存量老数据；它们若真过期，会在下载
+    失败后走就地重取流兜底，不会永久卡住。
     """
     if STALE_LINK_SECONDS <= 0:
         return False
@@ -4320,6 +4509,9 @@ def _select_stale_entries(entries, label="启动预检"):
     #    绝大多数集排队到总超时被丢弃（且它们的 refetch_counts 不会 +1，
     #    下次运行又从头再来，队尾永远轮不到）。按 fetched_at 升序截断：
     #    最旧的直链最可能已经过期，优先换它们。
+    #    被推迟的那部分**不会丢**：它们照常进下载队列，直链若真过期会在下载
+    #    失败后走"就地重取流"兜底（refetch_entries / AsyncRefetcher），只是多
+    #    花一次失败的下载尝试；所以限额（默认 500）只是配额节流，不是覆盖上限。
     deferred = 0
     if AUTO_REFETCH_MAX_PER_RUN and len(stale) > AUTO_REFETCH_MAX_PER_RUN:
         # 无 fetched_at 的不会出现在这里（is_stale_entry 已把它们判为不陈旧）。
@@ -4709,6 +4901,12 @@ def _run_pipeline():
 
     logged_ids = load_success_log_ids()
     disk_ids, duplicate_files = scan_downloaded_mp4_ids()
+    # 成品已落地但没入账的集（finalize 与 upload 之间被杀）：补进 SUCCESS_LOG +
+    # pending，否则它们会被 disk_ids 永久跳过且永不上传。失败只告警不阻断启动。
+    try:
+        reconcile_unlogged_downloads(disk_ids, logged_ids)
+    except Exception as exc:  # noqa: BLE001
+        print(f"⚠️ 启动巡检（落地未入账成品）异常，已忽略: {exc}", flush=True)
     # 画质判死账本：这些集"有源但流的画质不达标"，重下必然得到同样结论。
     # --retry-dead 时按当前门槛逐条复判，够格的放回重试队列。
     dead_ids = load_dead_keys(dead_record_passes_now if RETRY_DEAD_MODE else None)
@@ -5548,6 +5746,33 @@ def _run_pipeline():
             )
 
 
+def _reupload_assets_only(record):
+    """补传一条 `assets_only` pending 记录的旁车资产。
+
+    返回 `(status, detail)`：
+      - ("done", uploaded_keys)：回扫到的资产全部传上，集目录已尝试清理；
+      - ("empty", [])：集目录里已无我们的资产（被上次补传/手动清理），视为消解；
+      - ("failed", failed_rels)：仍有资产没传上，调用方保留 pending。
+
+    回扫而非信任 record["failed_assets"]：pending 记录可能来自更早的一次运行，
+    期间字幕补抓可能又落了新文件；以目录实况为准，宁可多传也不漏传。
+    """
+    assets = collect_sidecar_assets(record)
+    if not assets:
+        return "empty", []
+    uploaded, failed = _upload_sidecar_assets_detailed(record, assets)
+    if failed:
+        return "failed", failed
+    try:
+        _cleanup_episode_dir(episode_dir(
+            record.get("tmdbId"), record.get("season"),
+            record.get("episode"), record.get("year"),
+        ))
+    except ValueError:
+        pass
+    return "done", uploaded
+
+
 def reupload_pending():
     """手动补传：读 upload_pending.jsonl，逐条重传上传失败留在本地的成品。
 
@@ -5557,6 +5782,9 @@ def reupload_pending():
       2. 同一集（tmdbId+season+episode）只保留最新一条 pending 记录（去孤儿/去重复）。
       3. 补传成功 -> 删本地 + 从 pending 移除（重写整个文件）+ 更新 SUCCESS_LOG
          标 uploaded:true；仍失败则保留该条 pending。
+      4. `assets_only: true` 的记录（视频已进 R2，只欠 meta.json/字幕）不走第 1 条
+         的视频存在性判定：回扫集目录补传剩余资产，全部成功才移出 pending 并清
+         目录；回扫为空视为消解；不改 SUCCESS_LOG（视频行早已 uploaded:true）。
     """
     if not S3_ENABLED:
         print("s3.enabled=false，未开启远端上传，无需补传。")
@@ -5599,6 +5827,7 @@ def reupload_pending():
 
     remaining = {}  # key -> record，仍失败保留
     success_count = 0
+    assets_count = 0
     orphan_count = 0
     fail_count = 0
     # 中断（Ctrl+C / SIGTERM）后**未轮到**的记录：必须原样保留进 pending。
@@ -5646,6 +5875,25 @@ def reupload_pending():
                 print(f"  [{key}] 无法生成 s3_key，保留 pending: {exc}")
                 continue
 
+            if record.get("assets_only"):
+                # 视频早已进 R2（本地也已删），这条只欠旁车资产：不能拿"视频不在
+                # 本地"当孤儿，改为回扫集目录补传剩余资产。
+                status, detail = _reupload_assets_only(record)
+                if status == "done":
+                    assets_count += 1
+                    print(f"  [{key}] 旁车资产补传成功: {detail}")
+                elif status == "empty":
+                    orphan_count += 1
+                    print(f"  [{key}] 集目录已无旁车资产，视为已消解并移除 pending")
+                else:
+                    record["failed_assets"] = detail
+                    record["fail_reason"] = f"旁车资产上传失败: {', '.join(detail)}"
+                    record["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    remaining[key] = record
+                    fail_count += 1
+                    print(f"  [{key}] 旁车资产补传仍失败，保留 pending: {detail}")
+                continue
+
             if not local_path or not os.path.exists(local_path):
                 # 文件已不在本地：视为已消解（可能此前已成功补传），从 pending 移除。
                 orphan_count += 1
@@ -5655,8 +5903,20 @@ def reupload_pending():
             print(f"  [{key}] 补传中 -> {s3_key}")
             ok, reason = upload_to_r2(local_path, s3_key)
             if ok:
-                # 视频补传成功后顺带把旁车资产一并补上（内部已吞异常）。
-                asset_keys = upload_sidecar_assets(record)
+                # 视频补传成功后顺带把旁车资产一并补上（内部已吞异常）。没传上的
+                # 资产降级为一条 assets_only pending 留在台账里，下次 reupload 再补。
+                asset_keys, failed_assets = _upload_sidecar_assets_detailed(record)
+                if failed_assets:
+                    remaining[key] = {
+                        **record,
+                        "s3_key": s3_key,
+                        "assets_only": True,
+                        "failed_assets": failed_assets,
+                        "fail_reason": f"旁车资产上传失败: {', '.join(failed_assets)}",
+                        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    print(f"  [{key}] 视频已补传，旁车资产 {failed_assets} 仍失败，"
+                          f"降级为 assets_only pending")
                 if DELETE_LOCAL_AFTER_UPLOAD:
                     remove_file(local_path)
                     _cleanup_episode_dir(os.path.dirname(local_path))
@@ -5716,6 +5976,8 @@ def reupload_pending():
         f"补传完成：成功 {success_count}，仍失败 {fail_count}，"
         f"孤儿(本地已无)清理 {orphan_count}"
     )
+    if assets_count:
+        summary += f"，旁车资产补齐 {assets_count}"
     if interrupted_at is not None:
         summary += f"，中断保留 {untouched_count}"
     print(f"{summary}；pending 剩余 {len(keep)} 条。")

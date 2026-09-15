@@ -697,7 +697,8 @@ download_tv:
     secret_key: ""           # 环境变量 R2_SECRET_KEY
     upload_workers: 16       # 上传并发数
     max_pending_uploads: 64  # 反压阈值：在途上传数达到此值，新转封装完的集先在等待队列挂起（不阻塞主循环），防磁盘撑爆
-    upload_retry_max: 5      # 单文件上传最大重试次数（凭证/权限/桶不存在等确定性失败不重试）
+    upload_retry_max: 5      # 单文件上传最大尝试次数（401/403/404、凭证/权限/桶不存在等确定性失败不重试）
+    upload_retry_max_400: 2  # HTTP 400 的有限尝试次数：瞬时 400（RequestTimeout/BadDigest 等）能救回，确定性 400 只多花一轮
     upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避封顶 60s）
     connect_timeout: 15      # boto3 连接超时（秒）：默认 60s 太长，R2 抖动时会顶满反压
     read_timeout: 120        # boto3 读取超时（秒）
