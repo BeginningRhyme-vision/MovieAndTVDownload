@@ -324,6 +324,95 @@ def test_remove_upload_failure_from_log(sandbox):
     assert path.read_text(encoding="utf-8") == before
 
 
+def test_update_success_log_many_single_rewrite(sandbox, monkeypatch):
+    """批量版一次重写覆盖多 key、追加新 key、保留坏行；os.replace 只发生一次。"""
+    path = sandbox / "success.jsonl"
+    path.write_text(
+        json.dumps({"tmdbId": 1, "season": 1, "episode": 1, "uploaded": False}) + "\n"
+        + "garbage line\n"
+        + json.dumps({"tmdbId": 1, "season": 1, "episode": 2, "uploaded": False}) + "\n"
+        + json.dumps({"tmdbId": 1, "season": 1, "episode": 1, "uploaded": False}) + "\n",
+        encoding="utf-8",
+    )
+    replaces = []
+    real_replace = d.os.replace
+    monkeypatch.setattr(d.os, "replace", lambda a, b: (replaces.append(b), real_replace(a, b)))
+    d.update_success_log_many({
+        "1_S01E01": {"tmdbId": 1, "season": 1, "episode": 1, "uploaded": True},
+        "1_S01E02": {"tmdbId": 1, "season": 1, "episode": 2, "uploaded": True},
+        "9_S02E02": {"tmdbId": 9, "season": 2, "episode": 2, "uploaded": True},
+    })
+    assert len(replaces) == 1
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[1] == "garbage line"
+    recs = [json.loads(l) for l in lines if l.startswith("{")]
+    assert [d.record_episode_key(r) for r in recs] == ["1_S01E01", "1_S01E02", "9_S02E02"]
+    assert all(r["uploaded"] for r in recs)
+    # 空字典不动文件
+    d.update_success_log_many({})
+    assert len(replaces) == 1
+
+
+def test_remove_upload_failures_from_log_batch(sandbox, monkeypatch):
+    path = sandbox / "failed.jsonl"
+    recs = [
+        {"tmdbId": 1, "season": 1, "episode": 1, "stage": "upload"},
+        {"tmdbId": 1, "season": 1, "episode": 1, "stage": "download"},
+        {"tmdbId": 1, "season": 1, "episode": 2, "stage": "upload"},
+        {"tmdbId": 1, "season": 1, "episode": 3, "stage": "upload"},
+    ]
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs), encoding="utf-8")
+    replaces = []
+    real_replace = d.os.replace
+    monkeypatch.setattr(d.os, "replace", lambda a, b: (replaces.append(b), real_replace(a, b)))
+    d.remove_upload_failures_from_log(["1_S01E01", "1_S01E02"])
+    assert len(replaces) == 1
+    assert _read_jsonl(path) == [recs[1], recs[3]]
+    d.remove_upload_failures_from_log([])
+    d.remove_upload_failures_from_log(["nope"])
+    assert len(replaces) == 1
+
+
+def test_clean_stale_log_tmp(sandbox, capsys):
+    """启动清掉 SUCCESS_LOG/FAILED_LOG 的 .tmp 残骸，正式文件不动，缺失不报错。"""
+    (sandbox / "success.jsonl").write_text("keep\n", encoding="utf-8")
+    (sandbox / "success.jsonl.tmp").write_text("half\n", encoding="utf-8")
+    (sandbox / "failed.jsonl.tmp").write_text("half\n", encoding="utf-8")
+    d.clean_stale_log_tmp()
+    assert (sandbox / "success.jsonl").read_text(encoding="utf-8") == "keep\n"
+    assert not (sandbox / "success.jsonl.tmp").exists()
+    assert not (sandbox / "failed.jsonl.tmp").exists()
+    assert capsys.readouterr().out.count("已清理上次强杀") == 2
+    d.clean_stale_log_tmp()   # 再跑一次：无残骸、无输出、无异常
+    assert capsys.readouterr().out == ""
+
+
+def test_second_signal_releases_lock_before_force_exit(monkeypatch, capsys):
+    """D1：第二次信号不再 SIG_DFL 硬杀——先 release_main_lock 再 os._exit(130)。"""
+    events = []
+    monkeypatch.setattr(d.signal, "signal", lambda sig, h: events.append(("reg", sig, h)))
+    monkeypatch.setattr(d, "release_main_lock", lambda: events.append("release"))
+    monkeypatch.setattr(d.os, "_exit", lambda code: events.append(("exit", code)))
+    d.interrupted.clear()
+    handler, force_exit = d.install_interrupt_handler()
+    events.clear()
+
+    with pytest.raises(KeyboardInterrupt):
+        handler(d.signal.SIGINT, None)
+    assert d.interrupted.is_set()
+    # 首次信号把两个信号都切到 _force_exit，而不是 SIG_DFL
+    assert [e for e in events if e[0] == "reg"] == [
+        ("reg", d.signal.SIGINT, force_exit),
+        ("reg", d.signal.SIGTERM, force_exit),
+    ]
+    events.clear()
+
+    force_exit(d.signal.SIGINT, None)
+    assert events == ["release", ("exit", 130)]
+    assert "强制退出" in capsys.readouterr().out
+    d.interrupted.clear()
+
+
 def test_write_log_and_pending(sandbox):
     d.write_log(d.FAILED_LOG, {"tmdbId": 1, "season": 1, "episode": 1, "title": "剧"})
     d.write_pending({"tmdbId": 1, "season": 1, "episode": 1})
@@ -3258,6 +3347,74 @@ def test_async_dispatch_is_noop_without_hook(monkeypatch):
     monkeypatch.setattr(d, "async_refetch_hook", None)
     monkeypatch.setattr(d, "STALE_LINK_SECONDS", 10)
     assert d.dispatch_stale_entries_async([_entry("1", fetched_at=1)], {}) == 0
+
+
+def test_async_dispatch_does_not_count_rejected_inflight(monkeypatch, sandbox):
+    """钩子拒收（同集重取已在途、返回 0）的集**不计**重取额度。
+
+    AsyncRefetcher.dispatch 对在途同集返回 0；预检若先计数再投，这一次
+    "没发生的重取"会白白吃掉每集上限，与 download 分支的口径不一致。
+    """
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 10)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_RUN", 10)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_EPISODE", 2)
+    monkeypatch.setattr(d, "load_quality_dead_keys", lambda: set())
+
+    class _Hook:
+        def dispatch(self, entries):
+            # 第 2 集"已在途"→拒收
+            return 0 if d.record_episode_key(entries[0]) == "2_S01E02" else 1
+
+    monkeypatch.setattr(d, "async_refetch_hook", _Hook())
+    counts = {}
+    sent = d.dispatch_stale_entries_async(
+        [_entry("1", fetched_at=1), _entry("2", fetched_at=1)], counts
+    )
+    assert sent == 1
+    assert counts == {"1_S01E02": 1}
+
+
+def test_async_dispatch_exception_keeps_already_sent_counts(monkeypatch, sandbox):
+    """逐条投递中途抛异常：已投出的照常计数，后续的不再投、不计数。"""
+    monkeypatch.setattr(d, "STALE_LINK_SECONDS", 10)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_RUN", 10)
+    monkeypatch.setattr(d, "AUTO_REFETCH_MAX_PER_EPISODE", 2)
+    monkeypatch.setattr(d, "load_quality_dead_keys", lambda: set())
+
+    class _Hook:
+        calls = 0
+
+        def dispatch(self, entries):
+            _Hook.calls += 1
+            if _Hook.calls == 2:
+                raise RuntimeError("boom")
+            return 1
+
+    monkeypatch.setattr(d, "async_refetch_hook", _Hook())
+    counts = {}
+    sent = d.dispatch_stale_entries_async(
+        [_entry("1", fetched_at=1), _entry("2", fetched_at=2),
+         _entry("3", fetched_at=3)],
+        counts,
+    )
+    assert sent == 1
+    assert counts == {"1_S01E02": 1}
+    assert _Hook.calls == 2
+
+
+def test_sync_refetch_refuses_when_async_hook_installed(monkeypatch, capsys):
+    """装了 async_refetch_hook 后同步 refetch_entries 必须拒入（锁契约守卫）。
+
+    同步路径用下载侧 log_lock 写 INPUT_JSONL，AsyncRefetcher 用取流侧锁；
+    两者并行会交叉追加。守卫返回空并打警告，不动 refetch_counts。
+    """
+    monkeypatch.setattr(d, "async_refetch_hook", object())
+    counts = {}
+    assert d.refetch_entries([_entry("1", fetched_at=1)], counts) == []
+    assert counts == {}
+    assert "同步 refetch_entries 不应被调用" in capsys.readouterr().out
 
 
 # ------------------------------------------------ 流式来源（pipeline 模式）

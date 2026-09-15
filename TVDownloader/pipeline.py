@@ -6,6 +6,11 @@
     python tv_ids_to_links.py     # 旧入口：只跑取流（一行未改）
     python download_tv.py         # 旧入口：只跑下载（一行未改）
 
+命令行参数原样透传给**取流侧**（tv_ids_to_links._parse_args）。下载侧的
+`--retry-only` / `--retry-dead` 在 pipeline 模式下**不解析、恒为 False**：
+前者本就只是语义标记（默认行为已等价），后者（判死复判）请单独跑
+`python download_tv.py --retry-dead`。
+
 为什么要重叠：
   - vidlink 出的是**带时效签名的 mp4 直链**。串行模式下最早取到的那批，
     等轮到下载时可能已经放了几十小时；重叠后从产出到消费只隔几分钟。

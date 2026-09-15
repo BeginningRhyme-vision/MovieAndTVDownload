@@ -199,6 +199,12 @@ FAILED_LOG_MAX_BYTES = max(
 )
 # 由 __main__ 按命令行开关置位；模块级默认 False，便于测试直接 monkeypatch。
 RETRY_DEAD_MODE = False
+# RETRY_ONLY_MODE：仅作语义标记与日志提示。**它不改变任何筛选逻辑**——下载侧
+# 本来就是"输入 results.jsonl、跳过 success.jsonl ∪ 磁盘成品 ∪ 判死"，这恰好
+# 就是"只重试尚未成功的集"。加这个开关是为了让意图在命令行里显式可见（适合
+# 挂定时任务），与电影侧 download_movies.py 口径一致。任何地方都**不应**读它
+# 做分支——若日后需要真正不同的筛选行为，请新开一个开关而不是复用这个名字。
+# pipeline.py 合并跑时不解析 download_tv 的命令行，两个开关恒为 False。
 RETRY_ONLY_MODE = False
 BASE_DIR = resolve_dir(_CFG.get("base_dir"), "downloads")
 # 本地目录与 R2 对象键共用的根段，使两侧严格同构：
@@ -922,6 +928,10 @@ def scan_downloaded_mp4_ids():
 
     顺带清理 0 字节 mp4：那是移动中断留下的残骸，既不是有效成品也不该被误判
     为"已下载"而永久跳过该集。只删大小为 0 的，有内容的一律不动。
+    注意：本项目成品路径上没有 `.part` 之类的中间命名——ffmpeg 输出在 TEMP_DIR
+    （由 clean_temp_directory 清），成品只经 shutil.move 一步落到集目录。跨文件
+    系统 move 被强杀可能留下**非 0 字节的半成品**，它与完整成品无法从大小区分，
+    这里不碰；那种情况由 R2 侧 head 校验 / 人工核对兜底。
     """
     downloaded_ids = set()
     locations = {}
@@ -1578,12 +1588,26 @@ def update_success_log(key, new_record):
     用于 reupload 补传成功后，避免同一集在 SUCCESS_LOG 中残留
     uploaded:false / uploaded:true 两条记录。理想状态：每个下载成功的
     集只有一条记录（不管上传成功与否）。
-    全程 log_lock 保护，读全量 -> 覆盖/追加 -> 写临时文件 -> os.replace 原子替换。
+    单条版本，委托给批量版 update_success_log_many（一次全量重写）。
     """
-    key = str(key)
+    update_success_log_many({str(key): new_record})
+
+
+def update_success_log_many(records_by_key):
+    """批量版 update_success_log：一次全量读写把多条 key 一起覆盖/追加。
+
+    每次调用都是 O(N) 全量重写并持 `log_lock`（期间阻塞所有 write_log）。
+    SUCCESS_LOG 数万行时单次几十 ms——降级/补传逐条调用会把这个成本乘上条数，
+    故 `reupload_pending` 收集本轮成功记录后走这里**一次**写完。
+    全程 log_lock 保护，读全量 -> 覆盖/追加 -> 写临时文件 -> os.replace 原子替换。
+    空字典直接返回，不动文件。
+    """
+    if not records_by_key:
+        return
+    pending_map = {str(k): v for k, v in records_by_key.items()}
     with log_lock:
         records = []
-        replaced = False
+        replaced = set()
         if os.path.exists(SUCCESS_LOG):
             with open(SUCCESS_LOG, "r", encoding="utf-8") as file:
                 for line in file:
@@ -1595,15 +1619,17 @@ def update_success_log(key, new_record):
                     except json.JSONDecodeError:
                         records.append(line)  # 无法解析的行原样保留，避免丢数据
                         continue
-                    if record_episode_key(record) == key:
-                        if not replaced:
-                            records.append(new_record)
-                            replaced = True
+                    rec_key = record_episode_key(record)
+                    if rec_key in pending_map:
+                        if rec_key not in replaced:
+                            records.append(pending_map[rec_key])
+                            replaced.add(rec_key)
                         # 后续同 key 记录直接丢弃（去重）
                         continue
                     records.append(record)
-        if not replaced:
-            records.append(new_record)
+        for key, new_record in pending_map.items():
+            if key not in replaced:
+                records.append(new_record)
 
         tmp_path = SUCCESS_LOG + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as file:
@@ -1622,9 +1648,22 @@ def remove_upload_failure_from_log(key):
     即可判定所有下载成功的集都已上传成功。
     只删 stage=="upload" 的行，保留 download/conversion/preflight 等其它阶段
     的失败记录（那些不是上传问题，不应被补传成功抹掉）。
-    全程 log_lock 保护，读全量 -> 过滤 -> 写临时文件 -> os.replace 原子替换。
+    单条版本，委托给批量版 remove_upload_failures_from_log（一次全量重写）。
     """
-    key = str(key)
+    remove_upload_failures_from_log([key])
+
+
+def remove_upload_failures_from_log(keys):
+    """批量版 remove_upload_failure_from_log：一次全量读写删掉多条 key 的上传失败行。
+
+    与 update_success_log_many 同理——FAILED_LOG 可达上百 MB（有轮转阈值），
+    补传成功几百条时逐条 O(N) 重写不可接受。
+    全程 log_lock 保护，读全量 -> 过滤 -> 写临时文件 -> os.replace 原子替换。
+    空集合直接返回，不动文件。
+    """
+    key_set = {str(k) for k in keys}
+    if not key_set:
+        return
     with log_lock:
         if not os.path.exists(FAILED_LOG):
             return
@@ -1640,7 +1679,7 @@ def remove_upload_failure_from_log(key):
                 except json.JSONDecodeError:
                     kept.append(stripped)  # 无法解析的行原样保留
                     continue
-                if (record_episode_key(record) == key
+                if (record_episode_key(record) in key_set
                         and record.get("stage") == "upload"):
                     changed = True
                     continue  # 丢弃这条上传失败记录
@@ -1891,6 +1930,24 @@ def clean_temp_directory():
             (".ts", ".mp4")
         ):
             remove_file(path)
+
+
+def clean_stale_log_tmp():
+    """启动时清掉 SUCCESS_LOG / FAILED_LOG 原子重写留下的 `.tmp` 残骸。
+
+    `update_success_log_many` / `remove_upload_failures_from_log` /
+    `compact_failed_log` 都是"写 X.tmp → os.replace 到 X"。进程在两步之间被
+    强杀（第二次 Ctrl+C 的 os._exit、kill -9、断电），X 仍是旧的完整内容、
+    X.tmp 是半成品。下次运行任何一次重写都会以 "w" 覆盖 X.tmp，所以它**不会**
+    污染数据；清掉只是为了不让运维误把 `.tmp` 当成账本备份。绝不抛异常。
+    """
+    for path in (SUCCESS_LOG + ".tmp", FAILED_LOG + ".tmp"):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                print(f"已清理上次强杀留下的日志临时文件: {path}", flush=True)
+        except OSError as exc:
+            print(f"⚠️ 清理 {path} 失败（已忽略）: {exc}", flush=True)
 
 
 def move_to_target_folder(temp_mp4, tmdb_id, season, episode, year=None):
@@ -4038,7 +4095,20 @@ def refetch_entries(entries, refetch_counts):
       不再重取（新链接同样可能在排队期间再过期，但必须有上限防空转）。
     - 取流侧任何异常都不得逃逸：重取是"锦上添花"的捞回，失败了退回原状即可，
       绝不能让它崩掉整条下载流水线。
+
+    ⚠️ 锁契约：本函数（及其晚写回调 `_persist_late_refetch`）用**下载侧**的
+    `write_log` + `log_lock` 写 INPUT_JSONL；pipeline 的 `AsyncRefetcher` 则走
+    **取流侧**的 `fetcher.append_result`（取流侧自己的锁）。两把锁互不感知，
+    若同时活跃会对同一文件交叉追加。因此装了 `async_refetch_hook` 后**禁止**
+    进入同步路径——所有调用点都已按钩子分流，这里再加一道守卫兜底。
     """
+    if async_refetch_hook is not None:
+        print(
+            "⚠️ 已安装异步重取钩子，同步 refetch_entries 不应被调用（已跳过）；"
+            "请检查调用点是否漏了 async_refetch_hook 分流。",
+            flush=True,
+        )
+        return []
     # 延迟导入：取流侧模块 import 时会读 config、要求 TMDB key 与代理凭证并建
     # Session，放在模块级会让"只想跑下载"的场景平白多出这些依赖与副作用。
     #
@@ -4152,6 +4222,12 @@ def _persist_late_refetch(key, future):
     离开 refetch_entries，这里不能再往 revived 里塞，唯一能做的就是把新链接
     持久化，让"跨运行重试"接力。任何异常都不能逃逸——回调里抛错只会被
     concurrent.futures 吞掉记日志，但没必要留这种噪音。
+
+    并发说明：晚写可能发生在 `main()` 已返回、`__main__`/pipeline 正在跑
+    `reupload_pending` / `compact_failed_log` 之时。这里**只追加 INPUT_JSONL**
+    （经 `write_log` + `log_lock`），前两者只碰 pending / SUCCESS_LOG /
+    FAILED_LOG，文件集合不相交，无冲突；INPUT_JSONL 追加是幂等的（下次运行按
+    fetched_at 择新），即便进程随后退出、这条没写完，也只是少一次捞回。
     """
     try:
         if future.cancelled():
@@ -4256,6 +4332,9 @@ def dispatch_stale_entries_async(entries, refetch_counts):
     早已过期，那批集会每次运行都判一遍"需重新取流"然后什么也不做，永久卡死。
 
     投递计入 refetch_counts（每集重取上限跨预检与轮次共用）。返回投递数。
+    与 download 分支的过期重投口径一致：**逐条** dispatch、只对钩子实际接收
+    （accepted > 0）的集计额度——钩子对"同集重取已在途"的条目会拒收，那次
+    不算重取；批量 dispatch 只回总数、分不清哪条被拒，故不能先计数再整批投。
     """
     hook = async_refetch_hook
     if (
@@ -4265,28 +4344,31 @@ def dispatch_stale_entries_async(entries, refetch_counts):
         return 0
 
     stale, deferred = _select_stale_entries(entries)
-    to_dispatch = []
+    dispatched = 0
     for entry in stale:
         key = record_episode_key(entry)
         if not key:
             continue
-        if refetch_counts.get(key, 0) >= AUTO_REFETCH_MAX_PER_EPISODE:
+        used = refetch_counts.get(key, 0)
+        if used >= AUTO_REFETCH_MAX_PER_EPISODE:
             continue
-        refetch_counts[key] = refetch_counts.get(key, 0) + 1
-        to_dispatch.append(entry)
-    if not to_dispatch:
-        return 0
-
-    try:
-        hook.dispatch(to_dispatch)
-    except Exception as exc:  # noqa: BLE001
-        # 预检是锦上添花：投不出去就沿用旧链接，绝不影响首轮下载。
-        print(f"⚠️ 启动预检投递失败，沿用原直链继续: {exc}", flush=True)
+        try:
+            accepted = hook.dispatch([entry])
+        except Exception as exc:  # noqa: BLE001
+            # 预检是锦上添花：投不出去就沿用旧链接，绝不影响首轮下载。
+            # 已投出去的照常算数（它们已进钩子队列）。
+            print(f"⚠️ 启动预检投递失败，沿用原直链继续: {exc}", flush=True)
+            break
+        if accepted is not None and accepted <= 0:
+            continue
+        refetch_counts[key] = used + 1
+        dispatched += 1
+    if dispatched <= 0:
         return 0
 
     hours = STALE_LINK_SECONDS / 3600
     print(
-        f"\n[启动预检] {len(to_dispatch)}/{len(entries)} 集的直链已超过 "
+        f"\n[启动预检] {dispatched}/{len(entries)} 集的直链已超过 "
         f"{hours:.0f} 小时，已交给取流线程异步换新（不阻塞首轮下载；"
         f"旧链接照常先试，新链接回收后随到随投或留待下次运行）。",
         flush=True,
@@ -4298,7 +4380,7 @@ def dispatch_stale_entries_async(entries, refetch_counts):
             f"它们照常用原直链下载，下次运行会优先轮到。",
             flush=True,
         )
-    return len(to_dispatch)
+    return dispatched
 
 
 def refresh_stale_entries(entries, refetch_counts):
@@ -4489,13 +4571,28 @@ def install_interrupt_handler():
     31 个线程继续刷失败日志，只能 kill -9；而 kill -9 会截断正在写的
     results.jsonl / success.jsonl，把断点续跑的账本写坏。
 
-    首次收到信号：置位事件 + 恢复默认处理器，然后照常抛 KeyboardInterrupt 走
-    正常收尾（落盘、打统计、释放锁）。
-    再按一次 Ctrl+C 就是默认行为（立即终止），给"等不及了"留出硬退出的口子。
+    首次收到信号：置位事件 + 切换到"强制退出"处理器，然后照常抛
+    KeyboardInterrupt 走正常收尾（落盘、打统计、释放锁）。
+    再按一次 Ctrl+C 走 `_force_exit`：**不是** SIG_DFL 硬杀——SIG_DFL 会让
+    PID 锁文件留在磁盘上（下次启动被 `acquire_main_lock` 拒绝，需手动删），
+    还可能把 SUCCESS_LOG 原子重写的 `.tmp` 留下。所以第二次信号至少做两件事
+    再 `os._exit`：释放 PID 锁、打印一行提示。`os._exit` 不跑 atexit/finally，
+    仍是"立即终止"语义，给"等不及了"留的硬退出口子没有变窄。
 
     pipeline 模式下该处理器同样生效：`downloader.main()` 在主线程里跑，
     取流线程则由 pipeline 的 stop_event 负责收尾，两条路径互不干扰。
     """
+    def _force_exit(signum, _frame):
+        print(
+            f"\n⚠️ 再次收到信号 {signum}，强制退出（不等待收尾）。",
+            flush=True,
+        )
+        try:
+            release_main_lock()
+        except Exception:
+            pass
+        os._exit(130)
+
     def _handler(signum, _frame):
         interrupted.set()
         print(
@@ -4503,9 +4600,9 @@ def install_interrupt_handler():
             f"（再按一次 Ctrl+C 可强制退出）...",
             flush=True,
         )
-        # 恢复默认：第二次信号直接杀进程，不再走优雅收尾。
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        # 第二次信号切到 _force_exit：释放 PID 锁后立即 os._exit，不再走优雅收尾。
+        signal.signal(signal.SIGINT, _force_exit)
+        signal.signal(signal.SIGTERM, _force_exit)
         raise KeyboardInterrupt()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -4514,6 +4611,7 @@ def install_interrupt_handler():
         except ValueError:
             # 非主线程注册会抛 ValueError（如被 import 进别的框架里跑），忽略即可。
             pass
+    return _handler, _force_exit
 
 
 def main():
@@ -4592,6 +4690,7 @@ def main():
 
 def _run_pipeline():
     clean_temp_directory()
+    clean_stale_log_tmp()
     print("已清理 temp 目录中的旧临时文件")
 
     logged_ids = load_success_log_ids()
@@ -4805,14 +4904,26 @@ def _run_pipeline():
             print(f"上传提交失败: {label}: {exc}")
             return
         # release 由 future 完成回调对称释放，保证无论上传成功/异常/取消都
-        # 不泄漏信号量。
-        upload_future.add_done_callback(
-            lambda _f: upload_semaphore.release()
-        )
-        upload_future_to_entry[upload_future] = entry
-        stage_of[upload_future] = "upload"
-        pending.add(upload_future)
-        stats["uploads"] += 1
+        # 不泄漏信号量。回调挂载必须紧跟 submit——挂载与后续登记之间若抛异常
+        # （极窄窗口，如 stats/pending 被并发改坏），槽位没人释放。故把登记
+        # 包进 try：登记失败时若回调尚未挂上就手动 release，挂上了则由回调兜底。
+        callback_attached = False
+        try:
+            upload_future.add_done_callback(
+                lambda _f: upload_semaphore.release()
+            )
+            callback_attached = True
+            upload_future_to_entry[upload_future] = entry
+            stage_of[upload_future] = "upload"
+            pending.add(upload_future)
+            stats["uploads"] += 1
+        except Exception as exc:
+            if not callback_attached:
+                upload_semaphore.release()
+            # future 已在跑，槽位由回调兜底。登记顺序是 映射→stage→pending→
+            # stats：任一步失败时 future 要么还没进 pending（主循环不会碰它，
+            # 上传完成后由 upload_one_entry 自己落盘），要么已完整登记。
+            print(f"⚠️ 上传登记异常: {label}: {exc}", flush=True)
 
     def flush_upload_waiting():
         """尽力把等待队列里的集提交上传；**绝不阻塞**。
@@ -5458,65 +5569,83 @@ def reupload_pending():
     success_count = 0
     orphan_count = 0
     fail_count = 0
+    # 补传成功的 SUCCESS_LOG / FAILED_LOG 更新**攒批**写：两者都是持 log_lock
+    # 的 O(N) 全量重写，逐条调用在 pending 积压几百条时会把收尾拖成分钟级。
+    # 但也不能只在最后写一次——中途被杀会让已上传+已删本地的集永远停在
+    # uploaded:false。折中：每 REUPLOAD_LOG_FLUSH_EVERY 条刷一次 + finally 兜底。
+    success_records = {}   # key -> SUCCESS_LOG 新记录
+    REUPLOAD_LOG_FLUSH_EVERY = 50
 
-    for key in order:
-        record = latest_by_id[key]
-        local_path = record.get("local_path", "")
-        try:
-            s3_key = record.get("s3_key") or build_s3_key(
-                record.get("tmdbId"),
-                record.get("season"),
-                record.get("episode"),
-                record.get("year"),
-            )
-        except ValueError as exc:
-            record["fail_reason"] = str(exc)
-            remaining[key] = record
-            fail_count += 1
-            print(f"  [{key}] 无法生成 s3_key，保留 pending: {exc}")
-            continue
+    def _flush_logs():
+        if not success_records:
+            return
+        keys = list(success_records)
+        update_success_log_many(success_records)
+        remove_upload_failures_from_log(keys)
+        success_records.clear()
 
-        if not local_path or not os.path.exists(local_path):
-            # 文件已不在本地：视为已消解（可能此前已成功补传），从 pending 移除。
-            orphan_count += 1
-            print(f"  [{key}] 本地文件不存在，跳过并移除 pending: {local_path}")
-            continue
+    try:
+        for key in order:
+            record = latest_by_id[key]
+            local_path = record.get("local_path", "")
+            try:
+                s3_key = record.get("s3_key") or build_s3_key(
+                    record.get("tmdbId"),
+                    record.get("season"),
+                    record.get("episode"),
+                    record.get("year"),
+                )
+            except ValueError as exc:
+                record["fail_reason"] = str(exc)
+                remaining[key] = record
+                fail_count += 1
+                print(f"  [{key}] 无法生成 s3_key，保留 pending: {exc}")
+                continue
 
-        print(f"  [{key}] 补传中 -> {s3_key}")
-        ok, reason = upload_to_r2(local_path, s3_key)
-        if ok:
-            # 视频补传成功后顺带把旁车资产一并补上（内部已吞异常）。
-            asset_keys = upload_sidecar_assets(record)
-            if DELETE_LOCAL_AFTER_UPLOAD:
-                remove_file(local_path)
-                _cleanup_episode_dir(os.path.dirname(local_path))
-            update_success_log(key, {
-                "tmdbId": record.get("tmdbId"),
-                "season": parse_int(record.get("season")),
-                "episode": parse_int(record.get("episode")),
-                "title": record.get("title", ""),
-                "year": record.get("year"),
-                # ⚠️ update_success_log 是**整条覆盖**写。provider 归因必须
-                # 从 pending 记录里原样带回来，否则补传一次就把"这集是哪家
-                # 下成的"抹掉了——而降级留本地的集恰恰是上传侧出故障时的一
-                # 大批，抹掉会让各源转化率统计系统性偏低。
-                **_attribution_of(record),
-                "final_path": local_path,
-                "s3_key": s3_key,
-                "asset_keys": asset_keys,
-                "uploaded": True,
-                "reupload": True,
-            })
-            remove_upload_failure_from_log(key)
-            success_count += 1
-            print(f"  [{key}] 补传成功: {s3_key}")
-        else:
-            record["s3_key"] = s3_key
-            record["fail_reason"] = reason
-            record["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            remaining[key] = record
-            fail_count += 1
-            print(f"  [{key}] 补传仍失败，保留 pending: {reason}")
+            if not local_path or not os.path.exists(local_path):
+                # 文件已不在本地：视为已消解（可能此前已成功补传），从 pending 移除。
+                orphan_count += 1
+                print(f"  [{key}] 本地文件不存在，跳过并移除 pending: {local_path}")
+                continue
+
+            print(f"  [{key}] 补传中 -> {s3_key}")
+            ok, reason = upload_to_r2(local_path, s3_key)
+            if ok:
+                # 视频补传成功后顺带把旁车资产一并补上（内部已吞异常）。
+                asset_keys = upload_sidecar_assets(record)
+                if DELETE_LOCAL_AFTER_UPLOAD:
+                    remove_file(local_path)
+                    _cleanup_episode_dir(os.path.dirname(local_path))
+                success_records[key] = {
+                    "tmdbId": record.get("tmdbId"),
+                    "season": parse_int(record.get("season")),
+                    "episode": parse_int(record.get("episode")),
+                    "title": record.get("title", ""),
+                    "year": record.get("year"),
+                    # ⚠️ update_success_log 是**整条覆盖**写。provider 归因必须
+                    # 从 pending 记录里原样带回来，否则补传一次就把"这集是哪家
+                    # 下成的"抹掉了——而降级留本地的集恰恰是上传侧出故障时的一
+                    # 大批，抹掉会让各源转化率统计系统性偏低。
+                    **_attribution_of(record),
+                    "final_path": local_path,
+                    "s3_key": s3_key,
+                    "asset_keys": asset_keys,
+                    "uploaded": True,
+                    "reupload": True,
+                }
+                success_count += 1
+                print(f"  [{key}] 补传成功: {s3_key}")
+                if len(success_records) >= REUPLOAD_LOG_FLUSH_EVERY:
+                    _flush_logs()
+            else:
+                record["s3_key"] = s3_key
+                record["fail_reason"] = reason
+                record["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                remaining[key] = record
+                fail_count += 1
+                print(f"  [{key}] 补传仍失败，保留 pending: {reason}")
+    finally:
+        _flush_logs()
 
     # 重写整个 pending 文件：仅保留仍失败的记录。用锁保证与在跑主流程互斥。
     with pending_lock:
@@ -5554,6 +5683,7 @@ if __name__ == "__main__":
             print(
                 "[重试模式] 只重试 results.jsonl 里尚未成功的集"
                 "（跳过 success.jsonl、磁盘已有成品、画质判死）"
+                "——这与默认行为相同，该开关仅作显式标记，不改变筛选逻辑。"
             )
         if RETRY_DEAD_MODE:
             print(
