@@ -969,13 +969,18 @@ def _resolve_providers(names):
 ACTIVE_PROVIDERS = _resolve_providers(_CFG.get("providers") or DEFAULT_PROVIDERS)
 
 
-def process_episode(tid, season, episode, providers=None):
+def process_episode(tid, season, episode, providers=None, stop_event=None):
     """处理单集，仅对瞬时错误重试。
 
     返回 (status, 结果字典或None)，status 三态供多轮捞回区分：
       - "ok"    成功，附结果字典 {urls, tmdbId, season, episode, title, + 静态元数据}
       - "dead"  确认真无源（NoSource）→ 这一集永久排除（不影响同剧其它集）
       - "retry" 瞬时错误换 IP 重试 MAX_RETRIES 次仍失败 → 下一轮重跑
+
+    stop_event（可选，pipeline 模式用）：每次尝试开跑前检查，已置位则立即返回
+    ("retry", None)——不再发起新请求、也不再走判死确认。一集最多 4 次尝试 × 3 源
+    × 超时，跑满要几分钟；pipeline 收工时 FetchWorker.shutdown 只等 30 秒，不早退
+    的话取流线程会被强行遗弃在半途。retry 语义保证这集下次续跑仍会重试。
 
     多源：同一次尝试内按 providers 顺序逐家取流，把各家给出的 url 全部汇总
     （按 url 去重、保持 providers 顺序），下载侧按节点顺序逐个尝试，某家的流
@@ -992,6 +997,9 @@ def process_episode(tid, season, episode, providers=None):
     attempt = 0
     nosource_hits = 0
     while True:
+        if stop_event is not None and stop_event.is_set():
+            print(f"  [停止信号] {label}: 放弃后续尝试，留待下次续跑")
+            return "retry", None
         attempt += 1
         # 每集、每次重试用一个独立 Session：复用连接、绑定本次随机出口 IP
         with requests.Session(impersonate="chrome") as session:
@@ -1108,16 +1116,28 @@ def _load_ok_keys(results_file):
 
 
 def _load_fail(fail_file):
-    """解析 fail.txt，返回 (集级真无源集合, 剧级失效 tid 集合)；retry-exhausted 行忽略。"""
+    """解析 fail.txt，返回 (集级真无源集合, 剧级失效 tid 集合)；retry-exhausted 行忽略。
+
+    格式异常的行（列数不对、tag 不认识、季/集非整数）跳过但**计数告警**：
+    fail.txt 是人工可编辑的文本，一行被编辑坏了就等于这集"未处理"，静默跳过
+    会让它下次被重新取流、甚至再次写入 fail.txt，需要有人看见。
+    """
     dead_eps = set()
     dead_shows = set()
+    bad = 0
     if fail_file.exists():
         with open(fail_file, 'r', encoding='utf-8') as f:
             for line in f:
-                parts = line.strip().split("\t")
-                if len(parts) == 4 and parts[3] == RETRY_EXHAUSTED_TAG:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) == 4:
+                    if parts[3] != RETRY_EXHAUSTED_TAG:
+                        bad += 1
                     continue
                 if len(parts) != 3:
+                    bad += 1
                     continue
                 tid, s, e = parts
                 if s == "-" and e == "-":
@@ -1126,7 +1146,9 @@ def _load_fail(fail_file):
                 try:
                     dead_eps.add((tid, int(s), int(e)))
                 except ValueError:
-                    pass
+                    bad += 1
+    if bad:
+        print(f"⚠️  {fail_file.name} 有 {bad} 行格式异常，已跳过（这些集会被视作未处理，请人工核对）")
     return dead_eps, dead_shows
 
 
@@ -1234,12 +1256,34 @@ def _rollback_fail_tail(fail_file, items):
     return True
 
 
+# results.jsonl 的**唯一**追加写入口。pipeline 模式下有两路写手同时往这个文件追加：
+# run_batch 的取流线程 与 AsyncRefetcher（下载侧发现直链过期后重取）。两路若各持
+# 各的锁，等于没锁——两行可能交错、产出半行 JSON，下游 json.loads 直接跳过这集。
+# 故锁放在模块级、写入函数对外暴露，pipeline 必须经由它写入。
+_RESULTS_LOCK = threading.Lock()
+
+
+def append_result(results_file, result):
+    """向 results.jsonl 追加一行取流结果（进程内跨线程串行化，单次 write 落一整行）。
+    异常原样冒泡：写不进去就不能假装成功。"""
+    line = json.dumps(result, ensure_ascii=False) + '\n'
+    with _RESULTS_LOCK:
+        with open(results_file, 'a', encoding='utf-8') as f:
+            f.write(line)
+
+
 def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
               on_result=None, stop_event=None):
     """并发处理一批集，实时落盘 ok/dead，返回本批“瞬时耗尽”待重跑的三元组列表。
     write_dead=False（--recheck-dead 模式）：仍无源的集不再重复写 fail.txt（旧行已在），且不启用熔断。
-    熔断：连续 DEAD_STREAK_BREAKER 集 dead（无任何成功间隔）→ 持锁暂停全员，复探金丝雀；
+    熔断：连续 DEAD_STREAK_BREAKER 集 dead（无任何成功间隔）→ 暂停落盘、复探金丝雀；
     金丝雀存活或无法判断则清零继续，明确失败则回滚窗口内 fail 行并抛 DeadStreakBreaker。
+
+    复探**不持锁**：金丝雀要真实取流（CANARY_COUNT 集 × 最多 4 次尝试 × 3 源 ×
+    超时），跑满可达数分钟；若持锁，其余 max_workers-1 个线程会全部冻在 lock 上。
+    改为用 probing 标志 + Condition：复探期间其它线程可继续取流，只是到了落盘 /
+    判定这一步要等复探结束——必须等，因为 _rollback_fail_tail 依赖"fail.txt 末尾
+    N 行恰好是本窗口写的"，复探期间若放任别的线程继续写 fail，尾部就对不上了。
 
     on_result（可选，pipeline 模式用）：取到一条 ok 结果时回调一次，让下游
     （下载侧）立刻拿到这一集，而不必等整轮跑完再读文件。
@@ -1251,10 +1295,12 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
 
     stop_event（可选，pipeline 模式用）：协作式停止信号。置位后：
       - 尚未开跑的集直接跳过（不再消耗代理流量），按 retry 收集；
-      - 已在跑的那一集仍会跑完（HTTP 请求本身无法中途取消），结果照常落盘。
+      - 已在跑的那一集在下一次尝试前退出（见 process_episode），按 retry 收集。
     没有它的话，pipeline 被 Ctrl+C 时取流线程会把整批几百万集跑完才罢休。
     """
     lock = threading.Lock()
+    cond = threading.Condition(lock)
+    probing = False    # 金丝雀复探进行中：其它线程的落盘/判定在 cond 上等待
     ok_count = 0
     dead_count = 0
     retry_items = []
@@ -1263,8 +1309,36 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
     recent_ok = deque(maxlen=50)   # 本轮最近成功的集，作金丝雀候选
     tripped = False
 
+    def probe_and_judge(window):
+        """锁外复探金丝雀，再回到锁内下结论。调用时必须**未持锁**，且 probing 已置位。"""
+        nonlocal tripped, probing
+        try:
+            verdict = _canaries_alive(recent_ok, results_file)
+        except BaseException:
+            with cond:
+                probing = False
+                cond.notify_all()
+            raise
+        with cond:
+            try:
+                if verdict is False:
+                    tripped = True
+                    rolled = _rollback_fail_tail(fail_file, window)
+                    shows = sorted({t for t, _, _ in window})
+                    print(f"  [熔断] 已回滚 fail.txt 末尾 {len(window)} 行。" if rolled else
+                          "  [熔断] fail.txt 尾部与预期不符，未回滚，请人工核对以下剧：")
+                    print(f"  [熔断] 涉及剧 tmdb_id：{' '.join(shows)}")
+                    raise DeadStreakBreaker(
+                        f"连续 {len(window)} 集判死且 {CANARY_COUNT} 个历史成功集复探全部失败，"
+                        f"疑似上游系统性变更，已停止以免整批误杀")
+                print("  [熔断] 金丝雀存活，上游正常，这段剧为真无源，继续。\n" if verdict else
+                      "  [熔断] 金丝雀结果无法判断，放行继续。\n")
+            finally:
+                probing = False
+                cond.notify_all()
+
     def process_one(item):
-        nonlocal tripped
+        nonlocal probing
         tid, s, e = item
         # 停止信号已置位：不再开新的取流请求。按 retry 收集而非 dead——
         # 这些集从未被判过无源，绝不能写进 fail.txt 被永久排除。
@@ -1272,13 +1346,19 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
             with lock:
                 retry_items.append(item)
             return "skipped"
-        status, result = process_episode(tid, s, e)
+        if stop_event is not None:
+            status, result = process_episode(tid, s, e, stop_event=stop_event)
+        else:
+            status, result = process_episode(tid, s, e)
         label = _ep_label(tid, s, e)
-        with lock:
+        window = None
+        with cond:
+            # 复探进行中：等它结束再落盘/判定，保证 fail.txt 尾部与窗口精确匹配
+            while probing:
+                cond.wait()
             if status == "ok" and result:
                 # 熔断后到达的成功仍照常落盘（真成功没理由丢）
-                with open(results_file, 'a', encoding='utf-8') as f:
-                    f.write(json.dumps(result, ensure_ascii=False) + '\n')
+                append_result(results_file, result)
                 print(f"✅ SUCCESS: {result.get('title')} ({label})")
                 dead_streak.clear()
                 recent_ok.append((str(tid), int(s), int(e)))
@@ -1295,21 +1375,12 @@ def run_batch(to_process, results_file, fail_file, max_workers, write_dead=True,
                 if breaker_on:
                     dead_streak.append(item)
                     if len(dead_streak) >= DEAD_STREAK_BREAKER:
-                        print(f"\n⚠️  [熔断] 连续 {len(dead_streak)} 集判死且无一成功，暂停并复探金丝雀…")
-                        verdict = _canaries_alive(recent_ok, results_file)
-                        if verdict is False:
-                            tripped = True
-                            rolled = _rollback_fail_tail(fail_file, dead_streak)
-                            shows = sorted({t for t, _, _ in dead_streak})
-                            print(f"  [熔断] 已回滚 fail.txt 末尾 {len(dead_streak)} 行。" if rolled else
-                                  "  [熔断] fail.txt 尾部与预期不符，未回滚，请人工核对以下剧：")
-                            print(f"  [熔断] 涉及剧 tmdb_id：{' '.join(shows)}")
-                            raise DeadStreakBreaker(
-                                f"连续 {len(dead_streak)} 集判死且 {CANARY_COUNT} 个历史成功集复探全部失败，"
-                                f"疑似上游系统性变更，已停止以免整批误杀")
-                        print("  [熔断] 金丝雀存活，上游正常，这段剧为真无源，继续。\n" if verdict else
-                              "  [熔断] 金丝雀结果无法判断，放行继续。\n")
+                        print(f"\n⚠️  [熔断] 连续 {len(dead_streak)} 集判死且无一成功，暂停落盘并复探金丝雀…")
+                        probing = True
+                        window = list(dead_streak)
                         dead_streak.clear()
+        if window is not None:
+            probe_and_judge(window)
         # ⚠️ 回调必须在**锁外**执行：它可能阻塞（pipeline 模式下队列满时要等
         # 下载侧腾出空位，最长可达数分钟）。若放在临界区内，这一条的等待会把
         # 其余 max_workers-1 个取流线程全堵在 lock 上，整批取流吞吐直接归零——
@@ -1402,18 +1473,19 @@ def _main_impl(argv=None, on_result=None, stop_event=None):
     fail_file = _resolve(_CFG.get("fail_file", "fail.txt"))
     cache_file = _resolve(_CFG.get("seasons_cache", "seasons_cache.jsonl"))
 
+    if not ids_file.exists():
+        print(f"{ids_file} not found!")
+        return
+
     # 单实例锁：两个全量取流同时跑会重复写 results.jsonl / seasons_cache.jsonl，
-    # 并让熔断的尾部回滚失效（见 FETCH_LOCK_FILE 注释）。
+    # 并让熔断的尾部回滚失效（见 FETCH_LOCK_FILE 注释）。放在 ids 存在性检查之后：
+    # 输入都没有就没必要抢锁再释放。
     #
     # ⚠️ --recheck-dead **同样要抢锁**（与电影侧的 --refetch-failed 不同）：
     # 它走的是同一套 expand_seasons + run_batch，会写 results.jsonl 与
     # seasons_cache.jsonl，且熔断的 _rollback_fail_tail 同样依赖"fail.txt 末尾
     # N 行是本进程写的"。电影侧那个入口只按 id 列表重取、不展开不熔断，才敢不抢。
     acquire_fetch_lock()
-
-    if not ids_file.exists():
-        print(f"{ids_file} not found!")
-        return
 
     with open(ids_file, 'r', encoding='utf-8') as f:
         ids = []

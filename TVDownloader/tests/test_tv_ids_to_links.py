@@ -404,6 +404,31 @@ def test_load_processed_missing_files(tmp_path):
     assert m.load_processed(tmp_path / "a", tmp_path / "b") == (set(), set())
 
 
+def test_load_fail_warns_on_malformed_lines(tmp_path, capsys):
+    """fail.txt 是人工可编辑文本：格式坏行不能静默跳过，要计数告警。
+    空行不算异常（尾部换行/手工留白很常见）。"""
+    fail = tmp_path / "fail.txt"
+    fail.write_text(
+        "1\t1\t3\n"                      # 正常
+        "2\t-\t-\n"                      # 正常（剧级）
+        "\n"                             # 空行：不计
+        "3\tx\ty\n"                      # 季/集非整数
+        "only-two\tcols\n"               # 列数不对
+        "1\t1\t5\tsomething-else\n"      # 未知 tag
+        "1\t1\t4\tretry-exhausted\n",    # 合法 tag：不计
+        encoding="utf-8",
+    )
+    dead_eps, dead_shows = m._load_fail(fail)
+    assert dead_eps == {("1", 1, 3)} and dead_shows == {"2"}
+    out = capsys.readouterr().out
+    assert "3 行格式异常" in out
+
+    fail.write_text("1\t1\t3\n\n", encoding="utf-8")
+    capsys.readouterr()
+    m._load_fail(fail)
+    assert "格式异常" not in capsys.readouterr().out
+
+
 # ---------- process_episode (faked vidup + enc-dec) ----------
 class _FakeResp:
     def __init__(self, text="", payload=None, status=200):
@@ -721,6 +746,33 @@ def test_process_episode_retry_on_page_5xx(monkeypatch):
     seen = _install_fake_session(monkeypatch, PAGE, [], page_status=503)
     status, _ = m.process_episode("1", 1, 1)
     assert status == "retry" and len(seen["page_urls"]) == 2
+
+
+def test_process_episode_stop_event_aborts_before_next_attempt(monkeypatch):
+    """A2：stop_event 置位后，下一次尝试前立即以 retry 退出，不再发请求。
+
+    pipeline 收工时 FetchWorker.shutdown 只等 30 秒；一集跑满 4 次尝试 × 3 源
+    × 超时要几分钟，不早退取流线程会被遗弃在半途。retry 保证下次续跑仍会重试。
+    """
+    monkeypatch.setattr(m, "MAX_RETRIES", 3)
+    # 已置位：一次请求都不发
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=503)
+    stop = threading.Event()
+    stop.set()
+    assert m.process_episode("1", 1, 1, stop_event=stop) == ("retry", None)
+    assert seen["page_urls"] == []
+
+    # 第一次尝试瞬时失败后置位：第二次尝试不再发起
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=503)
+    stop = threading.Event()
+    monkeypatch.setattr(m.time, "sleep", lambda *_: stop.set())
+    assert m.process_episode("1", 1, 1, stop_event=stop) == ("retry", None)
+    assert len(seen["page_urls"]) == 1
+
+    # 未置位：行为与不传完全一致（跑满 MAX_RETRIES）
+    seen = _install_fake_session(monkeypatch, PAGE, [], page_status=503)
+    assert m.process_episode("1", 1, 1, stop_event=threading.Event()) == ("retry", None)
+    assert len(seen["page_urls"]) == 3
 
 
 def test_process_episode_dead_when_all_streams_404(monkeypatch):
@@ -1152,6 +1204,90 @@ def test_breaker_recent_ok_used_as_canary(tmp_path, monkeypatch):
     assert probed == [("ok", 1, 1), ("ok", 1, 1)]
 
 
+def test_breaker_probe_runs_outside_lock_but_pauses_writes(tmp_path, monkeypatch):
+    """A1：金丝雀复探不持锁——复探期间其它线程可继续取流；但落盘要等复探结束。
+
+    复探要真实取流、可达数分钟，持锁会把其余全部取流线程冻在 lock 上。
+    然而落盘必须暂停：_rollback_fail_tail 依赖 fail.txt 末尾 N 行恰是本窗口写的，
+    复探期间放任别的线程写 fail，尾部对不上就回滚失败、整批误杀无法撤销。
+    """
+    import time as _t
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    fail.write_text("old\t1\t1\n", encoding="utf-8")
+    results.write_text(json.dumps({"tmdbId": "c", "season": 1, "episode": 1}) + "\n", encoding="utf-8")
+
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    late_gate = threading.Event()       # 门控 late 集：保证它在复探开始后才开跑
+    fetched_during_probe = []
+
+    def fake(tid, s, e):
+        if tid == "c":                      # 金丝雀：卡住直到测试放行
+            probe_started.set()
+            release_probe.wait(5)
+            return "dead", None
+        if tid == "late":                   # 复探期间才开跑的集：取流必须不被阻塞
+            late_gate.wait(5)
+            fetched_during_probe.append(_t.monotonic())
+        return "dead", None
+
+    monkeypatch.setattr(m, "process_episode", fake)
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 3)
+    items = _dead_items(3) + [("late", 1, 1)]
+    holder = {}
+
+    def run():
+        try:
+            m.run_batch(items, results, fail, max_workers=4)
+        except BaseException as exc:  # noqa: BLE001
+            holder["exc"] = exc
+
+    th = threading.Thread(target=run)
+    th.start()
+    assert probe_started.wait(5), "未触发复探"
+    late_gate.set()
+    # 复探进行中：late 的取流应能完成（不持锁），但 fail.txt 尚不能多出它那一行
+    deadline = _t.monotonic() + 2
+    while not fetched_during_probe and _t.monotonic() < deadline:
+        _t.sleep(0.01)
+    assert fetched_during_probe, "复探期间取流被锁冻结"
+    _t.sleep(0.1)
+    assert fail.read_text(encoding="utf-8") == "old\t1\t1\n" + "".join(
+        f"d\t1\t{i}\n" for i in range(1, 4)), "复探期间不该有新 fail 行落盘"
+    release_probe.set()
+    th.join(5)
+    assert not th.is_alive()
+    # 金丝雀 dead → 熔断：窗口 3 行回滚，late 在熔断后到达不落盘
+    assert isinstance(holder.get("exc"), m.DeadStreakBreaker)
+    assert fail.read_text(encoding="utf-8") == "old\t1\t1\n"
+
+
+def test_breaker_probe_exception_releases_waiters(tmp_path, monkeypatch):
+    """复探本身抛异常（非 DeadStreakBreaker）也必须解除 probing，否则等待落盘的线程永久挂起。"""
+    results = tmp_path / "r.jsonl"
+    fail = tmp_path / "f.txt"
+    monkeypatch.setattr(m, "process_episode", lambda *a: ("dead", None))
+    monkeypatch.setattr(m, "DEAD_STREAK_BREAKER", 2)
+
+    def boom(*a, **k):
+        raise RuntimeError("probe crashed")
+
+    monkeypatch.setattr(m, "_canaries_alive", boom)
+    holder = {}
+
+    def run():
+        try:
+            holder["ret"] = m.run_batch(_dead_items(6), results, fail, max_workers=3)
+        except BaseException as exc:  # noqa: BLE001
+            holder["exc"] = exc
+
+    th = threading.Thread(target=run)
+    th.start()
+    th.join(5)
+    assert not th.is_alive(), "复探异常后 run_batch 挂起（probing 未复位）"
+
+
 # ---------- main ----------
 def test_main_expands_and_backfills_year(tmp_path, monkeypatch):
     ids = tmp_path / "ids.txt"
@@ -1462,6 +1598,22 @@ def test_main_acquires_lock_and_recheck_dead_also_locks(tmp_path, lock_path,
         assert not lock_path.exists(), f"{argv} 未释放锁"
 
 
+def test_main_missing_ids_returns_before_locking(tmp_path, lock_path, monkeypatch):
+    """E1：ids.txt 不存在时直接返回，不抢锁（输入都没有，没必要抢锁再释放）。"""
+    monkeypatch.setattr(m, "_CFG", {
+        "input": str(tmp_path / "missing_ids.txt"),
+        "output": str(tmp_path / "r.jsonl"),
+        "fail_file": str(tmp_path / "f.txt"),
+        "seasons_cache": str(tmp_path / "c.jsonl"),
+    })
+    monkeypatch.setattr(m, "acquire_fetch_lock",
+                        lambda: pytest.fail("ids 缺失不应抢锁"))
+    monkeypatch.setattr(m, "expand_seasons",
+                        lambda *a, **kw: pytest.fail("不该走到季集展开"))
+    assert m.main([]) is None
+    assert not lock_path.exists()
+
+
 def test_second_fetch_process_is_blocked_end_to_end(tmp_path, lock_path,
                                                     monkeypatch):
     """端到端：第一个进程持锁期间，第二次 main() 必须被挡下。"""
@@ -1503,6 +1655,37 @@ def test_run_batch_cancels_pending_on_interrupt(tmp_path, monkeypatch):
         m.run_batch(items, tmp_path / "r.jsonl", tmp_path / "f.txt", max_workers=1)
     # 单线程：第一个抛 KeyboardInterrupt 后，剩余排队任务被 cancel（最多再漏跑 1 个已被 worker 取走的）
     assert started[0] == "first" and len(started) <= 2
+
+
+def test_run_batch_forwards_stop_event_to_process_episode(tmp_path, monkeypatch):
+    """A2：run_batch 把 stop_event 透传给 process_episode（让在跑的集也能早退）；
+    没传时保持 3 参调用，与既有 fake 兼容。"""
+    calls = []
+
+    def fake(tid, s, e, **kw):
+        calls.append(kw)
+        return "retry", None
+
+    monkeypatch.setattr(m, "process_episode", fake)
+    stop = threading.Event()
+    m.run_batch([("a", 1, 1)], tmp_path / "r.jsonl", tmp_path / "f.txt",
+                max_workers=1, stop_event=stop)
+    m.run_batch([("a", 1, 1)], tmp_path / "r.jsonl", tmp_path / "f.txt", max_workers=1)
+    assert calls == [{"stop_event": stop}, {}]
+
+
+def test_append_result_is_the_shared_results_writer(tmp_path):
+    """A3：append_result 单次 write 落一整行、异常冒泡；pipeline 的 AsyncRefetcher
+    与 run_batch 都经它写 results.jsonl，共用 _RESULTS_LOCK。"""
+    out = tmp_path / "r.jsonl"
+    m.append_result(out, {"tmdbId": "1", "season": 1, "episode": 1, "title": "中文"})
+    m.append_result(out, {"tmdbId": "2", "season": 1, "episode": 1})
+    lines = out.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(x)["tmdbId"] for x in lines] == ["1", "2"]
+    assert "中文" in lines[0]            # ensure_ascii=False
+    with pytest.raises(OSError):
+        m.append_result(tmp_path / "no_such_dir" / "r.jsonl", {"x": 1})
+    assert isinstance(m._RESULTS_LOCK, type(threading.Lock()))
 
 
 # ---------- 内嵌字幕解析 ----------

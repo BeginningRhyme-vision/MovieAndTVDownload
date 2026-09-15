@@ -456,7 +456,10 @@ class AsyncRefetcher:
             return
         # 落盘，与取流侧行为一致（追加写，下游按 fetched_at 择新）。
         # 即使本次运行没消费到，下次启动也能用上。
-        downloader.write_log(downloader.INPUT_JSONL, result)
+        # ⚠️ 必须走取流侧的 append_result：它与 run_batch 的取流线程共用同一把
+        # 模块级锁。这里若用 downloader.write_log（另一把锁）追加同一个文件，
+        # 两路写手互不串行，可能交错出半行 JSON，下游解析时这集就丢了。
+        fetcher.append_result(downloader.INPUT_JSONL, result)
         # 逐键覆盖而非整体替换：entry 可能带有 result 没有的历史字段
         # （title/year/runtime_minutes/genres 等元数据）。
         new_entry = dict(entry)

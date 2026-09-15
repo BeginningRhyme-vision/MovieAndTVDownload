@@ -16,6 +16,7 @@ import pytest
 
 import download_tv as d
 import pipeline as p
+import tv_ids_to_links as _real_fetcher
 
 
 def _ep(tid="1", season=1, episode=1, **extra):
@@ -442,6 +443,10 @@ class _FakeFetcher:
         self.providers_sink.append(providers)
         return self.results.get(key, ("dead", None))
 
+    # 落盘入口与真实取流模块同名：pipeline 必须经由它写 results.jsonl
+    # （与 run_batch 共用同一把锁），替身用真实实现保证文件真的被写到。
+    append_result = staticmethod(_real_fetcher.append_result)
+
 
 def _ok_result(tid, season=1, episode=1, urls=("new",), fetched_at=999):
     return ("ok", {"tmdbId": tid, "season": season, "episode": episode,
@@ -487,6 +492,31 @@ def test_async_refetcher_revives_and_persists(monkeypatch, tmp_path):
     assert r.revived == 1
     # 落盘：下次运行的兜底
     assert out.exists() and "new" in out.read_text(encoding="utf-8")
+
+
+def test_async_refetcher_persists_via_fetcher_append_result(monkeypatch, tmp_path):
+    """🔴 A3：重取落盘必须走 fetcher.append_result（与 run_batch 共用同一把锁），
+    绝不能走 downloader.write_log（另一把锁）——两路写手不串行会交错出半行 JSON。"""
+    written = []
+
+    class _Spy(_FakeFetcher):
+        @staticmethod
+        def append_result(path, data):
+            written.append((path, data["tmdbId"]))
+
+    monkeypatch.setattr(p, "fetcher", _Spy({"7_S01E03": _ok_result("7", 1, 3)}))
+    monkeypatch.setattr(p.downloader, "INPUT_JSONL", str(tmp_path / "r.jsonl"))
+    monkeypatch.setattr(p.downloader, "write_log",
+                        lambda *a, **k: pytest.fail("重取落盘不该走 downloader.write_log"))
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop)
+    r.start()
+    try:
+        r.dispatch([_ep("7", 1, 3)])
+        assert _drain(r)
+    finally:
+        stop.set()
+    assert written == [(str(tmp_path / "r.jsonl"), "7")]
 
 
 def test_async_refetcher_refreshes_captions(monkeypatch, tmp_path):
@@ -559,10 +589,18 @@ def test_async_refetcher_inflight_drops_to_zero_on_every_path(monkeypatch,
 
     ⚠️ 三条分支的异常必须分别覆盖到**不同的层**，否则测不到 _loop 的 finally：
       - process_episode 抛的异常被 _handle 内部的 except 吃掉，走不到 _loop；
-      - 故第 4 条让 **write_log 落盘时**抛，那是 _handle 里唯一没被包住的动作，
+      - 故第 4 条让 **append_result 落盘时**抛，那是 _handle 里唯一没被包住的动作，
         异常会真正冒泡到 _loop —— 只有它能验证 finally 的必要性。
     """
+    def flaky_append_result(path, data):
+        # 只让第 4 条（S03）落盘失败，异常冒泡到 _loop。
+        if data.get("season") == 3:
+            raise OSError("磁盘写失败")
+        return _real_fetcher.append_result(path, data)
+
     class _Mixed(_FakeFetcher):
+        append_result = staticmethod(flaky_append_result)
+
         def process_episode(self, tid, season, episode, providers=None):
             if season == 2:
                 raise RuntimeError("源站 502")
@@ -575,16 +613,6 @@ def test_async_refetcher_inflight_drops_to_zero_on_every_path(monkeypatch,
     monkeypatch.setattr(
         p.downloader, "INPUT_JSONL", str(tmp_path / "r.jsonl")
     )
-
-    real_write_log = p.downloader.write_log
-
-    def flaky_write_log(path, data):
-        # 只让第 4 条（S03）落盘失败，异常冒泡到 _loop。
-        if data.get("season") == 3:
-            raise OSError("磁盘写失败")
-        return real_write_log(path, data)
-
-    monkeypatch.setattr(p.downloader, "write_log", flaky_write_log)
 
     stop = threading.Event()
     r = p.AsyncRefetcher(3, stop)
