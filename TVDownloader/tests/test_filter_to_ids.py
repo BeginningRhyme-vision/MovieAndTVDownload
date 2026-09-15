@@ -164,12 +164,23 @@ def test_main_survives_a_dirty_row(tmp_path, monkeypatch):
     ("0123", None),              # 前导零：拼出的 URL 与 123 不是同一个资源
     ("", None),
     ("１２３", None),              # 全角数字：str.isdigit() 会放过，正则不会
+    ("1２３", None),               # 首位 ASCII、后续全角：\d 会放过，[0-9] 不会
+    ("1٢٣", None),                 # 阿拉伯-印度数字，同上
     ({"id": 5}, None),
     ([1, 2], None),
     (None, None),
 ])
 def test_normalize_tmdb_id(raw, expect):
     assert f._normalize_tmdb_id(raw) == expect
+
+
+def test_tmdb_id_regex_is_ascii_only():
+    """钉住 A1：Python 3 里 \\d 对 str 匹配 Unicode 数字，"1２３" 能过 [1-9]\\d*。
+    先坐实这一点，再断言我们用的正则拒绝它，避免以后有人"顺手"改回 \\d。"""
+    assert re.fullmatch(r"[1-9]\d*", "1２３") is not None
+    assert f._TMDB_ID_RE.fullmatch("1２３") is None
+    assert f._TMDB_ID_RE.fullmatch("1٢٣") is None
+    assert f._TMDB_ID_RE.fullmatch("123") is not None
 
 
 def test_normalized_ids_never_contain_whitespace():
@@ -224,6 +235,32 @@ def test_main_skips_malformed_ids_and_reports_them(tmp_path, monkeypatch, capsys
     assert "5 条 tmdb_id 形态非法" in out
     # 不能混进 no_id：那代表"TMDB 查无"这种正常流失，会被当成背景噪音
     assert "无 tmdb_id 跳过 0" in out
+
+
+def test_falsy_but_present_ids_count_as_malformed_not_missing(tmp_path, monkeypatch, capsys):
+    """A2：no_id 只认 None（上游 TMDB 查无写的就是 null）。0 / "" / [] 这类假值
+    是上游写坏了，必须进 bad_id 告警；改之前 `if not tmdb_id` 会把它们静默归入
+    "无 tmdb_id"，与"正常查无"混在一起划过去。"""
+    rows = [
+        {"tmdb_id": None},   # 真正的查无
+        {"tmdb_id": 0},
+        {"tmdb_id": ""},
+        {"tmdb_id": []},
+        {"tmdb_id": 100},
+    ]
+    series = tmp_path / "tv.jsonl"
+    series.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+    monkeypatch.setattr(f, "SERIES", series)
+    monkeypatch.setattr(f, "CONFIG", tmp_path / "missing.yaml")
+    monkeypatch.setattr(f, "OUTPUT_IDS", tmp_path / "ids.txt")
+    monkeypatch.setattr(f, "OUTPUT_DETAIL", tmp_path / "filtered.jsonl")
+
+    f.main()
+
+    assert (tmp_path / "ids.txt").read_text().split() == ["100"]
+    out = capsys.readouterr().out
+    assert "无 tmdb_id 跳过 1" in out
+    assert "3 条 tmdb_id 形态非法" in out
 
 
 def test_malformed_id_is_counted_even_when_filters_would_reject_it(tmp_path, monkeypatch, capsys):
@@ -463,6 +500,8 @@ def test_main_end_to_end(tmp_path, monkeypatch, capsys):
 
     out = capsys.readouterr().out
     assert "读取 6 条" in out and "无 tmdb_id 跳过 1" in out and "重复跳过 1" in out and "最终选中 2" in out
+    # 启用筛选时用户最关心"筛掉了多少"：tt4（rating）与 tt5（genre）两条必须单独可见
+    assert "被筛选淘汰 2" in out
     # P2-A: the malformed line must be surfaced, not silently dropped
     assert "有 1 行无法解析为 JSON" in out
     # P3-D: no leftover temp files after a successful run

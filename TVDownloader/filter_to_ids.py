@@ -27,10 +27,11 @@ from typing import Optional
 
 import yaml
 
-# ids.txt 里合法的 tmdb_id 形态：正整数，无前导零。
-# 不用 str.isdigit()：它对全角数字 "１２３" 与阿拉伯文数字也返回 True，
-# 那些字符拼进 TMDB URL 同样是废请求。
-_TMDB_ID_RE = re.compile(r"[1-9]\d*")
+# ids.txt 里合法的 tmdb_id 形态：ASCII 正整数，无前导零。
+# 不用 str.isdigit()：它对全角数字 "１２３" 与阿拉伯文数字也返回 True；
+# 也不用 \d：Python 3 对 str 匹配时 \d 同样覆盖这些 Unicode 数字（已实测）。
+# 那些字符拼进 TMDB URL 同样是废请求，只认 [0-9]。
+_TMDB_ID_RE = re.compile(r"[1-9][0-9]*")
 
 # ========== 路径配置（来自 config.yaml 的 filter_to_ids 段；相对脚本目录，与其余脚本一致）==========
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -363,7 +364,7 @@ def _normalize_tmdb_id(value):
     合法形态只有两种：正整数，或它的纯数字字符串形式（JSON 里两种都可能出现）。
     - bool 是 int 子类，但 True 出现在 id 字段只能是脏数据，单独拦掉；
     - float 一律拒绝：TMDB id 是整数，3.7 是脏数据，而 3.0 写成 "3.0" 同样不合法；
-    - 用 [1-9]\\d* 而非 str.isdigit()：后者对全角/阿拉伯文数字也返回 True，
+    - 用 [1-9][0-9]* 而非 str.isdigit() 或 \\d：后两者对全角/阿拉伯文数字也放行，
       那些字符拼进 URL 同样是废请求。
     """
     if isinstance(value, bool):
@@ -393,7 +394,7 @@ def main():
     if kw_rule is not None:
         _compile_keywords(kw_rule)
 
-    total = kept = no_id = bad_id = duplicate = bad_json = 0
+    total = kept = no_id = bad_id = duplicate = bad_json = filtered_out = 0
     seen = set()
 
     # 先写临时文件，全部成功后再原子替换，避免中途异常留下截断的 ids.txt 被下游误用
@@ -415,9 +416,10 @@ def main():
 
                 total += 1
 
-                # 没有 tmdb_id 的无法下载，直接跳过
+                # 没有 tmdb_id 的无法下载，直接跳过。只认 None（上游“TMDB 查无”写的就是 null）；
+                # 0 / "" / [] 这类假值不是“没有 id”而是形态非法，交给下面的 bad_id 统计。
                 tmdb_id = show.get("tmdb_id")
-                if not tmdb_id:
+                if tmdb_id is None:
                     no_id += 1
                     continue
 
@@ -429,6 +431,7 @@ def main():
                     continue
 
                 if not passes_all(show, config):
+                    filtered_out += 1
                     continue
 
                 if tid in seen:  # 去重
@@ -452,8 +455,8 @@ def main():
         raise
 
     print(
-        f"读取 {total} 条 | 无 tmdb_id 跳过 {no_id} | 重复跳过 {duplicate} | "
-        f"最终选中 {kept}"
+        f"读取 {total} 条 | 无 tmdb_id 跳过 {no_id} | 被筛选淘汰 {filtered_out} | "
+        f"重复跳过 {duplicate} | 最终选中 {kept}"
     )
     if bad_id:
         # 单独一行告警而不是塞进上面那串：这不是正常流失，是上游写出了畸形 id，
