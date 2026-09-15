@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import (
     FIRST_COMPLETED,
     ThreadPoolExecutor,
@@ -154,8 +155,8 @@ ASYNC_REFETCH_WAIT_SECONDS = max(
 # 上传槽位等待超时（upload_slot_wait_timeout）后会降级为"留本地 + 写
 # upload_pending.jsonl"，这些成品**不会被任何后续轮次处理**——它们下载是成功的，
 # 既不在失败队列里也不在重试桶里，唯一的出路是人跑 `download_tv.py reupload`。
-# 而主流程跑完时 R2 往往早已恢复（降级只需积压 300s，主流程还要跑几小时），
-# 自动补一次能省掉这次人工介入。手动 reupload 子命令始终保留。
+# 而主流程跑完时 R2 往往早已恢复（降级只需在等待队列里挂 300s，主流程还要跑
+# 几小时），自动补一次能省掉这次人工介入。手动 reupload 子命令始终保留。
 AUTO_REUPLOAD_ENABLED = bool(
     (_CFG.get("auto_reupload", {}) or {}).get("enabled", True)
 )
@@ -405,18 +406,19 @@ S3_PREFIX = (_S3_CFG.get("prefix", "") or "").strip("/")
 S3_ACCESS_KEY = _s3_secret("access_key", "R2_ACCESS_KEY")
 S3_SECRET_KEY = _s3_secret("secret_key", "R2_SECRET_KEY")
 UPLOAD_WORKERS = _S3_CFG.get("upload_workers", 16)
-# 反压上限至少为 1：配成 0 会让 BoundedSemaphore 初值为 0，主循环首次 acquire
-# 就永久阻塞（release 只能由已提交的上传 future 触发，永远不会发生）。
+# 反压上限至少为 1：配成 0 会让 BoundedSemaphore 初值为 0，任何集都永远拿不到
+# 槽位（release 只能由已提交的上传 future 触发，永远不会发生），上传会全部降级。
 MAX_PENDING_UPLOADS = max(1, int(_S3_CFG.get("max_pending_uploads", 64)))
 UPLOAD_RETRY_MAX = _S3_CFG.get("upload_retry_max", 5)
 UPLOAD_RETRY_DELAY = _S3_CFG.get("upload_retry_delay", 3)
 # boto3 连接/读取超时（秒）：botocore 默认 60s 太长，R2 抖动时会顶满反压。
 S3_CONNECT_TIMEOUT = float(_S3_CFG.get("connect_timeout", 15))
 S3_READ_TIMEOUT = float(_S3_CFG.get("read_timeout", 120))
-# 反压信号量的最长等待（秒）。超时说明 R2 长时间消化不动，此时**不再阻塞主
-# 循环**，改为「不提交上传、成品留本地 + 写 pending」的降级模式：下载与转封装
-# 继续跑，事后用 `python download_tv.py reupload` 补传。若不设上限，R2 故障会
-# 让主事件循环无限期冻结——连已下载完的 future 都没人处理，整条流水线停摆。
+# 转封装完成但拿不到上传槽位的集，在主循环的上传等待队列里最多挂多久（秒）。
+# 主循环对信号量只做非阻塞尝试，拿不到就把该集挂进队列继续处理其它 future，
+# 每次醒来重试；挂满这么久仍拿不到（R2 长时间消化不动）就走降级：「不提交
+# 上传、成品留本地 + 写 pending」，下载与转封装继续跑，事后用
+# `python download_tv.py reupload` 补传。主事件循环自始至终不因上传积压阻塞。
 UPLOAD_SLOT_WAIT_TIMEOUT = float(_S3_CFG.get("upload_slot_wait_timeout", 300))
 DELETE_LOCAL_AFTER_UPLOAD = bool(_S3_CFG.get("delete_local_after_upload", True))
 
@@ -4726,6 +4728,120 @@ def _run_pipeline():
     # 确定性失败每片计一次；可重试失败跨轮会重复计（同片多轮重投），打印时分块标注。
     reject_permanent = {}
     reject_retriable = {}
+    # 上传等待队列：转封装完成但暂时拿不到上传槽位（upload_semaphore 满）的集。
+    # 元素为 (入队时刻 monotonic, entry, ident, label, info)，FIFO。
+    #
+    # 🔴 A2（2026-09-15）：此前是在**主事件循环线程**里
+    # `upload_semaphore.acquire(timeout=UPLOAD_SLOT_WAIT_TIMEOUT)`，R2 一慢就把
+    # 主循环整个冻住最长 300s——期间下载完成的 future 没人收、转封装没人提交、
+    # 也不响应 interrupted；pipeline 模式下更会连带取流队列（512）打满、
+    # `_on_result` 120s 后开始 dropped。现在主循环只做 `acquire(blocking=False)`，
+    # 拿不到就把该集挂进本队列立即返回，由主循环每次醒来（future 完成 / 定时
+    # 超时）重试提交；挂满 UPLOAD_SLOT_WAIT_TIMEOUT 仍拿不到槽才走降级
+    # （留本地 + 写 pending），interrupted 置位则全部立即降级。
+    # 队列非空时主循环的 wait 必须带超时（见下），否则 release 与 future 完成
+    # 之间的时序缝隙可能让等待者错过唤醒。
+    upload_waiting = deque()
+
+    def degrade_upload(entry, ident, label, info, degrade_reason):
+        """拿不到上传槽位的兜底：不提交上传、成品留本地，记账供事后补传。
+
+        S3_ENABLED=False 时上传任务只写日志、秒回，不可能积压；万一仍走到
+        这里也不能写 pending——纯本地模式下的成品无需补传，塞进 pending 只会
+        污染 reupload 的输入。故 pending 只对开启上传生效。
+        """
+        if S3_ENABLED:
+            try:
+                write_pending({
+                    "tmdbId": info.get("tmdbId"),
+                    "season": info.get("season"),
+                    "episode": info.get("episode"),
+                    "title": info.get("title", ""),
+                    "year": info.get("year"),
+                    **_attribution_of(info),
+                    "local_path": info.get("final_path"),
+                    "s3_key": "",
+                    "fail_reason": degrade_reason,
+                    "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            except Exception as exc:
+                print(f"⚠️ 降级写 pending 失败: {label}: {exc}", flush=True)
+        # 记 SUCCESS_LOG(uploaded=false) 防止下次运行重新下载。用
+        # update_success_log 按集级 key 覆盖写（而非 write_log 追加）：
+        # 后续 reupload 补传成功时也走同一函数覆盖同一条，保证
+        # SUCCESS_LOG "每集一条" 的设计意图不被破坏。
+        info["uploaded"] = False
+        try:
+            update_success_log(record_episode_key(info) or label, info)
+        except Exception as exc:
+            print(f"⚠️ 降级写 success 日志失败: {label}: {exc}", flush=True)
+        write_log(FAILED_LOG, {
+            **ident,
+            "urls": entry.get("urls", []),
+            "error": degrade_reason,
+            "stage": "upload",
+        })
+        print(f"⚠️ {label}: {degrade_reason}", flush=True)
+
+    def submit_upload(entry, ident, label, info):
+        """已持有一个上传槽位的前提下提交上传 future。
+
+        acquire 与 submit 之间若 submit 抛异常（如线程池已 shutdown），已
+        acquire 的配额会永久泄漏、累积到上限致上传全部降级。故用 try 兜底：
+        submit 失败立即 release 保证信号量对称，并就地写 FAILED_LOG（与转封装
+        提交失败分支对称）——绝不 raise。成品 mp4 有意留本地（未删），待
+        reupload 阶段补传，不构成泄漏。
+        """
+        try:
+            upload_future = upload_executor.submit(upload_one_entry, info)
+        except Exception as exc:
+            upload_semaphore.release()
+            write_log(FAILED_LOG, {
+                **ident,
+                "urls": entry.get("urls", []),
+                "error": f"上传提交失败: {exc}",
+                "stage": "upload",
+            })
+            print(f"上传提交失败: {label}: {exc}")
+            return
+        # release 由 future 完成回调对称释放，保证无论上传成功/异常/取消都
+        # 不泄漏信号量。
+        upload_future.add_done_callback(
+            lambda _f: upload_semaphore.release()
+        )
+        upload_future_to_entry[upload_future] = entry
+        stage_of[upload_future] = "upload"
+        pending.add(upload_future)
+        stats["uploads"] += 1
+
+    def flush_upload_waiting():
+        """尽力把等待队列里的集提交上传；**绝不阻塞**。
+
+        队头拿不到槽且未超时就停（FIFO，队头最老，它没超时后面的更不会）；
+        拿到槽即提交；超时或 interrupted 置位则降级。每次主循环醒来都调一次。
+        """
+        while upload_waiting:
+            enqueued_at, entry, ident, label, info = upload_waiting[0]
+            if interrupted.is_set():
+                upload_waiting.popleft()
+                degrade_upload(
+                    entry, ident, label, info,
+                    "收到中断信号，上传槽位未就绪，本集降级为留本地待补传",
+                )
+                continue
+            if upload_semaphore.acquire(blocking=False):
+                upload_waiting.popleft()
+                submit_upload(entry, ident, label, info)
+                continue
+            if time.monotonic() - enqueued_at >= UPLOAD_SLOT_WAIT_TIMEOUT:
+                upload_waiting.popleft()
+                degrade_upload(
+                    entry, ident, label, info,
+                    f"上传积压超过 {UPLOAD_SLOT_WAIT_TIMEOUT:g}s 未消化，"
+                    f"本集降级为留本地待补传",
+                )
+                continue
+            return
 
     def handle_done_future(future, round_failed_retriable,
                            round_failed_expired=None):
@@ -4908,83 +5024,19 @@ def _run_pipeline():
                 return
 
             # 转封装成功 -> 立即提交上传。反压：先 acquire 信号量（限制
-            # 在途+排队的上传总量为 MAX_PENDING_UPLOADS），若上传慢于下载
-            # 会在此阻塞主循环，从而钳制本地磁盘占用上限。release 由 future
-            # 完成回调对称释放，保证无论上传成功/异常/取消都不泄漏信号量。
+            # 在途+排队的上传总量为 MAX_PENDING_UPLOADS），从而钳制本地磁盘
+            # 占用上限。release 由 future 完成回调对称释放。
             #
-            # 但阻塞必须有上限：这里是**主事件循环线程**，无限等待会让整条
-            # 流水线冻结（下载完成的 future 也没人处理、转封装同步停摆）。
-            # 等满 UPLOAD_SLOT_WAIT_TIMEOUT 仍拿不到槽位，说明 R2 长时间消化
-            # 不动，此时降级：不提交上传、成品留本地并写 pending，主循环继续
-            # 推进下载与转封装，事后用 reupload 子命令补传。宁可暂时不传，
-            # 也不让远端故障拖垮本地下载产能。
-            #
-            # S3_ENABLED=False 时上传任务只写日志、秒回，不可能积压；万一
-            # 仍走到这里也不能写 pending——纯本地模式下的成品无需补传，
-            # 塞进 pending 只会污染 reupload 的输入。故降级只对开启上传生效。
-            if not upload_semaphore.acquire(timeout=UPLOAD_SLOT_WAIT_TIMEOUT):
-                degrade_reason = (
-                    f"上传积压超过 {UPLOAD_SLOT_WAIT_TIMEOUT:g}s 未消化，"
-                    f"本集降级为留本地待补传"
+            # 🔑 这里是**主事件循环线程**，只允许非阻塞尝试：拿不到槽位就挂进
+            # upload_waiting 立即返回，让主循环继续收下载/转封装 future、响应
+            # 取流侧与中断信号；由 flush_upload_waiting 在主循环每次醒来时重试，
+            # 挂满 UPLOAD_SLOT_WAIT_TIMEOUT 才降级（见 upload_waiting 的说明）。
+            if upload_semaphore.acquire(blocking=False):
+                submit_upload(entry, ident, label, info)
+            else:
+                upload_waiting.append(
+                    (time.monotonic(), entry, ident, label, info)
                 )
-                if S3_ENABLED:
-                    try:
-                        write_pending({
-                            "tmdbId": info.get("tmdbId"),
-                            "season": info.get("season"),
-                            "episode": info.get("episode"),
-                            "title": info.get("title", ""),
-                            "year": info.get("year"),
-                            **_attribution_of(info),
-                            "local_path": info.get("final_path"),
-                            "s3_key": "",
-                            "fail_reason": degrade_reason,
-                            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        })
-                    except Exception as exc:
-                        print(f"⚠️ 降级写 pending 失败: {label}: {exc}", flush=True)
-                # 记 SUCCESS_LOG(uploaded=false) 防止下次运行重新下载。用
-                # update_success_log 按集级 key 覆盖写（而非 write_log 追加）：
-                # 后续 reupload 补传成功时也走同一函数覆盖同一条，保证
-                # SUCCESS_LOG "每集一条" 的设计意图不被破坏。
-                info["uploaded"] = False
-                try:
-                    update_success_log(record_episode_key(info) or label, info)
-                except Exception as exc:
-                    print(f"⚠️ 降级写 success 日志失败: {label}: {exc}", flush=True)
-                write_log(FAILED_LOG, {
-                    **ident,
-                    "urls": entry.get("urls", []),
-                    "error": degrade_reason,
-                    "stage": "upload",
-                })
-                print(f"⚠️ {label}: {degrade_reason}", flush=True)
-                return
-            # acquire 与 submit 之间若 submit 抛异常（如线程池已 shutdown），
-            # 已 acquire 的配额会永久泄漏、累积到上限致主循环死锁。故用 try 兜底：
-            # submit 失败立即 release 保证信号量对称，并就地写 FAILED_LOG 后 return
-            # （与转封装提交失败分支对称）——绝不 raise，否则异常逃逸出无 try 包裹的
-            # 主循环，剩余 pending 任务记录全部丢失、并可能卡死磁盘 gate。
-            # 成品 mp4 有意留本地（未删），待 reupload 阶段补传，不构成泄漏。
-            try:
-                upload_future = upload_executor.submit(upload_one_entry, info)
-            except Exception as exc:
-                upload_semaphore.release()
-                write_log(FAILED_LOG, {
-                    **ident,
-                    "urls": entry.get("urls", []),
-                    "error": f"上传提交失败: {exc}",
-                    "stage": "upload",
-                })
-                print(f"上传提交失败: {label}: {exc}")
-                return
-            upload_future.add_done_callback(
-                lambda _f: upload_semaphore.release()
-            )
-            upload_future_to_entry[upload_future] = entry
-            stage_of[upload_future] = "upload"
-            pending.add(upload_future)
-            stats["uploads"] += 1
 
         elif stage == "upload":
             entry = upload_future_to_entry.pop(future)
@@ -5109,6 +5161,8 @@ def _run_pipeline():
             # 但不阻塞本轮判定——这正是方案 A 的并行精髓。
             # 循环条件涵盖“还有在途下载”或“来源尚未耗尽”，二者皆空才收尾。
             while round_download_futures or not source_exhausted:
+                # 先把等槽位的上传尽力提交/降级掉（非阻塞），再决定怎么等。
+                flush_upload_waiting()
                 if not pending:
                     # 仅流式来源会走到这里：`round_download_futures ⊆ pending`
                     # （两者的 add/discard 严格成对），故 pending 空即本轮无在途
@@ -5137,7 +5191,14 @@ def _run_pipeline():
                 # 槽位已满或来源已耗尽时 source_waiting 为 False，保持无超时
                 # 阻塞，不做无谓唤醒；list 来源永不返回 wait，故单独跑下载时
                 # 该值恒为 False，行为与改动前完全一致。
-                timeout = STREAM_IDLE_POLL_SECONDS if source_waiting else None
+                #
+                # 有集在等上传槽位时同样要带超时：槽位由上传 future 的完成回调
+                # 释放，而回调与 future 被 wait 收到之间存在时序缝隙；且等待者
+                # 的超时降级、interrupted 响应都靠主循环定时醒来驱动。
+                timeout = (
+                    STREAM_IDLE_POLL_SECONDS
+                    if (source_waiting or upload_waiting) else None
+                )
                 done, _ = wait(
                     pending, return_when=FIRST_COMPLETED, timeout=timeout
                 )
@@ -5285,15 +5346,30 @@ def _run_pipeline():
             current_batch = next_batch
             round_no += 1
 
-        # 多轮下载结束，但 pending 里可能还有末轮的转封装/上传在途 -> 显式排空，
-        # 确保所有失败/成功记录都在循环内被处理（而非交给 with 退出时静默等待）。
-        if pending:
+        # 多轮下载结束，但 pending 里可能还有末轮的转封装/上传在途，upload_waiting
+        # 里也可能还有等槽位的集 -> 显式排空，确保所有失败/成功记录都在循环内被
+        # 处理（而非交给 with 退出时静默等待）。
+        if pending or upload_waiting:
             print(
-                f"\n下载轮次结束，等待剩余 {len(pending)} 个转封装/上传任务完成...",
+                f"\n下载轮次结束，等待剩余 {len(pending) + len(upload_waiting)} "
+                "个转封装/上传任务完成...",
                 flush=True,
             )
-        while pending:
-            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+        while pending or upload_waiting:
+            # 先把等槽位的集推进去：槽位由 pending 里的上传完成后释放，
+            # 所以 flush 必须和收割交替进行；超时/中断的会在这里降级出队。
+            flush_upload_waiting()
+            if not pending:
+                # 只剩 upload_waiting 且槽位仍满（不可能——槽位只被 pending
+                # 里的上传占用；除非测试/外部预占了信号量），定时醒来再试，
+                # 直到 flush 把它们按超时降级掉，不能对空集合 wait()。
+                interrupted.wait(STREAM_IDLE_POLL_SECONDS)
+                continue
+            done, _ = wait(
+                pending,
+                return_when=FIRST_COMPLETED,
+                timeout=STREAM_IDLE_POLL_SECONDS if upload_waiting else None,
+            )
             for future in done:
                 pending.discard(future)
                 # 同上：排空阶段单条异常也不得逃逸，否则末轮转封装/上传记录全丢。

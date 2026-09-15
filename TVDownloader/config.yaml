@@ -694,14 +694,14 @@ download_tv:
     access_key: ""           # 环境变量 R2_ACCESS_KEY
     secret_key: ""           # 环境变量 R2_SECRET_KEY
     upload_workers: 16       # 上传并发数
-    max_pending_uploads: 64  # 反压阈值：在途+排队上传数达到此值就阻塞下载，防磁盘撑爆
+    max_pending_uploads: 64  # 反压阈值：在途上传数达到此值，新转封装完的集先在等待队列挂起（不阻塞主循环），防磁盘撑爆
     upload_retry_max: 5      # 单文件上传最大重试次数（凭证/权限/桶不存在等确定性失败不重试）
     upload_retry_delay: 3    # 上传重试基础间隔（秒，指数退避封顶 60s）
     connect_timeout: 15      # boto3 连接超时（秒）：默认 60s 太长，R2 抖动时会顶满反压
     read_timeout: 120        # boto3 读取超时（秒）
-    # 反压信号量最长等待（秒）。等满仍拿不到槽位说明 R2 长时间消化不动，此时降级为
-    # 「不上传、成品留本地 + 写 pending」，下载与转封装继续跑，事后用 reupload 补传。
-    # 若不设上限，R2 故障会让主事件循环无限期冻结、整条流水线停摆。
+    # 拿不到上传槽位的集在等待队列里最多挂多久（秒）。主循环每次醒来重试提交；挂满仍
+    # 拿不到说明 R2 长时间消化不动，此时降级为「不上传、成品留本地 + 写 pending」，
+    # 下载与转封装继续跑，事后用 reupload 补传。等待全程不阻塞主事件循环。
     upload_slot_wait_timeout: 300
     delete_local_after_upload: true   # 上传成功后删除本地 mp4（全量必开）
   # ---- 磁盘水位监控（兜底）----

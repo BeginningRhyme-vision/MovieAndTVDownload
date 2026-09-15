@@ -3499,6 +3499,8 @@ def test_run_pipeline_degrades_when_upload_slots_exhausted(sandbox, monkeypatch)
     monkeypatch.setattr(d, "upload_semaphore", __import__("threading").Semaphore(1))
     d.upload_semaphore.acquire()
     monkeypatch.setattr(d, "UPLOAD_SLOT_WAIT_TIMEOUT", 0.05)
+    # 等待队列的超时降级靠主循环/排空阶段定时醒来驱动，缩短轮询让测试秒回。
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
 
     final_path = str(sandbox / "downloads" / "tv_000001" / "7_S01E01.mp4")
 
@@ -3548,6 +3550,7 @@ def test_degrade_writes_no_pending_when_s3_disabled(sandbox, monkeypatch):
     monkeypatch.setattr(d, "upload_semaphore", __import__("threading").Semaphore(1))
     d.upload_semaphore.acquire()
     monkeypatch.setattr(d, "UPLOAD_SLOT_WAIT_TIMEOUT", 0.05)
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
 
     final_path = str(sandbox / "downloads" / "tv_000001" / "8_S01E01.mp4")
     monkeypatch.setattr(
@@ -3567,6 +3570,132 @@ def test_degrade_writes_no_pending_when_s3_disabled(sandbox, monkeypatch):
     assert not os.path.exists(d.UPLOAD_PENDING_LOG)
     success = _read_jsonl(d.SUCCESS_LOG)
     assert len(success) == 1 and success[0]["uploaded"] is False
+
+
+def _pipeline_two_entries(sandbox, monkeypatch, s3_enabled=True):
+    """两集串行下载的最小流水线环境：MAX_WORKERS=1 保证集 1 先于集 2 处理。"""
+    entries = [
+        {"tmdbId": "11", "season": 1, "episode": 1, "urls": ["u"]},
+        {"tmdbId": "12", "season": 1, "episode": 1, "urls": ["u"]},
+    ]
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in entries),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", False)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 1)
+    monkeypatch.setattr(d, "MAX_WORKERS", 1)
+    monkeypatch.setattr(d, "S3_ENABLED", s3_enabled)
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
+    # 容量 1 且预先占满：转封装完的集拿不到槽，只能进等待队列。
+    monkeypatch.setattr(d, "upload_semaphore", threading.Semaphore(1))
+    d.upload_semaphore.acquire()
+
+
+def test_upload_slot_wait_does_not_block_the_main_loop(sandbox, monkeypatch):
+    """等上传槽位期间主循环必须继续收割下载 future、提交后续转封装。
+
+    A2 修复前，conversion 分支在主事件循环线程里 acquire(timeout=300)：集 1
+    转封装完拿不到槽，主循环冻结 300s——期间集 2 下载完也没人提交转封装，
+    pipeline 模式下更会连带取流队列打满。修复后拿不到槽只是挂进等待队列。
+
+    编排：集 2 的下载**等集 1 转封装完成后**才结束（保证集 1 已在等槽）；
+    集 2 的转封装一旦被提交（说明主循环没被冻结），后台线程释放槽位 ->
+    集 1 应被正常提交上传而非降级。若主循环仍会冻结，集 2 的转封装要等
+    集 1 超时降级后才会提交，pending 里就会出现集 1。
+    """
+    _pipeline_two_entries(sandbox, monkeypatch)
+    monkeypatch.setattr(d, "UPLOAD_SLOT_WAIT_TIMEOUT", 2.0)
+
+    conv1_done = threading.Event()
+    conv2_started = threading.Event()
+    uploaded = []
+
+    def fake_process(entry, ids):
+        key = d.record_episode_key(entry)
+        if key == "12_S01E01":
+            assert conv1_done.wait(5), "集 1 转封装迟迟未完成"
+            time.sleep(0.05)   # 留给主循环收割集 1 的转封装 future 并入队
+        return key, True, {"cleanup_paths": []}
+
+    def fake_finalize(info, ids):
+        # process_one_entry 的返回里没带身份，靠调用顺序区分：第 1 次是集 1
+        # （MAX_WORKERS=1 且集 2 的下载要等集 1 转封装完才结束）。
+        if not conv1_done.is_set():
+            conv1_done.set()
+            tmdb = "11"
+        else:
+            conv2_started.set()
+            tmdb = "12"
+        return f"{tmdb}_S01E01", True, {
+            "tmdbId": tmdb, "season": 1, "episode": 1, "title": "S",
+            "year": 2020,
+            "final_path": str(sandbox / "downloads" / f"{tmdb}_S01E01.mp4"),
+        }
+
+    def fake_upload(info):
+        uploaded.append(info["tmdbId"])
+        return f"{info['tmdbId']}_S01E01", True, info
+
+    def release_when_conv2_submitted():
+        if conv2_started.wait(5):
+            d.upload_semaphore.release()
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    monkeypatch.setattr(d, "finalize_one_entry", fake_finalize)
+    monkeypatch.setattr(d, "upload_one_entry", fake_upload)
+    threading.Thread(target=release_when_conv2_submitted, daemon=True).start()
+
+    started = time.monotonic()
+    d._run_pipeline()
+
+    assert sorted(uploaded) == ["11", "12"]
+    assert not os.path.exists(d.UPLOAD_PENDING_LOG)
+    # 没有任何一集等满 UPLOAD_SLOT_WAIT_TIMEOUT。
+    assert time.monotonic() - started < 2.0
+
+
+def test_upload_slot_waiters_degrade_immediately_on_interrupt(sandbox, monkeypatch):
+    """Ctrl+C 后等槽位的集不得再干等到超时，应立即降级收尾。
+
+    修复前的 acquire(timeout) 不看 interrupted，Ctrl+C 后最长还要卡 300s。
+    """
+    _pipeline_two_entries(sandbox, monkeypatch)
+    monkeypatch.setattr(d, "UPLOAD_SLOT_WAIT_TIMEOUT", 30.0)
+    ev = threading.Event()
+    monkeypatch.setattr(d, "interrupted", ev)
+
+    def fake_finalize(info, ids):
+        # 转封装完成后不久置位中断：此刻该集已在等待队列里（或马上进队）。
+        threading.Timer(0.05, ev.set).start()
+        return "x", True, {
+            "tmdbId": "11", "season": 1, "episode": 1, "title": "S",
+            "year": 2020,
+            "final_path": str(sandbox / "downloads" / "11_S01E01.mp4"),
+        }
+
+    monkeypatch.setattr(
+        d, "process_one_entry",
+        lambda e, ids: (d.record_episode_key(e), True, {"cleanup_paths": []}),
+    )
+    monkeypatch.setattr(d, "finalize_one_entry", fake_finalize)
+    monkeypatch.setattr(
+        d, "upload_one_entry",
+        lambda info: pytest.fail("中断后不应再提交上传"),
+    )
+
+    started = time.monotonic()
+    d._run_pipeline()
+
+    assert time.monotonic() - started < 5.0
+    pend = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert pend and all("收到中断信号" in p["fail_reason"] for p in pend)
+    success = _read_jsonl(d.SUCCESS_LOG)
+    assert success and all(s["uploaded"] is False for s in success)
 
 
 def test_degrade_success_log_is_deduped_by_key(sandbox, monkeypatch):
