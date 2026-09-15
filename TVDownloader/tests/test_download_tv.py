@@ -374,15 +374,17 @@ def test_remove_upload_failures_from_log_batch(sandbox, monkeypatch):
 
 
 def test_clean_stale_log_tmp(sandbox, capsys):
-    """启动清掉 SUCCESS_LOG/FAILED_LOG 的 .tmp 残骸，正式文件不动，缺失不报错。"""
+    """启动清掉 SUCCESS_LOG/FAILED_LOG/PENDING 的 .tmp 残骸，正式文件不动，缺失不报错。"""
     (sandbox / "success.jsonl").write_text("keep\n", encoding="utf-8")
     (sandbox / "success.jsonl.tmp").write_text("half\n", encoding="utf-8")
     (sandbox / "failed.jsonl.tmp").write_text("half\n", encoding="utf-8")
+    (sandbox / "pending.jsonl.tmp").write_text("half\n", encoding="utf-8")
     d.clean_stale_log_tmp()
     assert (sandbox / "success.jsonl").read_text(encoding="utf-8") == "keep\n"
     assert not (sandbox / "success.jsonl.tmp").exists()
     assert not (sandbox / "failed.jsonl.tmp").exists()
-    assert capsys.readouterr().out.count("已清理上次强杀") == 2
+    assert not (sandbox / "pending.jsonl.tmp").exists()
+    assert capsys.readouterr().out.count("已清理上次强杀") == 3
     d.clean_stale_log_tmp()   # 再跑一次：无残骸、无输出、无异常
     assert capsys.readouterr().out == ""
 
@@ -1536,12 +1538,13 @@ def test_upload_to_r2_skips_retry_on_permanent_error(sandbox, monkeypatch):
 
 
 def test_upload_to_r2_retries_transient_with_exponential_backoff(sandbox, monkeypatch):
-    """网络类错误仍重试，且退避是指数（3/6/12...）而非线性。"""
+    """网络类错误仍重试，且退避是指数（3/6/12...）而非线性。
+    退避走 interrupted.wait（B1，可被中断打断），所以在事件上打桩而非 time.sleep。"""
     monkeypatch.setattr(d, "UPLOAD_RETRY_MAX", 4)
     monkeypatch.setattr(d, "UPLOAD_RETRY_DELAY", 3)
     monkeypatch.setattr(d.random, "uniform", lambda a, b: 0.0)
     sleeps = []
-    monkeypatch.setattr(d.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(d.interrupted, "wait", lambda s: sleeps.append(s) or False)
     attempts = []
 
     class _Client:
@@ -1554,6 +1557,55 @@ def test_upload_to_r2_retries_transient_with_exponential_backoff(sandbox, monkey
     assert ok is False
     assert len(attempts) == 4
     assert sleeps == [3, 6, 12]
+
+
+def test_upload_to_r2_backoff_is_interruptible(sandbox, monkeypatch):
+    """退避期间收到中断：立即返回失败（原因含"中断"），不再发起下一次尝试，
+    也不调用裸 time.sleep。走的是与真实失败同一条路径，调用方留本地 + pending。"""
+    monkeypatch.setattr(d, "UPLOAD_RETRY_MAX", 5)
+    monkeypatch.setattr(d, "UPLOAD_RETRY_DELAY", 60)
+    monkeypatch.setattr(d.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(
+        d.time, "sleep", lambda s: (_ for _ in ()).throw(AssertionError("裸 sleep 被调用")),
+    )
+    attempts = []
+
+    class _Client:
+        def upload_file(self, path, bucket, key):
+            attempts.append(key)
+            # 第一次失败后置位中断：模拟退避期间用户 Ctrl+C。
+            d.interrupted.set()
+            raise OSError("connection reset")
+
+    monkeypatch.setattr(d, "get_s3_client", lambda: _Client())
+    try:
+        started = time.monotonic()
+        ok, reason = d.upload_to_r2("/tmp/x.mp4", "k")
+        elapsed = time.monotonic() - started
+    finally:
+        d.interrupted.clear()
+    assert ok is False
+    assert "收到中断信号" in reason and "connection reset" in reason
+    assert len(attempts) == 1
+    assert elapsed < 5   # 没有真等 60s 退避
+
+
+def test_upload_to_r2_returns_immediately_when_already_interrupted(sandbox, monkeypatch):
+    """进入函数时已中断：一次 upload_file 都不发。"""
+    attempts = []
+
+    class _Client:
+        def upload_file(self, path, bucket, key):
+            attempts.append(key)
+
+    monkeypatch.setattr(d, "get_s3_client", lambda: _Client())
+    d.interrupted.set()
+    try:
+        ok, reason = d.upload_to_r2("/tmp/x.mp4", "k")
+    finally:
+        d.interrupted.clear()
+    assert ok is False and "收到中断信号" in reason
+    assert attempts == []
 
 
 # ---------------------------------------------------------------- orphan cleanup
@@ -4457,6 +4509,113 @@ def test_reupload_pending_flow(sandbox, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "孤儿(本地已无)清理 1" in out
     assert "成功 1" in out and "仍失败 1" in out
+
+
+def _pending_fixture(sandbox, n):
+    """n 条本地文件都在的 pending 记录（tmdbId 1..n），返回 [(record, path)]。"""
+    folder = sandbox / "downloads" / "tv_pend"
+    folder.mkdir(parents=True, exist_ok=True)
+    items = []
+    for i in range(1, n + 1):
+        path = folder / f"{i}_S01E01.mp4"
+        path.write_bytes(b"v")
+        items.append(({
+            "tmdbId": str(i), "season": 1, "episode": 1, "year": 2000 + i,
+            "local_path": str(path), "s3_key": f"k{i}", "fail_reason": "orig",
+            "ts": "orig-ts",
+        }, path))
+    (sandbox / "pending.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r, _ in items), encoding="utf-8",
+    )
+    return items
+
+
+def test_reupload_pending_interrupt_keeps_untouched_records(sandbox, monkeypatch, capsys):
+    """中断后：已成功的移出 pending，已失败的更新原因，**未轮到的原样保留**。
+    这是 B3 的核心不变量——否则未轮到的记录会被"只写 remaining"抹掉，
+    本地文件还在却再无人认领。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    monkeypatch.setattr(d.time, "strftime", lambda fmt: "new-ts")
+    items = _pending_fixture(sandbox, 5)
+    calls = []
+
+    def fake_upload(path, key):
+        calls.append(key)
+        if key == "k1":
+            return True, None
+        # 第 2 条失败，并在此刻模拟用户 Ctrl+C：第 3~5 条不应再被尝试。
+        d.interrupted.set()
+        return False, "net down"
+
+    monkeypatch.setattr(d, "upload_to_r2", fake_upload)
+    try:
+        d.reupload_pending()
+    finally:
+        d.interrupted.clear()
+
+    assert calls == ["k1", "k2"]
+    assert not items[0][1].exists()                # 成功的已删本地
+    assert all(p.exists() for _, p in items[1:])   # 其余本地都还在
+    remaining = _read_jsonl(d.UPLOAD_PENDING_LOG)
+    assert [r["tmdbId"] for r in remaining] == ["2", "3", "4", "5"]
+    # 失败的那条更新了原因/时间戳；未轮到的三条与原记录逐字段一致。
+    assert remaining[0]["fail_reason"] == "net down" and remaining[0]["ts"] == "new-ts"
+    for got, (orig, _) in zip(remaining[1:], items[2:]):
+        assert got == orig
+    succ = _read_jsonl(d.SUCCESS_LOG)
+    assert [r["tmdbId"] for r in succ] == ["1"] and succ[0]["uploaded"] is True
+    assert not os.path.exists(d.UPLOAD_PENDING_LOG + ".tmp")
+    out = capsys.readouterr().out
+    assert "收到中断信号" in out and "剩余 3 条" in out
+    assert "中断保留 3" in out and "pending 剩余 4 条" in out
+
+
+def test_reupload_pending_interrupt_before_first_keeps_all(sandbox, monkeypatch):
+    """进入循环前就已中断：一条都不传，pending 逐字节等价于原内容（去重后）。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    items = _pending_fixture(sandbox, 3)
+    calls = []
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: calls.append(k) or (True, None))
+    d.interrupted.set()
+    try:
+        d.reupload_pending()
+    finally:
+        d.interrupted.clear()
+    assert calls == []
+    assert _read_jsonl(d.UPLOAD_PENDING_LOG) == [r for r, _ in items]
+    assert all(p.exists() for _, p in items)
+
+
+def test_reupload_pending_rewrites_atomically(sandbox, monkeypatch):
+    """pending 重写走 tmp + os.replace：replace 之前旧文件必须完整无损，
+    这样二次信号 os._exit / 强杀落在中间时不会留下半截 pending。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", False)
+    _pending_fixture(sandbox, 3)
+    original = (sandbox / "pending.jsonl").read_text(encoding="utf-8")
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: (k == "k1", None if k == "k1" else "x"))
+
+    seen = {}
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        # SUCCESS_LOG / FAILED_LOG 的重写也走 os.replace，只盯 pending 那一次。
+        if dst == d.UPLOAD_PENDING_LOG:
+            seen["src"], seen["dst"] = src, dst
+            seen["old_intact"] = open(dst, encoding="utf-8").read() == original
+            seen["tmp_lines"] = open(src, encoding="utf-8").read().count("\n")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(d.os, "replace", spy_replace)
+    d.reupload_pending()
+
+    assert seen["dst"] == d.UPLOAD_PENDING_LOG
+    assert seen["src"] == d.UPLOAD_PENDING_LOG + ".tmp"
+    assert seen["old_intact"] is True
+    assert seen["tmp_lines"] == 2
+    assert [r["tmdbId"] for r in _read_jsonl(d.UPLOAD_PENDING_LOG)] == ["2", "3"]
+    assert not os.path.exists(d.UPLOAD_PENDING_LOG + ".tmp")
 
 
 def test_reupload_pending_refuses_when_main_running(sandbox, monkeypatch, capsys):

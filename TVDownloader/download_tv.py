@@ -1799,10 +1799,19 @@ def upload_to_r2(local_path, s3_key):
     """带指数退避重试地上传单个文件到 R2。成功返回 (True, None)，失败返回 (False, 原因)。
 
     确定性失败（凭证/权限/桶不存在）立即返回，不做无谓重试。
+
+    中断语义：退避等待用 `interrupted.wait` 而非裸 sleep，置位后立即返回
+    `(False, "收到中断信号...")`。这与"真实上传失败"走**完全相同**的路径——
+    主流程 `upload_one_entry` 留本地 + SUCCESS_LOG(uploaded=false) + pending，
+    `reupload_pending` 里则保留该条 pending——所以不会漏传，只是推迟到下次
+    reupload。**不打断正在飞的 `upload_file`**：boto3 自己失败时会 abort
+    multipart，本函数不额外引入半截对象。
     """
     client = get_s3_client()
     last_exc = None
     for attempt in range(1, UPLOAD_RETRY_MAX + 1):
+        if interrupted.is_set():
+            return False, f"收到中断信号，放弃上传（最近错误: {last_exc}）"
         try:
             client.upload_file(local_path, S3_BUCKET, s3_key)
             return True, None
@@ -1814,7 +1823,8 @@ def upload_to_r2(local_path, s3_key):
                 # 指数退避 + 抖动，封顶 60s：与下载侧各重试层口径一致。
                 wait = min(UPLOAD_RETRY_DELAY * (2 ** (attempt - 1)), 60)
                 wait += random.uniform(0, min(1.0, wait * 0.2))
-                time.sleep(wait)
+                if interrupted.wait(wait):
+                    return False, f"收到中断信号，放弃上传（最近错误: {exc}）"
     return False, str(last_exc)
 
 
@@ -1933,15 +1943,16 @@ def clean_temp_directory():
 
 
 def clean_stale_log_tmp():
-    """启动时清掉 SUCCESS_LOG / FAILED_LOG 原子重写留下的 `.tmp` 残骸。
+    """启动时清掉 SUCCESS_LOG / FAILED_LOG / UPLOAD_PENDING_LOG 原子重写留下的
+    `.tmp` 残骸。
 
     `update_success_log_many` / `remove_upload_failures_from_log` /
-    `compact_failed_log` 都是"写 X.tmp → os.replace 到 X"。进程在两步之间被
+    `compact_failed_log` / `reupload_pending` 都是"写 X.tmp → os.replace 到 X"。进程在两步之间被
     强杀（第二次 Ctrl+C 的 os._exit、kill -9、断电），X 仍是旧的完整内容、
     X.tmp 是半成品。下次运行任何一次重写都会以 "w" 覆盖 X.tmp，所以它**不会**
     污染数据；清掉只是为了不让运维误把 `.tmp` 当成账本备份。绝不抛异常。
     """
-    for path in (SUCCESS_LOG + ".tmp", FAILED_LOG + ".tmp"):
+    for path in (SUCCESS_LOG + ".tmp", FAILED_LOG + ".tmp", UPLOAD_PENDING_LOG + ".tmp"):
         try:
             if os.path.isfile(path):
                 os.remove(path)
@@ -5569,6 +5580,10 @@ def reupload_pending():
     success_count = 0
     orphan_count = 0
     fail_count = 0
+    # 中断（Ctrl+C / SIGTERM）后**未轮到**的记录：必须原样保留进 pending。
+    # 否则下面"只写 remaining"的重写会把它们从台账里抹掉——本地文件还在、
+    # 却再没人认领，这才是真正的漏传 + 磁盘泄露。
+    interrupted_at = None   # order 里第一个未处理的下标；None 表示跑完了
     # 补传成功的 SUCCESS_LOG / FAILED_LOG 更新**攒批**写：两者都是持 log_lock
     # 的 O(N) 全量重写，逐条调用在 pending 积压几百条时会把收尾拖成分钟级。
     # 但也不能只在最后写一次——中途被杀会让已上传+已删本地的集永远停在
@@ -5585,7 +5600,15 @@ def reupload_pending():
         success_records.clear()
 
     try:
-        for key in order:
+        for index, key in enumerate(order):
+            if interrupted.is_set():
+                interrupted_at = index
+                print(
+                    f"  ⚠️ 收到中断信号，停止补传；剩余 {len(order) - index} 条"
+                    f"原样保留在 pending，下次 reupload 继续。",
+                    flush=True,
+                )
+                break
             record = latest_by_id[key]
             local_path = record.get("local_path", "")
             try:
@@ -5647,19 +5670,34 @@ def reupload_pending():
     finally:
         _flush_logs()
 
-    # 重写整个 pending 文件：仅保留仍失败的记录。用锁保证与在跑主流程互斥。
-    with pending_lock:
-        with open(UPLOAD_PENDING_LOG, "w", encoding="utf-8") as file:
-            for key in order:
-                if key in remaining:
-                    file.write(
-                        json.dumps(remaining[key], ensure_ascii=False) + "\n"
-                    )
+    # 重写整个 pending 文件：保留"仍失败"+"中断后未轮到"的记录。
+    # 未轮到的记录原样写回（不改 ts / fail_reason），保证下次 reupload 能继续。
+    untouched_count = 0
+    keep = dict(remaining)
+    if interrupted_at is not None:
+        for key in order[interrupted_at:]:
+            if key not in keep:
+                keep[key] = latest_by_id[key]
+                untouched_count += 1
 
-    print(
+    # tmp + os.replace 原子替换：旧写法 open("w") 先截断再逐行写，若此刻被
+    # 二次信号的 os._exit 或 OOM 打断，pending 会只剩半截——被截掉的记录本地
+    # 文件还在却再无人认领。用锁保证与在跑主流程的 write_pending 互斥。
+    tmp_path = UPLOAD_PENDING_LOG + ".tmp"
+    with pending_lock:
+        with open(tmp_path, "w", encoding="utf-8") as file:
+            for key in order:
+                if key in keep:
+                    file.write(json.dumps(keep[key], ensure_ascii=False) + "\n")
+        os.replace(tmp_path, UPLOAD_PENDING_LOG)
+
+    summary = (
         f"补传完成：成功 {success_count}，仍失败 {fail_count}，"
-        f"孤儿(本地已无)清理 {orphan_count}；pending 剩余 {len(remaining)} 条。"
+        f"孤儿(本地已无)清理 {orphan_count}"
     )
+    if interrupted_at is not None:
+        summary += f"，中断保留 {untouched_count}"
+    print(f"{summary}；pending 剩余 {len(keep)} 条。")
 
 
 if __name__ == "__main__":
