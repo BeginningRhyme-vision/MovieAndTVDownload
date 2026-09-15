@@ -3685,6 +3685,70 @@ def test_run_pipeline_retries_only_retriable_entries(sandbox, monkeypatch):
     assert attempts.count("1") == 3 and attempts.count("2") == 1
 
 
+def test_round_end_waits_for_inflight_async_refetch_even_without_new_expiry(
+    sandbox, monkeypatch,
+):
+    """🔴 轮末即使本轮没有新过期集，只要异步重取仍有在途也要等它回来并入下一轮。
+
+    第 2 轮起来源是 list，不再直接消费重取结果；预检/上一轮投出的重取若在
+    本轮末尚未回来，旧逻辑只在 round_failed_expired 非空时才等——本轮恰好没
+    新过期集时直接 break，那批新直链只能靠落盘兜底、当次运行救不回。
+    """
+    entry_a = {"tmdbId": "1", "season": 1, "episode": 1, "urls": ["u"]}
+    input_path = sandbox / "results.jsonl"
+    input_path.write_text(
+        json.dumps(entry_a, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(d, "INPUT_JSONL", str(input_path))
+    monkeypatch.setattr(d, "DOWNLOAD_OK_LOG", str(sandbox / "download_ok.jsonl"))
+    monkeypatch.setattr(d, "DOWNLOAD_FAIL_LOG", str(sandbox / "download_fail.jsonl"))
+    monkeypatch.setattr(d, "MULTI_ROUND_ENABLED", True)
+    monkeypatch.setattr(d, "MAX_ROUNDS", 2)
+    monkeypatch.setattr(d, "ROUND_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(d, "AUTO_REFETCH_ENABLED", True)
+    monkeypatch.setattr(d, "ASYNC_REFETCH_WAIT_SECONDS", 5)
+    monkeypatch.setattr(d, "STREAM_IDLE_POLL_SECONDS", 0.01)
+    # pipeline 模式：ListEntrySource 被外部替换（这里只需触发 streaming 判定）
+    monkeypatch.setattr(d, "ListEntrySource", lambda es: d._ListEntrySource(es))
+    monkeypatch.setattr(d, "dispatch_stale_entries_async", lambda batch, counts: 0)
+
+    revived_b = {"tmdbId": "2", "season": 1, "episode": 1, "urls": ["fresh"],
+                 "fetched_at": 999}
+
+    class _Hook:
+        """模拟"预检投出的重取在首轮末仍在途、稍后才回来"。"""
+
+        def __init__(self):
+            self.collects = 0
+
+        def dispatch(self, entries):
+            return 0
+
+        def pending_count(self):
+            return 0 if self.collects >= 2 else 1
+
+        def collect(self):
+            self.collects += 1
+            return [revived_b] if self.collects == 2 else []
+
+    monkeypatch.setattr(d, "async_refetch_hook", _Hook())
+
+    attempts = []
+
+    def fake_process(entry, processed_ids):
+        attempts.append(d.record_episode_key(entry))
+        # 确定性失败且不是直链过期：本轮 round_failed_expired 为空
+        return d.record_episode_key(entry), False, {
+            "error": "低于红线", "retriable": False,
+        }
+
+    monkeypatch.setattr(d, "process_one_entry", fake_process)
+    d._run_pipeline()
+
+    # 首轮只有 A；轮末等到在途重取回来的 B 并入第 2 轮
+    assert attempts == ["1_S01E01", "2_S01E01"]
+
+
 def test_run_pipeline_degrades_when_upload_slots_exhausted(sandbox, monkeypatch):
     """R2 长时间消化不动时不得冻结主循环：降级为留本地 + 写 pending，继续跑下载。
 

@@ -436,11 +436,14 @@ class _FakeFetcher:
         self.providers_sink = (
             providers_sink if providers_sink is not None else []
         )
+        self.stop_events = []
 
-    def process_episode(self, tid, season, episode, providers=None):
+    def process_episode(self, tid, season, episode, providers=None,
+                        stop_event=None):
         key = f"{tid}_S{season:02d}E{episode:02d}"
         self.calls.append(key)
         self.providers_sink.append(providers)
+        self.stop_events.append(stop_event)
         return self.results.get(key, ("dead", None))
 
     # 落盘入口与真实取流模块同名：pipeline 必须经由它写 results.jsonl
@@ -558,9 +561,11 @@ def test_async_refetcher_dedupes_inflight_by_episode_key(monkeypatch):
     gate = threading.Event()
 
     class _Blocking(_FakeFetcher):
-        def process_episode(self, tid, season, episode, providers=None):
+        def process_episode(self, tid, season, episode, providers=None,
+                            stop_event=None):
             gate.wait(3)
-            return super().process_episode(tid, season, episode, providers)
+            return super().process_episode(tid, season, episode, providers,
+                                           stop_event)
 
     monkeypatch.setattr(p, "fetcher", _Blocking())
     stop = threading.Event()
@@ -601,10 +606,12 @@ def test_async_refetcher_inflight_drops_to_zero_on_every_path(monkeypatch,
     class _Mixed(_FakeFetcher):
         append_result = staticmethod(flaky_append_result)
 
-        def process_episode(self, tid, season, episode, providers=None):
+        def process_episode(self, tid, season, episode, providers=None,
+                            stop_event=None):
             if season == 2:
                 raise RuntimeError("源站 502")
-            return super().process_episode(tid, season, episode, providers)
+            return super().process_episode(tid, season, episode, providers,
+                                           stop_event)
 
     monkeypatch.setattr(p, "fetcher", _Mixed({
         "1_S01E01": _ok_result("1"),
@@ -635,7 +642,8 @@ def test_async_refetcher_inflight_drops_to_zero_on_every_path(monkeypatch,
 def test_async_refetcher_survives_system_exit(monkeypatch):
     """取流侧用 SystemExit 做配置校验，单集重取绝不能带塌整批。"""
     class _Exiting(_FakeFetcher):
-        def process_episode(self, tid, season, episode, providers=None):
+        def process_episode(self, tid, season, episode, providers=None,
+                            stop_event=None):
             raise SystemExit("缺少代理凭证: PROXY_USER")
 
     monkeypatch.setattr(p, "fetcher", _Exiting())
@@ -767,3 +775,120 @@ def test_source_without_refetcher_behaves_as_before():
     q.put(p._SENTINEL)
     source = p.QueueEntrySource(q, backlog=[])
     assert source.poll() == ("done", None)
+
+
+def test_many_in_place_replacements_do_not_blow_the_stack():
+    """🔴 启动预检一次能换回上千条过期直链，且它们对应的 backlog 大多尚未发出。
+
+    旧实现"就地替换后递归再 poll"会让递归深度 = 就地替换条数，
+    超过默认递归上限（1000）就 RecursionError 把主循环带塌。
+    """
+    n = 3000
+    q = queue.Queue()
+    backlog = [_ep(str(i), 1, 1, urls=["old"]) for i in range(n)]
+    revived = [_ep(str(i), 1, 1, urls=["new"]) for i in range(n)]
+    source = p.QueueEntrySource(
+        q, backlog=backlog, refetcher=_StubRefetcher(revived),
+    )
+    state, entry = source.poll()      # 全部就地替换后，投出 backlog 第一条
+    assert state == "item"
+    assert entry["urls"] == ["new"]
+    assert source.revived_delivered == n
+    assert source._revived_buf == []
+    # 余下的 backlog 也都是新链接，且一集只投一次
+    seen = {entry["tmdbId"]}
+    for _ in range(n - 1):
+        state, entry = source.poll()
+        assert (state, entry["urls"]) == ("item", ["new"])
+        seen.add(entry["tmdbId"])
+    assert len(seen) == n
+    q.put(p._SENTINEL)
+    assert source.poll() == ("done", None)
+
+
+def test_async_refetch_passes_stop_event_to_the_fetcher(monkeypatch, tmp_path):
+    """🔴 异步重取必须把 stop_event 传进 process_episode。
+
+    否则 Ctrl+C 后在途重取会把该集所有 provider × 重试次数走完
+    （每次尝试可达数十秒）才放线程退出，shutdown 白等满 timeout。
+    """
+    fake = _FakeFetcher({"9_S01E01": _ok_result("9", 1, 1)})
+    monkeypatch.setattr(p, "fetcher", fake)
+    monkeypatch.setattr(p.downloader, "INPUT_JSONL",
+                        str(tmp_path / "results.jsonl"))
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop)
+    r.start()
+    try:
+        assert r.dispatch([_ep("9", 1, 1)]) == 1
+        assert _drain(r)
+    finally:
+        stop.set()
+    assert fake.stop_events == [stop], "process_episode 应拿到同一个 stop_event"
+
+
+def test_dispatch_is_refused_after_fetch_side_halted(monkeypatch, capsys):
+    """🔴 取流侧因熔断/致命配置错误退出后，异步重取不再接收新投递。
+
+    此时源站或代理池已被判定不可用，继续投只会让每集在几十秒的超时里空转；
+    这些过期集留给下次运行的启动预检统一换新。已经排队的不清空、在途的照常跑完。
+    """
+    fake = _FakeFetcher()
+    monkeypatch.setattr(p, "fetcher", fake)
+    halted = threading.Event()
+    stop = threading.Event()
+    r = p.AsyncRefetcher(1, stop, halted=halted)
+    # 不 start：只验证 dispatch 的门禁，不触碰线程
+    halted.set()
+    assert r.dispatch([_ep("1", 1, 1), _ep("1", 1, 2)]) == 0
+    assert r.dispatch([_ep("1", 1, 3)]) == 0
+    assert r.skipped_halted == 3
+    assert r.pending_count() == 0
+    assert r._in.empty()
+    out = capsys.readouterr().out
+    assert out.count("异步重取不再接收新投递") == 1, "提示只打一次，不刷屏"
+
+
+def test_dispatch_is_open_while_fetch_side_is_healthy(monkeypatch):
+    """halted 未置位时 dispatch 行为不变（正常收工也不算 halted）。"""
+    fake = _FakeFetcher()
+    monkeypatch.setattr(p, "fetcher", fake)
+    halted = threading.Event()
+    r = p.AsyncRefetcher(1, threading.Event(), halted=halted)
+    assert r.dispatch([_ep("1", 1, 1)]) == 1
+    assert r.pending_count() == 1
+    assert r.skipped_halted == 0
+
+
+@pytest.mark.parametrize("exc", [SystemExit(2), RuntimeError("boom")])
+def test_worker_sets_halted_on_fatal_exit(monkeypatch, exc):
+    """取流线程因 SystemExit（熔断）或异常退出 → halted 置位。"""
+    def bail(argv=None, on_result=None, stop_event=None):
+        raise exc
+
+    monkeypatch.setattr(p.fetcher, "main", bail)
+    q = queue.Queue()
+    worker = p.FetchWorker(q)
+    worker.start()
+    assert q.get(timeout=5) is p._SENTINEL
+    assert worker.halted.is_set()
+    worker.shutdown()
+
+
+def test_worker_does_not_set_halted_on_normal_completion(monkeypatch):
+    """取流正常跑完整批不算致命退出：异步重取通道必须继续开着。
+
+    max_rounds>1 时取流早已收工、下载还在跑后几轮，此时过期重取全靠这条通道。
+    """
+    def fake_main(argv=None, on_result=None, stop_event=None):
+        on_result(_ep("1", 1, 1))
+
+    monkeypatch.setattr(p.fetcher, "main", fake_main)
+    q = queue.Queue()
+    worker = p.FetchWorker(q)
+    worker.start()
+    q.get(timeout=5)
+    assert q.get(timeout=5) is p._SENTINEL
+    assert not worker.halted.is_set()
+    worker.shutdown()
+    assert not worker.halted.is_set()

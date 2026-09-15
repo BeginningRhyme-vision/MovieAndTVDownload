@@ -140,7 +140,13 @@ class QueueEntrySource:
             self._revived_buf.extend(self._refetcher.collect())
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️ 收取异步重取结果失败: {exc}", flush=True)
-        for i, entry in enumerate(self._revived_buf):
+        # 用下标循环而非递归：就地替换 backlog 的分支不产出条目，需要继续
+        # 往后扫。预检一次最多投 AUTO_REFETCH_MAX_PER_RUN（默认上千）条，
+        # 下载侧饿等期间它们会集中回到缓冲里、且对应存量多半还没轮到——
+        # 若每替换一条就递归一层，一次 poll 就可能逼近解释器递归上限。
+        i = 0
+        while i < len(self._revived_buf):
+            entry = self._revived_buf[i]
             key = self._key(entry)
             idx = self._backlog_index.get(key) if key is not None else None
             if idx is not None and idx >= self._backlog_next:
@@ -148,10 +154,11 @@ class QueueEntrySource:
                 self._backlog[idx] = entry
                 self.revived_delivered += 1
                 del self._revived_buf[i]
-                return self._poll_revived()
+                continue
             if key is not None and self._is_busy is not None:
                 try:
                     if self._is_busy(key):
+                        i += 1
                         continue
                 except Exception:  # noqa: BLE001
                     pass
@@ -245,6 +252,11 @@ class FetchWorker:
         self._q = q
         self._argv = argv or []
         self._stop = threading.Event()
+        # 取流因致命错误退出时置位（熔断 DeadStreakBreaker / 配置校验 / 锁冲突 /
+        # 未捕获异常）。AsyncRefetcher 据此拒收新投递：重取走的是同一套取流代码
+        # 与同一个代理池，主取流都跑不下去了，再逐集烧满 MAX_RETRIES 只会白耗
+        # 配额。正常收工**不**置位——那只是"存货取尽"，重取照常。
+        self.halted = threading.Event()
         self.thread = threading.Thread(target=self._run, name="fetch-worker",
                                        daemon=True)
         self.error = None
@@ -285,9 +297,11 @@ class FetchWorker:
             # 取流侧用 SystemExit 做致命退出（熔断 DeadStreakBreaker → exit 2、
             # 配置校验失败等）。绝不能让它静默杀掉线程而下载侧毫不知情。
             self.error = exc
+            self.halted.set()
             print(f"\n⚠️ [pipeline] 取流提前终止: {exc}", flush=True)
         except Exception as exc:  # noqa: BLE001
             self.error = exc
+            self.halted.set()
             print(f"\n⚠️ [pipeline] 取流异常终止: {exc}", flush=True)
         finally:
             # 无论正常收尾还是异常退出，都必须放哨兵——否则下载侧会一直
@@ -351,10 +365,15 @@ class AsyncRefetcher:
     消费，下次启动也能按 fetched_at 择新直接用上。
     """
 
-    def __init__(self, workers, stop_event, providers=None):
+    def __init__(self, workers, stop_event, providers=None, halted=None):
         self._in = queue.Queue()
         self._done = queue.Queue()
         self._stop = stop_event
+        # 取流侧致命退出标志（FetchWorker.halted）。置位后 dispatch 一律拒收：
+        # 主取流已因熔断/配置错误跑不下去，重取用的是同一套代码与代理池，
+        # 再逐集烧满 MAX_RETRIES 只是白耗配额。已入队/在途的照常跑完并落盘
+        # （它们数量有限、且结果有价值），只是不再接新的。
+        self._halted = halted
         self._workers = max(1, int(workers))
         self._threads = []
         # 取流源列表：与主取流任务保持一致。None 表示用 config 默认
@@ -374,6 +393,7 @@ class AsyncRefetcher:
         self._lock = threading.Lock()
         self.dispatched = 0
         self.skipped_inflight = 0
+        self.skipped_halted = 0
         self.revived = 0
 
     def start(self):
@@ -386,8 +406,22 @@ class AsyncRefetcher:
     def dispatch(self, entries):
         """主循环调用：投递重取请求。绝不阻塞（无界队列）。
 
-        返回实际接收的条数：同一集已在途的条目被拒收（不计数、不入队）。
+        返回实际接收的条数：同一集已在途的条目被拒收（不计数、不入队）；
+        取流侧已致命退出时整批拒收（返回 0）。
         """
+        if self._halted is not None and self._halted.is_set():
+            n = len(entries)
+            if n:
+                with self._lock:
+                    first = self.skipped_halted == 0
+                    self.skipped_halted += n
+                if first:
+                    print(
+                        "⚠️ [pipeline] 取流侧已终止，异步重取不再接收新投递"
+                        "（过期集留待下次运行的启动预检换新）",
+                        flush=True,
+                    )
+            return 0
         accepted = 0
         for entry in entries:
             key = downloader.record_episode_key(entry)
@@ -447,8 +481,11 @@ class AsyncRefetcher:
         if tmdb_id is None or season is None or episode is None or not key:
             return
         try:
+            # 透传停止信号：Ctrl+C / 下载侧收工后，正在跑的那条重取在下一次
+            # 尝试前就退出，不再把 MAX_RETRIES 预算（每次换代理 IP）跑满。
             status, result = fetcher.process_episode(
-                tmdb_id, season, episode, providers=self._providers
+                tmdb_id, season, episode, providers=self._providers,
+                stop_event=self._stop,
             )
         except (Exception, SystemExit) as exc:
             # 单集重取失败绝不能带塌整批；SystemExit 一并兜住
@@ -527,7 +564,7 @@ def main():
     if downloader.AUTO_REFETCH_ENABLED:
         refetcher = AsyncRefetcher(
             downloader.AUTO_REFETCH_WORKERS, worker._stop,
-            providers=refetch_providers,
+            providers=refetch_providers, halted=worker.halted,
         )
         refetcher.start()
         downloader.async_refetch_hook = refetcher
@@ -605,6 +642,8 @@ def _print_summary(worker, source, refetcher, started, interrupted=False):
               + (f"（{in_round} 集在首轮内即刻消费）" if in_round else "")
               + (f"（{refetcher.skipped_inflight} 次因同集重取在途而合并）"
                  if getattr(refetcher, "skipped_inflight", 0) else "")
+              + (f"（{refetcher.skipped_halted} 次因取流侧已终止而拒收）"
+                 if getattr(refetcher, "skipped_halted", 0) else "")
               + (f"（{stranded} 集未及回收，已落盘 results.jsonl，"
                  f"下次运行自动使用）" if stranded > 0 else ""))
     if worker.error is not None:

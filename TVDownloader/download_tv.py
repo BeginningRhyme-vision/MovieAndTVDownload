@@ -123,7 +123,10 @@ AUTO_REFETCH_MAX_PER_EPISODE = max(
 # 排队到总超时被丢弃，而它们的 refetch_counts **不会 +1**（只在收到结果时记），
 # 下次运行又从头再来，队尾的集永远轮不到。等于预检只对前几百集有效。
 # 故按 fetched_at 升序截断：最旧的直链最可能过期，优先换它们。
-AUTO_REFETCH_MAX_PER_RUN = max(0, int(_REFETCH_CFG.get("max_per_run", 2000)))
+# 默认 500 而非更大：pipeline 模式下预检重取与主取流**共享同一个代理池**，
+# 每条最多 MAX_RETRIES+1 次尝试、每次换 IP，2000 条一次全投会在启动初期
+# 与主取流叠加出数倍于稳态的配额消耗。剩余陈旧集下次运行按最旧优先轮到。
+AUTO_REFETCH_MAX_PER_RUN = max(0, int(_REFETCH_CFG.get("max_per_run", 500)))
 # 预检是否跳过"上次因画质不达标被判死"的集。TV 侧有源率个位数，这类集占比高，
 # 重取回来画质依然不达标，白烧住宅代理配额。
 AUTO_REFETCH_SKIP_QUALITY_DEAD = bool(
@@ -5293,7 +5296,9 @@ def _run_pipeline():
                     # 这个状态）。此时 wait(空集合) 会立刻返回、退化成 100% CPU
                     # 空转，故让出 CPU 后重新问来源要货。
                     # list 来源永不返回 wait，故这段对单独跑下载的场景是死分支。
-                    time.sleep(STREAM_IDLE_POLL_SECONDS)
+                    # 用 interrupted.wait 而非 time.sleep：与文件内其它等待口径
+                    # 一致，收到中断信号立刻醒来收尾。
+                    interrupted.wait(STREAM_IDLE_POLL_SECONDS)
                     submit_downloads()
                     continue
                 # 🔑 来源正饿着时必须定时醒来重问：「取流侧产出了新集」**不是
@@ -5360,10 +5365,26 @@ def _run_pipeline():
                     print(f"⚠️ 收取异步重取结果失败: {exc}", flush=True)
                     revived = []
 
-            if AUTO_REFETCH_ENABLED and round_failed_expired and has_more_rounds:
+            # 第 2 轮起来源是 list，上一轮/预检投出的重取可能仍在途：即使本轮
+            # 没有新过期集，也得等它们回来并入下一轮，否则这些新链接只能靠落盘
+            # 兜底、当次运行救不回。（末轮不等：拿到也没轮次消费。）
+            async_pending = 0
+            if (
+                AUTO_REFETCH_ENABLED and has_more_rounds
+                and async_refetch_hook is not None
+            ):
+                try:
+                    async_pending = async_refetch_hook.pending_count()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"⚠️ 查询异步重取在途数失败: {exc}", flush=True)
+
+            if (
+                AUTO_REFETCH_ENABLED and has_more_rounds
+                and (round_failed_expired or async_pending > 0)
+            ):
                 try:
                     if async_refetch_hook is not None:
-                        if not streaming:
+                        if not streaming and round_failed_expired:
                             # 装了钩子却不是流式来源（正常部署不会出现）：
                             # 没人在轮中投递，退回轮末集中投递。次数上限仍由
                             # 这里把关——钩子只负责投递，不认识 refetch_counts。
@@ -5389,8 +5410,8 @@ def _run_pipeline():
                         # 退出，不会白等满。
                         if async_refetch_hook.pending_count() > 0:
                             print(
-                                f"\n[自动重取流] 本轮 {len(round_failed_expired)} 集直链过期"
-                                f"已投异步重取，等待在途结果"
+                                f"\n[自动重取流] 本轮 {len(round_failed_expired)} 集直链过期，"
+                                f"异步重取仍有在途，等待结果"
                                 f"（最多 {ASYNC_REFETCH_WAIT_SECONDS}s）...",
                                 flush=True,
                             )
