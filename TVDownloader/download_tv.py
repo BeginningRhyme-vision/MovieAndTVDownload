@@ -648,13 +648,29 @@ def record_block_status(status):
 #     下一轮重投——万一主机恢复了还能救回来；
 #   - 计数仅存活于**本次运行**（模块级字典，进程退出即清空），不落盘。
 #     主机故障是临时状态，落盘会让下次运行带着过期结论跑。
+#
+# 🔁 半开恢复（2026-09-15 补）：熔断**不是**本次运行内永久生效。实测踩坑——
+#   sun.peakstorm.top 被熔断后 1 小时已恢复（独立探测 HTTP 200），但本次运行
+#   再也不碰它，白白放弃 226 集；而 peakstorm 只有 moon/sun 两台，两台都熔断
+#   就等于 vidup/vidfast 两家 provider 全废。故改为：熔断记一个"下次可重试
+#   时刻"，到点后**第一个**问到该主机的线程把熔断整个复位（计数清零、解除跳过），
+#   让正常的失败检测重新判断——主机真没好就再攒够阈值重新熔断（mp4 只需 3 次
+#   429、HLS 只需 8 次 5xx，几秒内完成），代价极小；主机好了就立刻全量恢复。
+#   不单独做"探针请求 + 半开态"，因为复位本身就是最廉价的探针，且无状态泄漏风险。
 _mp4_host_lock = threading.Lock()
 _mp4_host_429 = {}
-_mp4_host_tripped = set()
+# host -> 下次允许重试的 time.monotonic() 时刻。键存在即表示当前熔断中。
+_mp4_host_tripped = {}
 # 单台主机累计多少次 429 后熔断。3 次足以区分"偶发限流"（退避后恢复）与
 # "整机故障"（次次复现）。
 MP4_HOST_CIRCUIT_THRESHOLD = max(
     1, int(_CFG.get("mp4_host_circuit_threshold", 3))
+)
+# 熔断后多久允许复位重试（秒），mp4 与 HLS 共用。默认 15 秒：源站故障多是
+# 分钟级抖动，间隔太长（如 300s）会在一次运行内白扔上百集；而复位的代价只有
+# 几次必然失败的请求，远小于漏下的影片。
+HOST_CIRCUIT_COOLDOWN_SEC = max(
+    1.0, float(_CFG.get("host_circuit_cooldown_sec", 15))
 )
 # 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS（见上第三条边界）。
 _MP4_HOST_BLOCKED_MARKER = "直链主机疑似故障已熔断"
@@ -669,33 +685,47 @@ def _host_of(url):
 
 
 def _mp4_host_record_429(url):
-    """记一次 mp4 直链 429；达到阈值则熔断该主机（本次运行内）。"""
+    """记一次 mp4 直链 429；达到阈值则熔断该主机（到点可半开复位）。"""
     host = _host_of(url)
     if not host:
         return
     with _mp4_host_lock:
         _mp4_host_429[host] = _mp4_host_429.get(host, 0) + 1
         count = _mp4_host_429[host]
-        newly_tripped = (
-            count >= MP4_HOST_CIRCUIT_THRESHOLD and host not in _mp4_host_tripped
-        )
-        if newly_tripped:
-            _mp4_host_tripped.add(host)
+        tripped_now = count >= MP4_HOST_CIRCUIT_THRESHOLD
+        newly_tripped = tripped_now and host not in _mp4_host_tripped
+        if tripped_now:
+            # 无论首次熔断还是复位后再次失败，都把下次重试时刻往后推。
+            _mp4_host_tripped[host] = (
+                time.monotonic() + HOST_CIRCUIT_COOLDOWN_SEC
+            )
     # 打印放在锁外：避免 I/O 拖住其它线程的计数。
     if newly_tripped:
         print(
-            f"  [主机熔断] {host} 累计 {count} 次 429，本次运行内跳过该主机的"
-            f"全部 mp4 直链节点（其余节点不受影响）",
+            f"  [主机熔断] {host} 累计 {count} 次 429，暂时跳过该主机的全部 mp4"
+            f"直链节点（其余节点不受影响），"
+            f"{HOST_CIRCUIT_COOLDOWN_SEC:.0f}s 后自动重试",
             flush=True,
         )
 
 
 def _mp4_host_is_tripped(url):
+    """该主机当前是否应跳过；到达重试时刻则就地复位熔断并放行。"""
     host = _host_of(url)
     if not host:
         return False
     with _mp4_host_lock:
-        return host in _mp4_host_tripped
+        next_retry = _mp4_host_tripped.get(host)
+        if next_retry is None:
+            return False
+        if time.monotonic() < next_retry:
+            return True
+        # 冷却到点：整个复位，让正常的 429 检测重新判断（还坏就再攒 3 次重新熔断）。
+        del _mp4_host_tripped[host]
+        _mp4_host_429[host] = 0
+    print(f"  [主机半开] {host} 冷却到点，解除熔断重新尝试直链节点", flush=True)
+    return False
+
 
 
 # ---------- HLS 分片主机级 5xx 熔断（只作用于 m3u8 分片层）----------
@@ -714,9 +744,11 @@ def _mp4_host_is_tripped(url):
 #     熔断 marker，统计上看不出是主机故障。
 # 其余三条边界与 mp4 完全一致：只跳过同主机节点 / 不判整集死（marker 不进
 # _PERMANENT_FAILURE_MARKERS，下一轮重投主机恢复了还能救回）/ 计数仅存活于本次运行。
+# 半开恢复机制与 mp4 侧同构，共用 HOST_CIRCUIT_COOLDOWN_SEC（见上方长注释）。
 _hls_host_lock = threading.Lock()
 _hls_host_5xx = {}
-_hls_host_tripped = set()
+# host -> 下次允许重试的 time.monotonic() 时刻。键存在即表示当前熔断中。
+_hls_host_tripped = {}
 # 同一主机连续多少次 5xx（中间无一成功）后熔断。采样阶段并发 4、正片并发 64，
 # 恒定 502 的主机在第一波请求内即达阈值；8 也足够覆盖几秒级的真抖动
 # （抖动期间只要有一个分片成功就清零）。
@@ -751,7 +783,8 @@ def _status_in_chain(exc):
 def _hls_host_record_result(url, status):
     """记一次分片请求结果：5xx 累加连续失败数，其它（含成功）清零。
 
-    返回该主机此刻是否已熔断。
+    返回该主机此刻是否已熔断。成功（非 5xx）时**立即解除熔断**——比等冷却
+    到点更积极，且是真实证据而非猜测。
     """
     host = _host_of(url)
     if not host:
@@ -761,27 +794,43 @@ def _hls_host_record_result(url, status):
         if status in _HLS_HOST_CIRCUIT_STATUS:
             _hls_host_5xx[host] = _hls_host_5xx.get(host, 0) + 1
             count = _hls_host_5xx[host]
-            if count >= HLS_HOST_CIRCUIT_THRESHOLD and host not in _hls_host_tripped:
-                _hls_host_tripped.add(host)
-                newly_tripped = True
+            if count >= HLS_HOST_CIRCUIT_THRESHOLD:
+                newly_tripped = host not in _hls_host_tripped
+                # 首次熔断与复位后再失败都把下次重试时刻往后推。
+                _hls_host_tripped[host] = (
+                    time.monotonic() + HOST_CIRCUIT_COOLDOWN_SEC
+                )
         else:
             _hls_host_5xx[host] = 0
+            # 拿到非 5xx 响应说明主机活着，无须再等冷却。
+            _hls_host_tripped.pop(host, None)
         tripped = host in _hls_host_tripped
     if newly_tripped:
         print(
-            f"  [主机熔断] {host} 连续 {count} 次 HTTP {status}，本次运行内跳过"
-            f"该主机的全部 m3u8 节点（其余节点不受影响）",
+            f"  [主机熔断] {host} 连续 {count} 次 HTTP {status}，暂时跳过该主机的"
+            f"全部 m3u8 节点（其余节点不受影响），"
+            f"{HOST_CIRCUIT_COOLDOWN_SEC:.0f}s 后自动重试",
             flush=True,
         )
     return tripped
 
 
 def _hls_host_is_tripped(url):
+    """该主机当前是否应跳过；到达重试时刻则就地复位熔断并放行。"""
     host = _host_of(url)
     if not host:
         return False
     with _hls_host_lock:
-        return host in _hls_host_tripped
+        next_retry = _hls_host_tripped.get(host)
+        if next_retry is None:
+            return False
+        if time.monotonic() < next_retry:
+            return True
+        # 冷却到点：整个复位，让正常的 5xx 检测重新判断（还坏就再攒够阈值重熔断）。
+        del _hls_host_tripped[host]
+        _hls_host_5xx[host] = 0
+    print(f"  [主机半开] {host} 冷却到点，解除熔断重新尝试 m3u8 节点", flush=True)
+    return False
 
 
 def _raise_if_hls_host_tripped(url, what):

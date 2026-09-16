@@ -1851,7 +1851,7 @@ def _install_range_session(monkeypatch, data, status=None):
 def circuit_env(monkeypatch):
     """每个用例独立的熔断计数（模块级字典会跨用例污染）。"""
     monkeypatch.setattr(d, "_mp4_host_429", {})
-    monkeypatch.setattr(d, "_mp4_host_tripped", set())
+    monkeypatch.setattr(d, "_mp4_host_tripped", {})
     monkeypatch.setattr(d, "MP4_HOST_CIRCUIT_THRESHOLD", 3)
     monkeypatch.setattr(d, "record_block_status", lambda s: None)
 
@@ -1947,6 +1947,91 @@ def test_host_circuit_marker_is_not_a_permanent_failure():
     assert d._classify_failure(msg) is True          # 仍可重试
     assert d._MP4_HOST_BLOCKED_MARKER in d._MP4_CHUNK_NO_RETRY_MARKERS
     assert d.classify_reject_reason(msg) == "直链主机熔断(429)"
+
+
+# ------------------------------------------------ 熔断半开恢复
+def test_mp4_circuit_half_opens_after_cooldown(circuit_env, monkeypatch):
+    """🔒 冷却到点后熔断必须自动复位，否则已恢复的主机被白白放弃整轮。
+
+    实测踩坑：sun.peakstorm.top 熔断后 1 小时已恢复（curl 200），但本次运行
+    再也不碰它，白丢 226 集；peakstorm 只有 moon/sun 两台，两台都熔断等于
+    vidup/vidfast 全废。
+    """
+    monkeypatch.setattr(d, "HOST_CIRCUIT_COOLDOWN_SEC", 15)
+    url = "https://flaky.cdn/a.mp4"
+    for _ in range(3):
+        d._mp4_host_record_429(url)
+    assert d._mp4_host_is_tripped(url) is True
+
+    # 冷却未到：仍然跳过（base 先取值，避免 patch 后的 lambda 自递归）
+    base = time.monotonic()
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 14)
+    assert d._mp4_host_is_tripped(url) is True
+
+    # 冷却到点：解除熔断，且计数已清零（还坏就得重新攒满 3 次）
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 16)
+    assert d._mp4_host_is_tripped(url) is False
+    assert d._mp4_host_429[d._host_of(url)] == 0
+    assert d._host_of(url) not in d._mp4_host_tripped
+
+
+def test_mp4_circuit_retrips_if_still_broken(circuit_env, monkeypatch):
+    """半开后主机仍坏：重新攒满阈值就再次熔断（不会无限放行）。"""
+    monkeypatch.setattr(d, "HOST_CIRCUIT_COOLDOWN_SEC", 15)
+    url = "https://stillbad.cdn/a.mp4"
+    for _ in range(3):
+        d._mp4_host_record_429(url)
+    base = time.monotonic()
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 100)
+    assert d._mp4_host_is_tripped(url) is False      # 复位放行
+    for _ in range(3):
+        d._mp4_host_record_429(url)
+    assert d._mp4_host_is_tripped(url) is True       # 再次熔断
+
+
+@pytest.fixture
+def hls_circuit_env(monkeypatch):
+    monkeypatch.setattr(d, "_hls_host_5xx", {})
+    monkeypatch.setattr(d, "_hls_host_tripped", {})
+    monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD", 8)
+    monkeypatch.setattr(d, "HOST_CIRCUIT_COOLDOWN_SEC", 15)
+
+
+def test_hls_circuit_half_opens_after_cooldown(hls_circuit_env, monkeypatch):
+    """🔒 HLS 侧同样要半开：peakstorm 恢复后必须能重新用。"""
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(8):
+        d._hls_host_record_result(url, 502)
+    assert d._hls_host_is_tripped(url) is True
+
+    base = time.monotonic()
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 14)
+    assert d._hls_host_is_tripped(url) is True
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 16)
+    assert d._hls_host_is_tripped(url) is False
+    assert d._hls_host_5xx[d._host_of(url)] == 0
+
+
+def test_hls_circuit_clears_immediately_on_success(hls_circuit_env):
+    """一次非 5xx 响应即刻解除熔断——真实证据比等冷却更可靠。"""
+    url = "https://moon.peakstorm.top/x/seg.ts"
+    for _ in range(8):
+        d._hls_host_record_result(url, 503)
+    assert d._hls_host_is_tripped(url) is True
+    # 无需等冷却：拿到 200 说明主机活了
+    assert d._hls_host_record_result(url, 200) is False
+    assert d._hls_host_is_tripped(url) is False
+    assert d._host_of(url) not in d._hls_host_tripped
+
+
+def test_hls_circuit_other_host_unaffected_by_cooldown(hls_circuit_env):
+    """🔒 边界不变：熔断只作用于同一主机。"""
+    bad = "https://sun.peakstorm.top/x/seg.ts"
+    good = "https://moon.peakstorm.top/x/seg.ts"
+    for _ in range(8):
+        d._hls_host_record_result(bad, 502)
+    assert d._hls_host_is_tripped(bad) is True
+    assert d._hls_host_is_tripped(good) is False
 
 
 # ------------------------------------------------ 失败侧逐节点归因
