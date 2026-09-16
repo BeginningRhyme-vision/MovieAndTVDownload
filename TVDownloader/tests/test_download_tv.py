@@ -2606,6 +2606,76 @@ def _success_info(sandbox, key="1_S01E01"):
     }
 
 
+def test_upload_records_file_size_before_deleting_local(sandbox, monkeypatch):
+    """成品体积必须在 remove_file 之前落进 SUCCESS_LOG。
+
+    这是整个统计的命门：上传成功后本地文件立刻被删，事后再也 stat 不到。
+    """
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: (True, None))
+    info = _success_info(sandbox)
+    # _success_info 写的是 b"mp4" = 3 字节
+    key, ok, out = d.upload_one_entry(info)
+    assert ok is True
+    assert not os.path.exists(info["final_path"])  # 本地已删
+    assert _read_jsonl(d.SUCCESS_LOG)[0]["file_size_bytes"] == 3
+
+
+def test_upload_failure_records_size_in_success_and_pending(sandbox, monkeypatch):
+    # 上传失败留本地：SUCCESS_LOG 与 pending 都要带体积，供补传与统计复用。
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: (False, "boom"))
+    info = _success_info(sandbox)
+    d.upload_one_entry(info)
+    assert _read_jsonl(d.SUCCESS_LOG)[0]["file_size_bytes"] == 3
+    assert _read_jsonl(d.UPLOAD_PENDING_LOG)[0]["file_size_bytes"] == 3
+
+
+def test_record_file_size_missing_file_does_not_raise(sandbox):
+    # stat 不到（文件被移走/竞态）只记 None，绝不能让上传主流程炸掉。
+    info = {"final_path": str(sandbox / "nope.mp4")}
+    assert d._record_file_size(info, info["final_path"]) is None
+    assert info["file_size_bytes"] is None
+
+
+def test_record_file_size_does_not_overwrite_existing(sandbox):
+    # 补传路径可能在文件已删后重写记录，已有实测值不能被覆盖成 None。
+    info = {"file_size_bytes": 12345}
+    assert d._record_file_size(info, str(sandbox / "nope.mp4")) == 12345
+    assert info["file_size_bytes"] == 12345
+
+
+def test_reupload_carries_file_size_into_success_log(sandbox, monkeypatch):
+    """跨运行补传：整条覆盖写 SUCCESS_LOG，体积必须带回来否则会被抹掉。"""
+    monkeypatch.setattr(d, "S3_ENABLED", True)
+    monkeypatch.setattr(d, "DELETE_LOCAL_AFTER_UPLOAD", True)
+    monkeypatch.setattr(d, "is_main_running", lambda: False)
+    monkeypatch.setattr(d, "upload_to_r2", lambda p, k: (True, None))
+    info = _success_info(sandbox)
+    d.write_pending({
+        "tmdbId": "1", "season": 1, "episode": 1, "title": "T", "year": 2001,
+        "local_path": info["final_path"], "s3_key": "tv/2001/1/S01/E01/E01.mp4",
+        "fail_reason": "boom", "ts": "now",
+    })
+    d.reupload_pending()
+    rec = _read_jsonl(d.SUCCESS_LOG)[0]
+    assert rec["uploaded"] is True and rec["file_size_bytes"] == 3
+
+
+def test_record_file_size_retries_when_previous_value_was_none(sandbox):
+    """上次 stat 失败记了 None，本次文件在 → 必须重新取到真实值。
+
+    falsy 短路是有意的：None/0 都允许重试，只有真实正值才受保护。
+    反压降级路径会在 stat 失败后再次经过补传路径，靠这条才能补上体积。
+    """
+    path = sandbox / "some.mp4"
+    path.write_bytes(b"1234567890")
+    info = {"file_size_bytes": None}
+    assert d._record_file_size(info, str(path)) == 10
+    assert info["file_size_bytes"] == 10
+
+
 def test_upload_one_entry_s3_disabled(sandbox, monkeypatch):
     monkeypatch.setattr(d, "S3_ENABLED", False)
     info = _success_info(sandbox)

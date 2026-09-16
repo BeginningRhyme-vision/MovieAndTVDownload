@@ -1222,8 +1222,9 @@ def reconcile_unlogged_downloads(disk_ids, logged_ids):
                     episode_dir(tid, season, episode, year),
                     episode_video_name(episode),
                 )
-                if os.stat(mp4_path).st_size > 0:
-                    located[key] = (mp4_path, year)
+                size = os.stat(mp4_path).st_size
+                if size > 0:
+                    located[key] = (mp4_path, year, size)
             except (OSError, ValueError):
                 continue
 
@@ -1233,7 +1234,7 @@ def reconcile_unlogged_downloads(disk_ids, logged_ids):
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     count = 0
     for key in sorted(located):
-        mp4_path, year = located[key]
+        mp4_path, year, size = located[key]
         tid, season, episode = wanted[key]
         try:
             s3_key = build_s3_key(tid, season, episode, year)
@@ -1248,6 +1249,8 @@ def reconcile_unlogged_downloads(disk_ids, logged_ids):
             **_attribution_of(None),
             "final_path": mp4_path,
             "s3_key": s3_key,
+            # 巡检这一步刚好 stat 过，顺手带上体积，免得补传路径再 stat 一次。
+            "file_size_bytes": size,
             "uploaded": False,
             "reconciled": True,
         }
@@ -1262,6 +1265,7 @@ def reconcile_unlogged_downloads(disk_ids, logged_ids):
                 **_attribution_of(None),
                 "local_path": mp4_path,
                 "s3_key": s3_key,
+                "file_size_bytes": size,
                 "fail_reason": "启动巡检：成品已落地但未入账",
                 "ts": now,
             })
@@ -4390,6 +4394,27 @@ def finalize_one_entry(conversion_job, processed_ids):
                 processed_ids.add(normalized_id)
 
 
+def _record_file_size(success_info, local_path):
+    """把成品体积记进 success_info["file_size_bytes"]（供 R2 总量统计）。
+
+    ⚠️ **必须在 remove_file(local_path) 之前调用**：上传成功后本地文件即被删除，
+    事后无法再 stat。SUCCESS_LOG 是唯一留存体积的地方。
+
+    取不到大小（文件已被移走/权限/竞态）时记 None 并**照常返回**——统计是旁路
+    需求，绝不能因为 stat 失败就影响上传主流程。下游汇总按缺失跳过。
+    已有非空值时不覆盖：补传路径可能在文件删除后重写记录，保留首次实测值。
+    """
+    if success_info.get("file_size_bytes"):
+        return success_info["file_size_bytes"]
+    size = None
+    try:
+        size = os.stat(local_path, follow_symlinks=False).st_size
+    except OSError:
+        size = None
+    success_info["file_size_bytes"] = size
+    return size
+
+
 def upload_one_entry(success_info):
     """上传阶段：把成品 mp4 传到 R2，成功删本地；失败留本地并写 pending。
 
@@ -4404,6 +4429,7 @@ def upload_one_entry(success_info):
     local_path = success_info["final_path"]
     if not S3_ENABLED:
         success_info["uploaded"] = False
+        _record_file_size(success_info, local_path)
         write_log(SUCCESS_LOG, success_info)
         print(f"  [{key}] 成功（未上传，本地保留）: {local_path}",
               flush=True)
@@ -4418,6 +4444,8 @@ def upload_one_entry(success_info):
         if ok:
             success_info["uploaded"] = True
             success_info["s3_key"] = s3_key
+            # 🔑 必须在下面的 remove_file 之前取：删完就 stat 不到了。
+            _record_file_size(success_info, local_path)
             # 先传附属资产再删视频：删视频不依赖资产结果，但把两者放在一起
             # 便于日志按集聚集。资产上传内部已完全吞异常；没传上去的资产记一条
             # assets_only pending，留给 reupload 回扫补传（否则视频删了、目录里
@@ -4440,6 +4468,7 @@ def upload_one_entry(success_info):
         # 上传失败：保留本地文件，写 SUCCESS_LOG(uploaded=false) 防重下 + 写 pending。
         success_info["uploaded"] = False
         success_info["s3_key"] = s3_key
+        _record_file_size(success_info, local_path)
         write_log(SUCCESS_LOG, success_info)
         write_pending({
             "tmdbId": tmdb_id,
@@ -4450,6 +4479,9 @@ def upload_one_entry(success_info):
             **_attribution_of(success_info),
             "local_path": local_path,
             "s3_key": s3_key,
+            # 带上体积：补传时本地文件还在，但让 pending 自带可省一次 stat，
+            # 也让台账自身能看出待补传的总量。
+            "file_size_bytes": success_info.get("file_size_bytes"),
             "fail_reason": reason,
             "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
         })
@@ -5290,6 +5322,9 @@ def _run_pipeline():
                     **_attribution_of(info),
                     "local_path": info.get("final_path"),
                     "s3_key": "",
+                    "file_size_bytes": _record_file_size(
+                        info, info.get("final_path") or ""
+                    ),
                     "fail_reason": degrade_reason,
                     "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                 })
@@ -5300,6 +5335,9 @@ def _run_pipeline():
         # 后续 reupload 补传成功时也走同一函数覆盖同一条，保证
         # SUCCESS_LOG "每集一条" 的设计意图不被破坏。
         info["uploaded"] = False
+        # 降级时成品留在本地，此刻还 stat 得到；不记的话这条 SUCCESS_LOG
+        # 会一直缺体积（补传成功后虽会覆盖，但补传前的统计要少算这一集）。
+        _record_file_size(info, info.get("final_path") or "")
         try:
             update_success_log(record_episode_key(info) or label, info)
         except Exception as exc:
@@ -6119,6 +6157,14 @@ def reupload_pending():
                 continue
 
             print(f"  [{key}] 补传中 -> {s3_key}")
+            # 🔑 体积必须在下面的 remove_file 之前取。pending 记录本身可能带
+            # file_size_bytes（首传失败时已实测），优先沿用，缺了才现场 stat。
+            reupload_size = record.get("file_size_bytes")
+            if not reupload_size:
+                try:
+                    reupload_size = os.stat(local_path, follow_symlinks=False).st_size
+                except OSError:
+                    reupload_size = None
             ok, reason = upload_to_r2(local_path, s3_key)
             if ok:
                 # 视频补传成功后顺带把旁车资产一并补上（内部已吞异常）。没传上的
@@ -6152,6 +6198,9 @@ def reupload_pending():
                     "final_path": local_path,
                     "s3_key": s3_key,
                     "asset_keys": asset_keys,
+                    # 同上：整条覆盖写，体积也必须带回来，否则补传会把首传时
+                    # 实测到的字节数抹掉，R2 总量统计少算这一集。
+                    "file_size_bytes": reupload_size,
                     "uploaded": True,
                     "reupload": True,
                 }

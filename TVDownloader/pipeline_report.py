@@ -181,6 +181,22 @@ def _pct(part, whole):
     return f"{part / whole:.1%}" if whole else "n/a"
 
 
+def _human_bytes(num):
+    """字节数转人类可读（二进制单位）。非法输入返回 "n/a"。
+
+    带到 PB：全量跑的预估在百 TB 量级，长期累计可能跨过 1024 TB。
+    """
+    try:
+        value = float(num)
+    except (TypeError, ValueError):
+        return "n/a"
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(value) < 1024 or unit == "PB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.2f} {unit}"
+        value /= 1024
+    return f"{value:.2f} PB"
+
+
 def _print_counter(title, counter, total):
     if not counter:
         return
@@ -344,12 +360,24 @@ def main():
                 fallback_wins[name] += 1
 
     # success.jsonl 每集一条，uploaded 标记是否已进 R2
+    # 体积按**集级 key 去重**：SUCCESS_LOG 是 append-only，同一集可能先写
+    # uploaded:false、补传后再写 true；而 R2 的 key 是幂等覆盖的，去重后的和
+    # 才等于 R2 实际占用。后写的正值覆盖先写的（与 update_success_log 的覆盖
+    # 语义一致），但**无效值不覆盖已记录的正值**——补传若 stat 失败会写回
+    # None，不能让它抹掉首传时的实测值。
+    # uploaded 一旦为真就不再撤销：对象 PUT 成功后就在 R2 上，后续记录里的
+    # false 只反映那一刻的写入状态，不代表对象消失。
     finalized, uploaded = set(), set()
+    size_by_key = {}
     for record in _iter_jsonl(success_log):
         key = _ep_key(record)
         if not key:
             continue
         finalized.add(key)
+        size = record.get("file_size_bytes")
+        # 只接受正整数；None/缺失/bool/非正数都算"无体积信息"（旧记录没有该字段）。
+        if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+            size_by_key[key] = size
         if record.get("uploaded"):
             uploaded.add(key)
 
@@ -448,6 +476,22 @@ def main():
     local_only = finalized - uploaded
     if local_only:
         print(f"  仅本地未上传：{len(local_only)} 集")
+
+    # R2 总量：按集级 key 去重后累加**已上传**集的体积，等于 R2 实际占用。
+    # 窗口是整个台账而非单次运行——SUCCESS_LOG 追加式记录，首轮/自愈轮/跨运行
+    # 重试/断点续跑写进来的集都在里面，所以这就是"完整一次全量取流下载"的总和。
+    uploaded_with_size = uploaded & size_by_key.keys()
+    total_bytes = sum(size_by_key[k] for k in uploaded_with_size)
+    if uploaded_with_size:
+        print(f"  R2 总大小：{_human_bytes(total_bytes)}"
+              f"（{len(uploaded_with_size)} 集，单集均值 "
+              f"{_human_bytes(total_bytes / len(uploaded_with_size))}）")
+        # 缺体积的集单独报出，避免把"少算的量"悄悄吞掉看不出来。
+        lacking = len(uploaded) - len(uploaded_with_size)
+        if lacking:
+            print(f"  ⚠️ 另有 {lacking} 集无体积信息（早于该字段的旧记录），未计入上面的总大小")
+    elif uploaded:
+        print("  ⚠️ 已上传的集均无 file_size_bytes 字段（旧记录），无法统计 R2 总大小")
 
     _print_counter("各阶段失败记录条数", stage_fail, sum(stage_fail.values()))
 
