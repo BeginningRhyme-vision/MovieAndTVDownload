@@ -736,9 +736,9 @@ def _mp4_host_is_tripped(url):
 # 直接把整机吞吐拖到个位数 MB/s。
 #
 # 与 mp4 的 429 熔断同构，但有两点差别：
-#   - 计的是**连续**失败数：任一分片成功即清零。5xx 是"临时不可用"语义，一台健康
-#     主机跑几万个分片偶发几次 502 很正常，累计口径会把健康主机也熔断掉；
-#     而真死的主机所有请求都 5xx，没有成功来清零，几秒内就能达到阈值。
+#   - 计的是**连续**失败数：任一分片成功即清零。5xx/429 都是"临时不可用"语义，一台
+#     健康主机跑几万个分片偶发几次很正常，累计口径会把健康主机也熔断掉；
+#     而真死的主机所有请求都失败，没有成功来清零，几秒内就能达到阈值。
 #   - 触发后整集**立刻**失败（download_segments 停止补片并上抛），而不是逐片跳过：
 #     否则会得到一个缺几百片的残件，再被缺片保护判"缺片率过高"——文案里没有
 #     熔断 marker，统计上看不出是主机故障。
@@ -746,7 +746,11 @@ def _mp4_host_is_tripped(url):
 # _PERMANENT_FAILURE_MARKERS，下一轮重投主机恢复了还能救回）/ 计数仅存活于本次运行。
 # 半开恢复机制与 mp4 侧同构，共用 HOST_CIRCUIT_COOLDOWN_SEC（见上方长注释）。
 _hls_host_lock = threading.Lock()
+# host -> 连续 5xx 次数。与 429 分开计数：两者阈值不同，合用一个计数器会让
+# "19 次 429 + 1 次 502" 凑到 20 ≥ 5xx阈值8 而立即熔断，等于绕过 429 的宽松保护。
 _hls_host_5xx = {}
+# host -> 连续 429 次数。
+_hls_host_429 = {}
 # host -> 下次允许重试的 time.monotonic() 时刻。键存在即表示当前熔断中。
 _hls_host_tripped = {}
 # 同一主机连续多少次 5xx（中间无一成功）后熔断。采样阶段并发 4、正片并发 64，
@@ -755,7 +759,19 @@ _hls_host_tripped = {}
 HLS_HOST_CIRCUIT_THRESHOLD = max(
     1, int(_CFG.get("m3u8_host_circuit_threshold", 8))
 )
-_HLS_HOST_CIRCUIT_STATUS = frozenset({500, 502, 503, 504})
+# 🔴 429 用独立的、**更宽松**的阈值（2026-09-15 实测补）：
+#   peakstorm 的故障形态会从 502/503 变成**恒定 429**（server: cloudflare、
+#   retry-after: 0），而原先熔断只认 5xx，于是 18848 次分片 429 全部走
+#   SEG_RETRY_MAX=20 指数退避死磕，累计空耗 84741s 线程时间、卡住 4 集 ——
+#   正是熔断要解决的问题，只因换了个状态码就被绕过。
+#   但 429 不能沿用 5xx 的阈值 8：segment_concurrency=64 时一波并发请求撞上
+#   **瞬时**限流，很容易连续拿到 8 个 429，而熔断会让整集立即失败 —— 那是误杀。
+#   取 20：真·恒定 429 的主机一两秒内就能攒满（且中间不会有成功来清零），
+#   而瞬时限流只要有任何一个分片成功就归零，够不到这个数。
+HLS_HOST_CIRCUIT_THRESHOLD_429 = max(
+    1, int(_CFG.get("m3u8_host_circuit_threshold_429", 20))
+)
+_HLS_HOST_CIRCUIT_STATUS = frozenset({429, 500, 502, 503, 504})
 # 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS。
 _HLS_HOST_BLOCKED_MARKER = "分片主机疑似故障已熔断"
 
@@ -781,28 +797,36 @@ def _status_in_chain(exc):
 
 
 def _hls_host_record_result(url, status):
-    """记一次分片请求结果：5xx 累加连续失败数，其它（含成功）清零。
+    """记一次分片请求结果：5xx 与 429 各自累加连续失败数，其它（含成功）清零。
 
-    返回该主机此刻是否已熔断。成功（非 5xx）时**立即解除熔断**——比等冷却
-    到点更积极，且是真实证据而非猜测。
+    返回该主机此刻是否已熔断。成功（非熔断状态码）时**立即解除熔断**——比等
+    冷却到点更积极，且是真实证据而非猜测。
+    5xx 与 429 分开计数、各有阈值：429 的瞬时限流远比 5xx 常见，混算会误杀。
     """
     host = _host_of(url)
     if not host:
         return False
     newly_tripped = False
     with _hls_host_lock:
-        if status in _HLS_HOST_CIRCUIT_STATUS:
-            _hls_host_5xx[host] = _hls_host_5xx.get(host, 0) + 1
-            count = _hls_host_5xx[host]
-            if count >= HLS_HOST_CIRCUIT_THRESHOLD:
+        if status == 429:
+            counter, threshold = _hls_host_429, HLS_HOST_CIRCUIT_THRESHOLD_429
+        elif status in _HLS_HOST_CIRCUIT_STATUS:
+            counter, threshold = _hls_host_5xx, HLS_HOST_CIRCUIT_THRESHOLD
+        else:
+            counter = None
+        if counter is not None:
+            counter[host] = counter.get(host, 0) + 1
+            count = counter[host]
+            if count >= threshold:
                 newly_tripped = host not in _hls_host_tripped
                 # 首次熔断与复位后再失败都把下次重试时刻往后推。
                 _hls_host_tripped[host] = (
                     time.monotonic() + HOST_CIRCUIT_COOLDOWN_SEC
                 )
         else:
+            # 拿到正常响应说明主机活着：两个计数器都清零、并立即解除熔断。
             _hls_host_5xx[host] = 0
-            # 拿到非 5xx 响应说明主机活着，无须再等冷却。
+            _hls_host_429[host] = 0
             _hls_host_tripped.pop(host, None)
         tripped = host in _hls_host_tripped
     if newly_tripped:
@@ -826,9 +850,10 @@ def _hls_host_is_tripped(url):
             return False
         if time.monotonic() < next_retry:
             return True
-        # 冷却到点：整个复位，让正常的 5xx 检测重新判断（还坏就再攒够阈值重熔断）。
+        # 冷却到点：整个复位，让正常的失败检测重新判断（还坏就再攒够阈值重熔断）。
         del _hls_host_tripped[host]
         _hls_host_5xx[host] = 0
+        _hls_host_429[host] = 0
     print(f"  [主机半开] {host} 冷却到点，解除熔断重新尝试 m3u8 节点", flush=True)
     return False
 
@@ -2971,8 +2996,8 @@ def download_single_segment(url, index, retry_max, delay, headers=None):
         except Exception as exc:
             last_error = exc
             message = str(exc)
-            # 5xx 计入主机连续失败数；达到阈值当场熔断并上抛。
-            # 非 5xx 的失败（超时/连接错/4xx）不清零也不累加：它们说明不了
+            # 5xx/429 计入主机连续失败数；达到阈值当场熔断并上抛。
+            # 其它失败（超时/连接错/4xx）不清零也不累加：它们说明不了
             # 主机是否活着，交给原有退避逻辑处理。
             status = _status_in_chain(exc)
             if status in _HLS_HOST_CIRCUIT_STATUS and _hls_host_record_result(

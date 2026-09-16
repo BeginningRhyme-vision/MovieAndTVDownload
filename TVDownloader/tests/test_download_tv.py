@@ -1992,8 +1992,10 @@ def test_mp4_circuit_retrips_if_still_broken(circuit_env, monkeypatch):
 @pytest.fixture
 def hls_circuit_env(monkeypatch):
     monkeypatch.setattr(d, "_hls_host_5xx", {})
+    monkeypatch.setattr(d, "_hls_host_429", {})
     monkeypatch.setattr(d, "_hls_host_tripped", {})
     monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD", 8)
+    monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD_429", 20)
     monkeypatch.setattr(d, "HOST_CIRCUIT_COOLDOWN_SEC", 15)
 
 
@@ -2013,7 +2015,7 @@ def test_hls_circuit_half_opens_after_cooldown(hls_circuit_env, monkeypatch):
 
 
 def test_hls_circuit_clears_immediately_on_success(hls_circuit_env):
-    """一次非 5xx 响应即刻解除熔断——真实证据比等冷却更可靠。"""
+    """一次正常响应即刻解除熔断——真实证据比等冷却更可靠。"""
     url = "https://moon.peakstorm.top/x/seg.ts"
     for _ in range(8):
         d._hls_host_record_result(url, 503)
@@ -2032,6 +2034,59 @@ def test_hls_circuit_other_host_unaffected_by_cooldown(hls_circuit_env):
         d._hls_host_record_result(bad, 502)
     assert d._hls_host_is_tripped(bad) is True
     assert d._hls_host_is_tripped(good) is False
+
+
+def test_hls_circuit_429_uses_looser_threshold(hls_circuit_env):
+    """🔒 分片 429 也要能熔断，但阈值必须比 5xx 宽松。
+
+    实测：peakstorm 故障形态会从 502 变成恒定 429，原先熔断只认 5xx，
+    18848 次分片 429 全走 20 次指数退避死磕，空耗 84741s 线程时间。
+    但 segment_concurrency=64 时瞬时限流很容易连续 8 个 429，沿用 5xx
+    阈值会误杀整集，故 429 用独立的 20。
+    """
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    # 到 5xx 阈值（8）时 429 还不该熔断
+    for _ in range(8):
+        assert d._hls_host_record_result(url, 429) is False
+    assert d._hls_host_is_tripped(url) is False
+    # 攒满 429 专用阈值（20）才熔断
+    for _ in range(11):
+        d._hls_host_record_result(url, 429)
+    assert d._hls_host_record_result(url, 429) is True
+    assert d._hls_host_is_tripped(url) is True
+
+
+def test_hls_circuit_429_cleared_by_any_success(hls_circuit_env):
+    """瞬时限流不该被误杀：中间只要有一片成功，连续计数就归零。"""
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(19):
+        d._hls_host_record_result(url, 429)
+    assert d._hls_host_is_tripped(url) is False   # 差一次到阈值
+    d._hls_host_record_result(url, 200)           # 一次成功即清零
+    assert d._hls_host_429[d._host_of(url)] == 0
+    for _ in range(19):
+        d._hls_host_record_result(url, 429)
+    assert d._hls_host_is_tripped(url) is False   # 又得从头攒
+
+
+def test_hls_circuit_429_and_5xx_counted_separately(hls_circuit_env):
+    """🔒 429 与 5xx 必须分开计数，否则 429 的宽松阈值会被绕过。
+
+    合用一个计数器时「19 次 429 + 1 次 502」会凑到 20 ≥ 5xx 阈值 8 而立即
+    熔断，实际只出现过 1 次 5xx —— 等于把 429 的误杀保护废掉。
+    """
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(19):
+        d._hls_host_record_result(url, 429)       # 429 计数 19，未达 20
+    # 来一次 502：5xx 自己的计数才 1，远未达 8，不该熔断
+    assert d._hls_host_record_result(url, 502) is False
+    assert d._hls_host_is_tripped(url) is False
+    assert d._hls_host_429[d._host_of(url)] == 19
+    assert d._hls_host_5xx[d._host_of(url)] == 1
+    # 5xx 独立攒到 8 才熔断
+    for _ in range(6):
+        d._hls_host_record_result(url, 502)
+    assert d._hls_host_record_result(url, 502) is True
 
 
 # ------------------------------------------------ 失败侧逐节点归因
