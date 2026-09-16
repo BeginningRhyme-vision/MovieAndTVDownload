@@ -129,12 +129,21 @@ tv_ids_to_links:
 
   # 解密服务 API 根地址（负责 enc-vidup / dec-vidup / enc-vidfast / dec-vidfast / enc-vidlink 加解密）
   api: "https://enc-dec.app/api"
-  # 取流源顺序：同一次尝试内按此顺序逐家取流，首家命中即返回，不再打后面的源。
+  # 取流源顺序：同一次尝试内按此顺序逐家取流，把**各家给出的 url 全部汇总**
+  # （按 url 去重、保持本列表顺序），有任一家给出 url 即 ok——不是"首家命中即返回"。
   # 某家真无源或瞬时错误都继续试下一家；全部跑完仍无 url 时，只要有任一家是瞬时错误就重试，
   # 全部真无源才算一次“疑似无源”（再走 dead_confirm 换 IP 复探）。可用：vidup / vidlink / vidfast。
   # vidup、vidfast 出 m3u8；vidlink 出带时效签名的 mp4 直链（带 quality/size，下载头 okhttp）。
   # 命令行 --providers vidlink,vidfast 可临时覆盖（如 --recheck-dead 只用新源复扫）。
-  providers: [vidup, vidlink, vidfast]
+  #
+  # 🔑 本列表顺序 = 下载侧节点尝试顺序（download_tv 逐个试，首个"达标"即收，不比最优）。
+  # 2026-09-16 按 §0.43 实测数据定为 vidup → vidfast → vidlink，依据是成片码率中位：
+  #   vidup 5941 kbps ≫ vidfast 3018 ≫ vidlink 2210
+  # vidup 画质最好放第一；vidfast 次之且同为 m3u8（采样几 MB 即可淘汰，试错成本低）；
+  # vidlink 垫底——它的价值是**兜底覆盖**（独占 798/1278 集）而非画质，
+  # 且其失败中 99.1% 是"码率未达门槛"，排前面只会增加无效试错。
+  # ⚠️ 别按覆盖率排序：vidlink 覆盖 94% 但画质最差，排前面会系统性拉低成片质量。
+  providers: [vidup, vidfast, vidlink]
   # 并发线程数：同时解析多少集。配合住宅代理分散 IP。
   # 无源404不重试，任务为纯IO等待，可拉高并发；电影版 50 实测稳定。
   # 2026-09 全量实跑：50 并发时老剧段（判死需 2 轮 × 5 server）仅 ~72 集/分钟，瓶颈在代理 RTT，

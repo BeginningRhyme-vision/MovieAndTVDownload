@@ -5,9 +5,11 @@ tv_ids_to_links.py —— 由剧集 tmdb_id 展开季集结构，并逐集从多
     - 处理单位从“一部电影”变为“一集”：(tmdb_id, season, episode) 三元组。
     - 取流前先调 TMDB /tv/{id}（含 append_to_response=season/N）拿准确的季集结构，
       结果缓存到 seasons_cache.jsonl，多轮/续跑不重复调 API。
-    - 多源：按 config.providers（默认 vidup → vidlink → vidfast）顺序逐家取流，首家命中即返回；
+    - 多源：按 config.providers（默认 vidup → vidfast → vidlink）顺序逐家取流，
+      **把各家给出的 url 全部汇总**（按 url 去重、保持该顺序），有任一家出 url 即 ok；
       全部真无源才判 dead。vidup.to / vidfast.vc 同构（页面 → enc → servers → dec → stream，出 m3u8），
       vidlink.pro 为 enc-vidlink(tmdb id) → /api/b/tv 直接返 JSON（出带时效签名的 mp4 直链）。
+      顺序即下载侧节点尝试顺序，按成片码率中位定档（AGENTS.md §0.43）。
     - fail.txt 一行一集：tmdb_id\\tseason\\tepisode；剧级失效（TMDB 查不到）记为 tmdb_id\\t-\\t-
     - results.jsonl 一行一集：{urls, tmdbId, season, episode, title, + tv_series.jsonl 静态元数据}
       urls 每项为 {url, provider, type("m3u8"|"mp4"), headers, quality, size}；
@@ -95,7 +97,10 @@ VIDLINK_API_HEADERS = {"User-Agent": UA, "Origin": "https://vidlink.pro", "Refer
 # 只有 okhttp UA + 不带 Referer 才 206。随 url 一起写进 results.jsonl，供 download_tv.py 直接使用。
 VIDLINK_DOWNLOAD_HEADERS = {"User-Agent": "okhttp/4.9.3"}
 
-DEFAULT_PROVIDERS = ["vidup", "vidlink", "vidfast"]
+# 顺序即下载侧节点尝试顺序，按成片码率中位定档（§0.43 实测）：
+# vidup 5941 kbps ≫ vidfast 3018 ≫ vidlink 2210。vidlink 覆盖最广但画质最差，
+# 作兜底放末位。改动前请先读 config.yaml 里 providers 的注释。
+DEFAULT_PROVIDERS = ["vidup", "vidfast", "vidlink"]
 
 API = _CFG.get("api", "https://enc-dec.app/api")
 MAX_RETRIES = _CFG.get("max_retries", 3)
