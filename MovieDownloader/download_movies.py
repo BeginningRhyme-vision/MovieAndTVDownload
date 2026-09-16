@@ -17,6 +17,7 @@ import threading
 import time
 from concurrent.futures import (
     FIRST_COMPLETED,
+    CancelledError,
     ThreadPoolExecutor,
     as_completed,
     wait,
@@ -613,13 +614,29 @@ def record_block_status(status):
 #   - **不判整片死**：熔断文案不进 _PERMANENT_FAILURE_MARKERS，整片仍可进
 #     下一轮重投——万一主机恢复了还能救回来。
 #   - 计数仅存活于**本次运行**（模块级字典，进程退出即清空），不落盘。
+#
+# 🔁 半开恢复（2026-09-16 从 TV 侧移植，TV §0.39）：熔断**不是**本次运行内永久
+#   生效。TV 侧实测踩坑——sun.peakstorm.top 被熔断后 1 小时已恢复（独立探测
+#   HTTP 200），但本次运行再也不碰它，白白放弃 226 集。movie 侧风险更大：
+#   一次实跑里 45% 的 vidlink url 指向 bcdnxw，早期误触发就等于丢掉近一半片源。
+#   故改为：熔断记一个"下次可重试时刻"，到点后**第一个**问到该主机的线程把熔断
+#   整个复位（计数清零、解除跳过），让正常的失败检测重新判断——主机真没好就再
+#   攒够阈值重新熔断（只需 3 次 429，几秒内完成），代价极小；主机好了立刻全量恢复。
+#   不单独做"探针请求 + 半开态"，因为复位本身就是最廉价的探针，且无状态泄漏风险。
 _mp4_host_lock = threading.Lock()
 _mp4_host_429 = {}
-_mp4_host_tripped = set()
+# host -> 下次允许重试的 time.monotonic() 时刻。键存在即表示当前熔断中。
+_mp4_host_tripped = {}
 # 单台主机累计多少次 429 后熔断。3 次足以区分"偶发限流"与"整机故障"：
 # 真限流退避后会恢复，整机故障则次次复现。
 MP4_HOST_CIRCUIT_THRESHOLD = max(
     1, int(_CFG.get("mp4_host_circuit_threshold", 3))
+)
+# 熔断后多久允许复位重试（秒），mp4 与 HLS 分片层共用。默认 15 秒：源站故障多是
+# 分钟级抖动，间隔太长（如 300s）会在一次运行内白扔大量片；而复位的代价只有
+# 几次必然失败的请求，远小于漏下的影片。
+HOST_CIRCUIT_COOLDOWN_SEC = max(
+    1.0, float(_CFG.get("host_circuit_cooldown_sec", 15))
 )
 # 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS（见上）。
 _MP4_HOST_BLOCKED_MARKER = "直链主机疑似故障已熔断"
@@ -634,32 +651,183 @@ def _host_of(url):
 
 
 def _mp4_host_record_429(url):
-    """记一次 mp4 直链 429；达到阈值则熔断该主机（本次运行内）。"""
+    """记一次 mp4 直链 429；达到阈值则熔断该主机（到点可半开复位）。"""
     host = _host_of(url)
     if not host:
         return
     with _mp4_host_lock:
         _mp4_host_429[host] = _mp4_host_429.get(host, 0) + 1
         count = _mp4_host_429[host]
-        newly_tripped = (
-            count >= MP4_HOST_CIRCUIT_THRESHOLD and host not in _mp4_host_tripped
-        )
-        if newly_tripped:
-            _mp4_host_tripped.add(host)
+        tripped_now = count >= MP4_HOST_CIRCUIT_THRESHOLD
+        newly_tripped = tripped_now and host not in _mp4_host_tripped
+        if tripped_now:
+            # 无论首次熔断还是复位后再次失败，都把下次重试时刻往后推。
+            _mp4_host_tripped[host] = (
+                time.monotonic() + HOST_CIRCUIT_COOLDOWN_SEC
+            )
     if newly_tripped:
         print(
-            f"  [主机熔断] {host} 累计 {count} 次 429，本次运行内跳过该主机的"
-            f"全部 mp4 直链节点（其余节点不受影响）",
+            f"  [主机熔断] {host} 累计 {count} 次 429，暂时跳过该主机的全部 mp4"
+            f"直链节点（其余节点不受影响），"
+            f"{HOST_CIRCUIT_COOLDOWN_SEC:.0f}s 后自动重试",
             flush=True,
         )
 
 
 def _mp4_host_is_tripped(url):
+    """该主机当前是否应跳过；到达重试时刻则就地复位熔断并放行。"""
     host = _host_of(url)
     if not host:
         return False
     with _mp4_host_lock:
-        return host in _mp4_host_tripped
+        next_retry = _mp4_host_tripped.get(host)
+        if next_retry is None:
+            return False
+        if time.monotonic() < next_retry:
+            return True
+        # 冷却到点：整个复位，让正常的 429 检测重新判断（还坏就再攒 3 次重新熔断）。
+        del _mp4_host_tripped[host]
+        _mp4_host_429[host] = 0
+    print(f"  [主机半开] {host} 冷却到点，解除熔断重新尝试直链节点", flush=True)
+    return False
+
+
+# ---- m3u8 分片的「主机级 5xx/429 熔断」（2026-09-16 从 TV 侧移植，TV §0.39/§0.40）----
+# 背景（TV 侧 2026-09-15 实测）：vidup/vidfast 的 moon/sun.peakstorm.top 整机故障——
+# 换 IP、冷却后**恒定** 502/500/429（Cloudflare + openresty 回源失败），恢复是小时级。
+# movie 侧用的是同一批源（vidup/videasy 的 m3u8 同样落在 peakstorm），故同样暴露。
+# 分片层没有熔断时，每个分片都按 SEG_RETRY_MAX=20 指数退避（累计 ≈ 10 分钟）死磕，
+# 一部片 SEGMENT_CONCURRENCY 个槽位全部空转在注定失败的请求上。
+# TV 侧实测一轮里 18848 次分片 429 累计空耗 84741s 线程时间、卡死 4 集。
+#
+# 与 mp4 的 429 熔断同构，但有两点差别：
+#   - 计的是**连续**失败数：任一分片成功即清零。5xx/429 都是"临时不可用"语义，一台
+#     健康主机跑几万个分片偶发几次很正常，累计口径会把健康主机也熔断掉；
+#     而真死的主机所有请求都失败，没有成功来清零，几秒内就能达到阈值。
+#   - 触发后整片**立刻**失败（download_segments 停止补片并上抛），而不是逐片跳过：
+#     否则会得到一个缺几百片的残件，再被缺片保护判"缺片率过高"——文案里没有
+#     熔断 marker，统计上看不出是主机故障。
+# 其余三条边界与 mp4 完全一致：只跳过同主机节点 / 不判整片死（marker 不进
+# _PERMANENT_FAILURE_MARKERS，下一轮重投主机恢复了还能救回）/ 计数仅存活于本次运行。
+# 半开恢复机制与 mp4 侧同构，共用 HOST_CIRCUIT_COOLDOWN_SEC。
+_hls_host_lock = threading.Lock()
+# host -> 连续 5xx 次数。与 429 分开计数：两者阈值不同，合用一个计数器会让
+# "19 次 429 + 1 次 502" 凑到 20 ≥ 5xx阈值8 而立即熔断，等于绕过 429 的宽松保护。
+_hls_host_5xx = {}
+# host -> 连续 429 次数。
+_hls_host_429 = {}
+# host -> 下次允许重试的 time.monotonic() 时刻。键存在即表示当前熔断中。
+_hls_host_tripped = {}
+# 同一主机连续多少次 5xx（中间无一成功）后熔断。恒定 502 的主机在第一波请求内
+# 即达阈值；8 也足够覆盖几秒级的真抖动（抖动期间只要有一个分片成功就清零）。
+# ⚠️ 阈值语义是"连续失败、成功即清零"，与并发数无关，故 movie 侧
+# （SEGMENT_CONCURRENCY 比 TV 小）沿用同一默认值是安全的。
+HLS_HOST_CIRCUIT_THRESHOLD = max(
+    1, int(_CFG.get("m3u8_host_circuit_threshold", 8))
+)
+# 🔴 429 用独立的、**更宽松**的阈值（TV 侧 2026-09-15 实测）：
+#   peakstorm 的故障形态会从 502/503 变成**恒定 429**（server: cloudflare、
+#   retry-after: 0），若熔断只认 5xx，分片 429 就会全部走 SEG_RETRY_MAX 指数
+#   退避死磕 —— 正是熔断要解决的问题，只因换了个状态码就被绕过。
+#   但 429 不能沿用 5xx 的阈值 8：一波并发请求撞上**瞬时**限流，很容易连续拿到
+#   8 个 429，而熔断会让整片立即失败 —— 那是误杀。
+#   取 20：真·恒定 429 的主机一两秒内就能攒满（且中间不会有成功来清零），
+#   而瞬时限流只要有任何一个分片成功就归零，够不到这个数。
+HLS_HOST_CIRCUIT_THRESHOLD_429 = max(
+    1, int(_CFG.get("m3u8_host_circuit_threshold_429", 20))
+)
+_HLS_HOST_CIRCUIT_STATUS = frozenset({429, 500, 502, 503, 504})
+# 熔断文案。⚠️ 有意**不**加入 _PERMANENT_FAILURE_MARKERS。
+_HLS_HOST_BLOCKED_MARKER = "分片主机疑似故障已熔断"
+
+
+class HostCircuitOpenError(RuntimeError):
+    """分片主机已熔断：整个节点应立即放弃并换下一个，不再逐流/逐片尝试。"""
+
+
+def _status_in_chain(exc):
+    """沿 __cause__ 链取 HTTP 状态码。
+
+    request_with_retry 会把 HTTPError 包成 RuntimeError 再抛，状态码只在
+    __cause__ 上；_status_of 只看当前异常，这里补上沿链查找。
+    """
+    seen = 0
+    while exc is not None and seen < 5:
+        status = _status_of(exc)
+        if status is not None:
+            return status
+        exc = exc.__cause__
+        seen += 1
+    return None
+
+
+def _hls_host_record_result(url, status):
+    """记一次分片请求结果：5xx 与 429 各自累加连续失败数，其它（含成功）清零。
+
+    返回该主机此刻是否已熔断。成功（非熔断状态码）时**立即解除熔断**——比等
+    冷却到点更积极，且是真实证据而非猜测。
+    5xx 与 429 分开计数、各有阈值：429 的瞬时限流远比 5xx 常见，混算会误杀。
+    """
+    host = _host_of(url)
+    if not host:
+        return False
+    newly_tripped = False
+    with _hls_host_lock:
+        if status == 429:
+            counter, threshold = _hls_host_429, HLS_HOST_CIRCUIT_THRESHOLD_429
+        elif status in _HLS_HOST_CIRCUIT_STATUS:
+            counter, threshold = _hls_host_5xx, HLS_HOST_CIRCUIT_THRESHOLD
+        else:
+            counter = None
+        if counter is not None:
+            counter[host] = counter.get(host, 0) + 1
+            count = counter[host]
+            if count >= threshold:
+                newly_tripped = host not in _hls_host_tripped
+                # 首次熔断与复位后再失败都把下次重试时刻往后推。
+                _hls_host_tripped[host] = (
+                    time.monotonic() + HOST_CIRCUIT_COOLDOWN_SEC
+                )
+        else:
+            # 拿到正常响应说明主机活着：两个计数器都清零、并立即解除熔断。
+            _hls_host_5xx[host] = 0
+            _hls_host_429[host] = 0
+            _hls_host_tripped.pop(host, None)
+        tripped = host in _hls_host_tripped
+    if newly_tripped:
+        print(
+            f"  [主机熔断] {host} 连续 {count} 次 HTTP {status}，暂时跳过该主机的"
+            f"全部 m3u8 节点（其余节点不受影响），"
+            f"{HOST_CIRCUIT_COOLDOWN_SEC:.0f}s 后自动重试",
+            flush=True,
+        )
+    return tripped
+
+
+def _hls_host_is_tripped(url):
+    """该主机当前是否应跳过；到达重试时刻则就地复位熔断并放行。"""
+    host = _host_of(url)
+    if not host:
+        return False
+    with _hls_host_lock:
+        next_retry = _hls_host_tripped.get(host)
+        if next_retry is None:
+            return False
+        if time.monotonic() < next_retry:
+            return True
+        # 冷却到点：整个复位，让正常的失败检测重新判断（还坏就再攒够阈值重熔断）。
+        del _hls_host_tripped[host]
+        _hls_host_5xx[host] = 0
+        _hls_host_429[host] = 0
+    print(f"  [主机半开] {host} 冷却到点，解除熔断重新尝试 m3u8 节点", flush=True)
+    return False
+
+
+def _raise_if_hls_host_tripped(url, what):
+    if _hls_host_is_tripped(url):
+        raise HostCircuitOpenError(
+            f"{_HLS_HOST_BLOCKED_MARKER}（{_host_of(url)}），跳过{what}: {url}"
+        )
 
 
 # 确定性 HTTP 状态码：同一条 url 重试必然复现同样结果，重试纯属浪费时间与槽位。
@@ -1066,6 +1234,13 @@ _REJECT_REASON_RULES = (
     ("直链块不可用(404/416)", ("直链块不可用",)),
     ("直链不支持Range", ("直链不支持 Range", "服务器未按 Range 响应")),
     ("直链总长异常", ("直链总长异常", "直链下载长度不符")),
+    # 主机级熔断：与下面的"直链块重试耗尽"分开，便于跑完后直接看出
+    # "有多少片是被某台坏 CDN 主机拖累的"（该数偏高说明要盯 vidlink 的 CDN）。
+    ("直链主机熔断(429)", (_MP4_HOST_BLOCKED_MARKER,)),
+    # m3u8 分片主机 5xx/429 熔断：与"源站5xx"分开单列，便于看出"有多少片是被
+    # peakstorm 之类整机故障的分片主机拖累的"。⚠️ 须排在"源站5xx"之前：熔断
+    # 文案里带 HTTP 502 字样，会被通用 5xx 类目抢先命中。
+    ("分片主机熔断(5xx)", (_HLS_HOST_BLOCKED_MARKER,)),
     ("直链块重试耗尽", ("直链块",)),
     ("直链探测失败", ("直链探测失败",)),
     ("源站5xx", ("HTTP Error 5", "500 Server Error", "502", "503", "504")),
@@ -2815,6 +2990,9 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
         if interrupted.is_set() or (abort_event is not None
                                     and abort_event.is_set()):
             raise RuntimeError(f"分片 {index + 1} 已取消")
+        # 主机已熔断（本线程或别的线程刚触发）：不再发请求、不再退避，
+        # 直接上抛让 download_segments 整片止损。
+        _raise_if_hls_host_tripped(url, f"分片 {index + 1}")
         try:
             # 外层已经负责精确重试次数，因此这里关闭额外应用层重试。
             content = request_with_retry(
@@ -2822,10 +3000,24 @@ def download_single_segment(url, index, retry_max, delay, headers=None,
                 headers=headers,
             )
             validate_segment_content(content, url)
+            _hls_host_record_result(url, 200)
             return content
+        except HostCircuitOpenError:
+            raise
         except Exception as exc:
             last_error = exc
             message = str(exc)
+            # 5xx/429 计入主机连续失败数；达到阈值当场熔断并上抛。
+            # 其它失败（超时/连接错/4xx）不清零也不累加：它们说明不了
+            # 主机是否活着，交给原有退避逻辑处理。
+            status = _status_in_chain(exc)
+            if status in _HLS_HOST_CIRCUIT_STATUS and _hls_host_record_result(
+                url, status
+            ):
+                raise HostCircuitOpenError(
+                    f"{_HLS_HOST_BLOCKED_MARKER}（{_host_of(url)}，HTTP {status}），"
+                    f"分片 {index + 1} 不再重试: {url}"
+                ) from exc
             if (
                 attempt == retry_max
                 or is_permanent_http_failure(exc)
@@ -2954,6 +3146,9 @@ def download_segments(
 
             refill()
 
+            # 主机熔断：整片立即止损。只记第一个熔断异常，收尾后统一上抛。
+            circuit_exc = None
+
             while future_to_index:
                 done, _ = wait(
                     future_to_index.keys(), return_when=FIRST_COMPLETED
@@ -2962,6 +3157,16 @@ def download_segments(
                     index = future_to_index.pop(future)
                     try:
                         done_buffer[index] = future.result()
+                    except HostCircuitOpenError as exc:
+                        # 主机已熔断：不再补片，撤销尚未开跑的分片。在途分片会在
+                        # 各自下一次循环开头命中熔断检查、很快以同样异常收尾。
+                        if circuit_exc is None:
+                            circuit_exc = exc
+                            print(f"    {exc}", flush=True)
+                        for pending in list(future_to_index):
+                            pending.cancel()
+                    except CancelledError:
+                        pass
                     except Exception as exc:
                         done_buffer[index] = None
                         failed_indices.append(index)
@@ -2982,7 +3187,11 @@ def download_segments(
                     write_cursor += 1
 
                 # 落盘后再补满窗口，保持 concurrency 个分片始终在途。
-                refill()
+                if circuit_exc is None:
+                    refill()
+
+    if circuit_exc is not None:
+        raise circuit_exc
 
     return total_bytes, sorted(failed_indices), init_bytes
 
@@ -3750,6 +3959,9 @@ def process_one_entry(entry, processed_ids):
             )
             return conversion_job
 
+        # 该主机的 m3u8 节点已熔断：连 playlist 都不必请求，直接换下一个节点。
+        _raise_if_hls_host_tripped(url, "该节点")
+
         variants = parse_master_playlist(
             url, retries=None if is_last_node else PLAYLIST_RETRY_FALLBACK,
             headers=node_headers,
@@ -3851,6 +4063,9 @@ def process_one_entry(entry, processed_ids):
                 segment_urls, durations, init_url = parse_media_playlist(
                     playlist_url, headers=node_headers
                 )
+                # 分片主机已熔断：整条流的分片都在同一台主机上，不必开采样。
+                if segment_urls:
+                    _raise_if_hls_host_tripped(segment_urls[0], "该节点的分片")
                 sample_count = min(SAMPLE_COUNT, len(segment_urls))
                 # 从影片“正中间”连续取 sample_count 段测码率：片头常是 logo/黑场/
                 # 字幕卡等低动态画面、码率系统性偏低，会误杀压线的合格片；中间为高动态
@@ -3960,6 +4175,11 @@ def process_one_entry(entry, processed_ids):
                 # 加密/BYTERANGE/MAP 等结构是整片级属性（同一片各清晰度同构），
                 # 重下必然同样失败 → 直接向外抛（带确定性 marker），不再试其余流、
                 # 不落入下方"可重试"汇总，避免永久不支持的结构被白重试多轮。
+                remove_file(sample_path)
+                raise
+            except HostCircuitOpenError:
+                # 分片主机已熔断：同一 master 下各清晰度流的分片都在同一台主机上，
+                # 再试其余流纯属空耗 → 直接向外抛，换下一个节点。
                 remove_file(sample_path)
                 raise
             except QualityRejectedError as exc:

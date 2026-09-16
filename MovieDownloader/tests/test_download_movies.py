@@ -3579,9 +3579,15 @@ def _clear_mp4_circuit():
     """熔断状态是模块级的，用例间必须隔离，否则相互污染。"""
     d._mp4_host_429.clear()
     d._mp4_host_tripped.clear()
+    d._hls_host_5xx.clear()
+    d._hls_host_429.clear()
+    d._hls_host_tripped.clear()
     yield
     d._mp4_host_429.clear()
     d._mp4_host_tripped.clear()
+    d._hls_host_5xx.clear()
+    d._hls_host_429.clear()
+    d._hls_host_tripped.clear()
 
 
 def test_host_of_parses_hostname():
@@ -3691,6 +3697,210 @@ def test_untripped_host_probe_still_requests(monkeypatch):
     total, range_ok = d._mp4_probe_total_size("https://good.cdn.com/a.mp4", {}, None)
     assert (total, range_ok) == (12345, True)
     assert seen, "正常主机必须真的发请求"
+
+
+# ------------------------------------------------- 熔断半开恢复（TV 侧移植）
+# 背景：熔断原本"本次运行内永久生效"。TV 侧实测 sun.peakstorm.top 熔断后 1 小时
+# 已恢复（独立探测 HTTP 200），但当次运行再也不碰它，白丢 226 集。
+# movie 侧风险更大：一次实跑 45% 的 vidlink url 指向 bcdnxw。
+
+def test_mp4_circuit_half_opens_after_cooldown(monkeypatch):
+    """🔒 冷却到点后熔断必须自动复位，否则已恢复的主机被白白放弃整轮。"""
+    monkeypatch.setattr(d, "MP4_HOST_CIRCUIT_THRESHOLD", 3)
+    monkeypatch.setattr(d, "HOST_CIRCUIT_COOLDOWN_SEC", 15)
+    url = "https://flaky.cdn.com/a.mp4"
+    for _ in range(3):
+        d._mp4_host_record_429(url)
+    assert d._mp4_host_is_tripped(url) is True
+
+    # base 先取值，避免 patch 后的 lambda 调到自己造成无限递归。
+    base = time.monotonic()
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 14)
+    assert d._mp4_host_is_tripped(url) is True, "冷却未到不得放行"
+
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 16)
+    assert d._mp4_host_is_tripped(url) is False, "冷却到点必须复位"
+    assert d._mp4_host_429[d._host_of(url)] == 0, "复位须清零计数"
+    assert d._host_of(url) not in d._mp4_host_tripped
+
+
+def test_mp4_circuit_retrips_if_still_broken(monkeypatch):
+    """半开后主机仍坏：重新攒满阈值就再次熔断（不会无限放行）。"""
+    monkeypatch.setattr(d, "MP4_HOST_CIRCUIT_THRESHOLD", 3)
+    monkeypatch.setattr(d, "HOST_CIRCUIT_COOLDOWN_SEC", 15)
+    url = "https://stillbad.cdn.com/a.mp4"
+    for _ in range(3):
+        d._mp4_host_record_429(url)
+    base = time.monotonic()
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 100)
+    assert d._mp4_host_is_tripped(url) is False      # 复位放行
+    for _ in range(3):
+        d._mp4_host_record_429(url)
+    assert d._mp4_host_is_tripped(url) is True       # 再次熔断
+
+
+# ------------------------------------------------- HLS 分片主机级熔断（TV 侧移植）
+
+@pytest.fixture
+def hls_circuit_env(monkeypatch):
+    monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD", 8)
+    monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD_429", 20)
+    monkeypatch.setattr(d, "HOST_CIRCUIT_COOLDOWN_SEC", 15)
+
+
+def test_hls_circuit_trips_on_consecutive_5xx(hls_circuit_env):
+    """恒定 5xx 的分片主机达阈值即熔断，未达阈值不得熔断。"""
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(7):
+        assert d._hls_host_record_result(url, 502) is False
+    assert d._hls_host_is_tripped(url) is False
+    assert d._hls_host_record_result(url, 502) is True
+    assert d._hls_host_is_tripped(url) is True
+
+
+def test_hls_circuit_clears_immediately_on_success(hls_circuit_env):
+    """一次正常响应即刻解除熔断——真实证据比等冷却更可靠。"""
+    url = "https://moon.peakstorm.top/x/seg.ts"
+    for _ in range(8):
+        d._hls_host_record_result(url, 503)
+    assert d._hls_host_is_tripped(url) is True
+    assert d._hls_host_record_result(url, 200) is False
+    assert d._hls_host_is_tripped(url) is False
+    assert d._host_of(url) not in d._hls_host_tripped
+
+
+def test_hls_circuit_half_opens_after_cooldown(hls_circuit_env, monkeypatch):
+    """🔒 HLS 侧同样要半开：peakstorm 恢复后必须能重新用。"""
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(8):
+        d._hls_host_record_result(url, 502)
+    assert d._hls_host_is_tripped(url) is True
+
+    base = time.monotonic()
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 14)
+    assert d._hls_host_is_tripped(url) is True
+    monkeypatch.setattr(d.time, "monotonic", lambda: base + 16)
+    assert d._hls_host_is_tripped(url) is False
+    assert d._hls_host_5xx[d._host_of(url)] == 0
+
+
+def test_hls_circuit_is_per_host(hls_circuit_env):
+    """🔒 边界：熔断只作用于同一主机，其余节点照常。"""
+    bad = "https://sun.peakstorm.top/x/seg.ts"
+    good = "https://moon.peakstorm.top/x/seg.ts"
+    for _ in range(8):
+        d._hls_host_record_result(bad, 502)
+    assert d._hls_host_is_tripped(bad) is True
+    assert d._hls_host_is_tripped(good) is False
+
+
+def test_hls_circuit_429_uses_looser_threshold(hls_circuit_env):
+    """🔒 分片 429 也要能熔断，但阈值必须比 5xx 宽松。
+
+    一波并发撞上瞬时限流很容易连续拿到 8 个 429，沿用 5xx 阈值会误杀整片。
+    """
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(8):
+        assert d._hls_host_record_result(url, 429) is False
+    assert d._hls_host_is_tripped(url) is False, "429 不得沿用 5xx 的阈值"
+    for _ in range(11):
+        d._hls_host_record_result(url, 429)
+    assert d._hls_host_record_result(url, 429) is True
+    assert d._hls_host_is_tripped(url) is True
+
+
+def test_hls_circuit_429_cleared_by_any_success(hls_circuit_env):
+    """瞬时限流不该被误杀：中间只要有一片成功，连续计数就归零。"""
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(19):
+        d._hls_host_record_result(url, 429)
+    assert d._hls_host_is_tripped(url) is False   # 差一次到阈值
+    d._hls_host_record_result(url, 200)           # 一次成功即清零
+    assert d._hls_host_429[d._host_of(url)] == 0
+    for _ in range(19):
+        d._hls_host_record_result(url, 429)
+    assert d._hls_host_is_tripped(url) is False   # 又得从头攒
+
+
+def test_hls_circuit_429_and_5xx_counted_separately(hls_circuit_env):
+    """🔒 429 与 5xx 必须分开计数，否则 429 的宽松阈值会被绕过。
+
+    合用一个计数器时「19 次 429 + 1 次 502」会凑到 20 ≥ 5xx 阈值 8 而立即
+    熔断，实际只出现过 1 次 5xx —— 等于把 429 的误杀保护废掉。
+    """
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(19):
+        d._hls_host_record_result(url, 429)
+    assert d._hls_host_record_result(url, 502) is False
+    assert d._hls_host_is_tripped(url) is False
+    assert d._hls_host_429[d._host_of(url)] == 19
+    assert d._hls_host_5xx[d._host_of(url)] == 1
+    for _ in range(6):
+        d._hls_host_record_result(url, 502)
+    assert d._hls_host_record_result(url, 502) is True
+
+
+def test_hls_circuit_marker_is_not_a_permanent_failure():
+    """🔴 红线：分片熔断文案绝不能进整片判死表。
+
+    主机故障是临时的，判整片死会让本可救回的片永久丢失。
+    """
+    msg = (f"{d._HLS_HOST_BLOCKED_MARKER}（sun.peakstorm.top，HTTP 502），"
+           f"分片 5 不再重试: https://sun.peakstorm.top/x/seg.ts")
+    assert d._HLS_HOST_BLOCKED_MARKER not in d._PERMANENT_FAILURE_MARKERS
+    assert d._classify_failure(msg) is True, "必须仍可重试"
+    # 必须排在"源站5xx"之前，否则文案里的 502 会被通用 5xx 类目抢先命中。
+    assert d.classify_reject_reason(msg) == "分片主机熔断(5xx)"
+
+
+def test_hls_tripped_segment_fails_fast_without_request(monkeypatch,
+                                                        hls_circuit_env):
+    """熔断后分片层不得再发请求——这正是"省时间"的收益来源。"""
+    url = "https://sun.peakstorm.top/x/seg.ts"
+    for _ in range(8):
+        d._hls_host_record_result(url, 502)
+
+    def _boom(*a, **kw):
+        raise AssertionError("熔断后不该再发请求")
+
+    monkeypatch.setattr(d, "request_with_retry", _boom)
+    with pytest.raises(d.HostCircuitOpenError) as ei:
+        d.download_single_segment(url, 0, 20, 1)
+    assert d._HLS_HOST_BLOCKED_MARKER in str(ei.value)
+
+
+def test_segment_5xx_trips_and_aborts_immediately(monkeypatch, hls_circuit_env):
+    """🔒 分片层恒定 5xx 必须熔断并立刻上抛，不走满 SEG_RETRY_MAX 次退避。"""
+    monkeypatch.setattr(d, "HLS_HOST_CIRCUIT_THRESHOLD", 2)
+    calls = []
+
+    class _FakeResp:
+        status_code = 502
+
+    def always_502(*a, **kw):
+        calls.append(1)
+        exc = RuntimeError("请求失败: 502 Server Error")
+        exc.__cause__ = type("E", (Exception,), {"response": _FakeResp()})()
+        raise exc
+
+    monkeypatch.setattr(d, "request_with_retry", always_502)
+    with pytest.raises(d.HostCircuitOpenError):
+        d.download_single_segment("https://sun.peakstorm.top/x/s.ts", 0, 20, 0.01)
+    # 阈值 2：第 2 次就熔断上抛，远小于 retry_max=20
+    assert len(calls) == 2, f"应在达阈值时立即上抛，实际发了 {len(calls)} 次"
+
+
+def test_segment_success_clears_hls_counter(hls_circuit_env, monkeypatch):
+    """分片成功要清零连续计数，避免健康主机被累计口径误伤。"""
+    url = "https://ok.peakstorm.top/x/seg.ts"
+    for _ in range(5):
+        d._hls_host_record_result(url, 502)
+    assert d._hls_host_5xx[d._host_of(url)] == 5
+
+    monkeypatch.setattr(d, "request_with_retry", lambda *a, **kw: b"\x47" + b"\x00" * 64)
+    monkeypatch.setattr(d, "validate_segment_content", lambda *a, **kw: None)
+    d.download_single_segment(url, 0, 20, 1)
+    assert d._hls_host_5xx[d._host_of(url)] == 0
 
 
 # ------------------------------------------------- 中断与重试预算
